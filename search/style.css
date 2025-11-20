@@ -1,0 +1,29 @@
+* {
+    font-family: Papyrus, fantasy;
+}
+
+/* Search Queary Text */
+#search-header {
+    border: 2px solid red;
+}
+
+/* Results formatting */
+#results-container {
+    border: 2px solid rgb(57, 106, 179);
+}
+
+.result {
+    border: 2px solid rgb(57, 57, 179);
+}
+
+.title {
+
+}
+
+.link {
+    color: rgb(84, 51, 160);
+}
+
+.descrition {
+
+}
