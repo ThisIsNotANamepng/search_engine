@@ -1,3 +1,7 @@
+:root {
+    --title: black;
+}
+
 * {
     font-family: Papyrus, fantasy;
 }
@@ -5,23 +9,44 @@
 /* Search Queary Text */
 #search-header {
     border: 2px solid red;
+    border-radius: 5px;
+    padding: 5px;
+}
+
+#search-input {
+    border: none;
+    margin-left: 5px;
+    width: 300px;
+}
+
+#submit-btn {
+    border-radius: 5px;
 }
 
 /* Results formatting */
 #results-container {
-    border: 2px solid rgb(57, 106, 179);
+    
 }
 
 .result {
     border: 2px solid rgb(57, 57, 179);
+    border-radius: 10px;
+    padding: 0 20px 0 20px;
+    margin: 20px 0 0 0;
+
 }
 
 .title {
+    color: var(--title);
 
 }
 
 .link {
     color: rgb(84, 51, 160);
+}
+
+.link:hover {
+    text-decoration: underline;
 }
 
 .descrition {

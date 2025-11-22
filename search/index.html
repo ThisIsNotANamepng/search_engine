@@ -10,21 +10,24 @@
     </head>
     <body>
         <div id="search-header">
-            <span>Shitty Index</span>
+            <!-- <span>Shitty Index</span> -->
             <form action="bruh">
-                <input type="search" placeholder="Search Here">
-                <input type="submit" />
+                <input id="search-input" type="search" placeholder="Search Here">
+                <input id="submit-btn" type="submit" />
             </form>
         </div>
         <div id="results-container">
-            <!-- Add div elements for each result Similar to below -->
-            <a href="https://gooble.com">
-                <div class="result">
-                    <h2 class="title">Some Title Here</h2>
-                    <p class="link">https://gooble.com</p>
-                    <p class="description">Lorum Ipsum dolor siet amen.</p>
-                </div>
-            </a>
+            <!-- Example search result format -->
+            <div class="result"> <!-- Add a listener for a click -->
+                <h2 class="title">Jack Hagen</h2>
+                <p class="link">https://hagen.rip/</p>
+                <p class="description">About Me I'm Jack Hagen. I'm a student, double majoring in Computer Science and Political Science.</p>
+            </div>
+            <div class="result"> 
+                <h2 class="title">Some Title Here</h2>
+                <p class="link">https://google.com</p>
+                <p class="description">The #1 search engine for the world.</p>
+            </div>
         </div>
         <!-- owen can't code without an AI -->
         <script src="" async defer></script>
