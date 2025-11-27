@@ -68,6 +68,8 @@ def clean(text):
     """
     Cleans the input text by removing punctuation and converting to lowercase
 
+    ##TODO: Can probably remove stopwords, need to talk about that
+
     Parameters:
     text (str): The input text to be cleaned
 
@@ -79,5 +81,26 @@ def clean(text):
     text = text.translate(str.maketrans('', '', string.punctuation))
     return text.split()
 
+def tokenize_all(text):
+    """
+    Tokenizes the input text into unigrams, bigrams, trigrams, and prefixes
 
-#print(tokenize_prefixes(clean("I love programming in python"), 3))
+    Parameters:
+    text (str): The input text to be tokenized
+
+    Returns:
+    list[wordgrams, bigrams, trigrams, prefixes]: A list containing lists of unigrams, bigrams, trigrams, and prefixes
+    """
+
+    cleaned_text = clean(text)
+
+    wordgrams = cleaned_text
+    bigrams = tokenize_bigrams(cleaned_text)
+    trigrams = tokenize_trigrams(cleaned_text)
+    prefixes = tokenize_prefixes(cleaned_text, 3)
+
+    return [wordgrams, bigrams, trigrams, prefixes]
+
+#print(tokenize_bigrams(clean("How do I hack a website")))
+#print(tokenize_bigrams(clean("I love programming in python")))
+
