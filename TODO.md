@@ -1,4 +1,4 @@
-Todo:
+# Todo:
 
 (Update it with the progres you've made, add whatever you need to)
 
@@ -11,7 +11,7 @@ Todo:
 
 - [ ] Add checks for html pages only
 - [ ] Optimize
-- [ ] Dockerize scraping for kubernetes deployment
+- [x] Dockerize scraping for kubernetes deployment
     - [ ] Add checks for stalled scraping, reporting to the dashboard
 - [ ] Come up with more chracteristics about scraped domains to store and use in search algorithm
 - [ ] Make rock-solid domain wait times, don't hit a domain accross all scrapers in less than 5 seconds
@@ -23,7 +23,6 @@ Todo:
 - [ ] Handle scraping pdf files
 - [ ] Handle urls which redirect to another (probably just resolve all urls) (for example https://woo.app)
 - [ ] Still tries to scrape image files, fix that
-- [ ]
 
 ## Database
 
@@ -37,13 +36,17 @@ Todo:
 
 - [ ] Figure out the hardware
 
+## Dashboard
+
+- [ ] Add number of urls in the queue
+
 ## Misc
 
-- [ ] Write the dashboard for monitoring scraping progress. How many sites/pages have been crawled, how much is stored in the database, how many links have been foloowed, etc. Make a public version?
+- [x] Write the dashboard for monitoring scraping progress. How many sites/pages have been crawled, how much is stored in the database, how many links have been foloowed, etc. Make a public version?
 - [ ] Look into proxying traffic through cloud services
 - [ ] Make a config system for new scrapers to pull from, possily integrate with k8?
 - [ ] Make a web page or about page + email address on Github to for abuse complaints
-- [ ] Come up wth a name
+- [x] Come up wth a name
 - [ ] Need to add language detection somewhere, only scrape English?
 
 ## Cool Things to Add

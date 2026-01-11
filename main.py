@@ -25,17 +25,17 @@ def search(query):
 
     tokenized = tokenizer.tokenize_all(query)
 
-    # Ensure lists (psycopg2 will adapt Python lists to SQL arrays)
     words = list(tokenized[0]) if tokenized and len(tokenized) > 0 else []
     bigrams = list(tokenized[1]) if tokenized and len(tokenized) > 1 else []
     trigrams = list(tokenized[2]) if tokenized and len(tokenized) > 2 else []
     prefixes = list(tokenized[3]) if tokenized and len(tokenized) > 3 else []
 
+    # I changed it to rate based on number of token occurences divided by total tokens on url, we might want to change this in the future
     sql_query = """
     WITH scores AS (
         -- Words
         SELECT url_id,
-            COUNT(*) * %s AS score
+            COUNT(*) * %s / COUNT(url_id) AS score
         FROM word_urls
         WHERE word_id IN (
             SELECT id FROM words WHERE word = ANY(%s)
@@ -46,7 +46,7 @@ def search(query):
 
         -- Bigrams
         SELECT url_id,
-            COUNT(*) * %s AS score
+            COUNT(*) * %s / COUNT(url_id) AS score
         FROM bigram_urls
         WHERE bigram_id IN (
             SELECT id FROM bigrams WHERE bigram = ANY(%s)
@@ -57,7 +57,7 @@ def search(query):
 
         -- Trigrams
         SELECT url_id,
-            COUNT(*) * %s AS score
+            COUNT(*) * %s / COUNT(url_id) AS score
         FROM trigram_urls
         WHERE trigram_id IN (
             SELECT id FROM trigrams WHERE trigram = ANY(%s)
@@ -68,7 +68,7 @@ def search(query):
 
         -- Prefixes
         SELECT url_id,
-            COUNT(*) * %s AS score
+            COUNT(*) * %s / COUNT(url_id) AS score
         FROM prefix_urls
         WHERE prefix_id IN (
             SELECT id FROM prefixes WHERE prefix = ANY(%s)
@@ -92,7 +92,7 @@ def search(query):
         prefix_weight, prefixes,
     )
 
-    print("Searching....")
+    print("Searching....", query)
     start = time.time()
     cur.execute(sql_query, params)
     print(time.time()-start)
@@ -106,5 +106,5 @@ def search(query):
 
 # Example usage:
 # query = input("Search query: ")
-query = "Nicklas Lidstrom hockey"
+query = "university"
 search(query)
