@@ -25,7 +25,7 @@ from psycopg2.extras import execute_values
 from langdetect import detect
 import signal
 
-USER_AGENT = "SearchEngineProjectBot/1.0 (+https://github.com/ThisIsNotANamepng/search_engine; hagenjj4111@uwec.edu)"
+USER_AGENT = "StultusSearchEngine/1.0 (+https://github.com/ThisIsNotANamepng/search_engine; hagenjj4111@uwec.edu)"
 
 def get_conn():
     """Return a new psycopg2 connection using `DATABASE_URL` or PG_* env vars."""
