@@ -16,7 +16,7 @@ scraper.create_database()
 
 total_scraped = 0
 
-"""
+
 # This is legacy from running on a single machine, we can probably delete this now that we have a shared queue
 # Seed URLs into DB-backed queue (skip those already in DB)
 with open("seed_urls.csv", "r") as f:
@@ -24,7 +24,7 @@ with open("seed_urls.csv", "r") as f:
         url = line.strip()
         if url and not scraper.exists(url, 'url'):
             scraper.enqueue_url(url)
-"""
+
 
 scraper.log("Started scraping")
 

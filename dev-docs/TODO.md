@@ -9,7 +9,7 @@
 - [x] Dockerize scraping for kubernetes deployment
     - [ ] Add checks for stalled scraping, reporting to the dashboard
 - [ ] Come up with more chracteristics about scraped domains to store and use in search algorithm
-- [ ] Make rock-solid domain wait times, don't hit a domain accross all scrapers in less than 5 seconds
+- [x] Make rock-solid domain wait times, don't hit a domain accross all scrapers in less than 5 seconds
 - [ ] **Respect 400/500 error responses and stop crawling the domain**
 - [ ] Look for and respect Crawl-Delay in robots.txt
 - [ ] Should report http reponses to local lookup table and therefore the index database
@@ -18,6 +18,7 @@
 - [ ] Handle scraping pdf files
 - [ ] Handle urls which redirect to another (probably just resolve all urls) (for example https://woo.app)
 - [ ] Still tries to scrape image files, fix that
+- [ ] Add TFIDF to index data
 
 ## Database
 
@@ -59,3 +60,7 @@
 - [ ] Host the search over DNS. Something very similar was done with Wikipedia summaries, [https://dgl.cx/2008/10/wikipedia-summary-dns](https://dgl.cx/2008/10/wikipedia-summary-dns) you can have a domain name be the search query and have a super optimized dns response with the results
 - [ ] Could classify text for each page with sentiment analysis
 - [ ] Add onion site
+- [ ] Scrape only academic sites (and save into a DB so we can create a scholastic LLM) (scholar.google.com)
+- [ ] Use ML on the internet dataset from Stultus to measure how much of the web is positive vs negative
+- [ ] Classify internet dataset into categories, (eg news categories, industry topics, or content themes), can be used in searching
+- [ ] Use Named Entity Recognition (NER) to extract specific entity types like people, organizations, locations, and dates from the internet dataset to analyze where on the internet they appear, including through page categories (see above)
