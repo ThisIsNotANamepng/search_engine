@@ -43,7 +43,7 @@
 - [ ] Make a config system for new scrapers to pull from, possily integrate with k8?
 - [ ] Make a web page or about page + email address on Github to for abuse complaints
 - [x] Come up wth a name
-- [ ] Need to add language detection somewhere, only scrape English? Or we could translate pages on the hpc and serve up the translated versions
+- [x] Need to add language detection somewhere, only scrape English? Or we could translate pages on the hpc and serve up the translated versions
 - [ ] Need to save the raw text of pages so we can do analysis and research on it later
 
 ## Cool Things to Add
