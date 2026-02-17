@@ -27,6 +27,7 @@
 - [ ] Optimize searching
 - [ ] Enter urls into queue with delay for scraping
 - [x] Set up Redis DB for domain scraping cooldown
+- [ ] Batch job for calculating total_references for the total_references table
 
 ## Hardware
 
