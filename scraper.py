@@ -69,6 +69,23 @@ def create_database():
         url VARCHAR(2048) NOT NULL PRIMARY KEY,
         id INT NOT NULL DEFAULT nextval('urls_id_seq')
     );
+    CREATE TABLE IF NOT EXISTS urls_references (
+        url VARCHAR(2048) NOT NULL PRIMARY KEY,
+        referenced_domain VARCHAR(2048) NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS total_references (
+        domain VARCHAR(2048) NOT NULL PRIMARY KEY,
+        total_references INT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS entities (
+        entity_text VARCHAR(2048) NOT NULL PRIMARY KEY,
+        id INT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS entity_urls (
+        url VARCHAR(2048) NOT NULL PRIMARY KEY,
+        entity_url INT NOT NULL
+    );
+
 
     CREATE TABLE IF NOT EXISTS bigram_urls (bigram_id INT NOT NULL, url_id INT NOT NULL);
     CREATE TABLE IF NOT EXISTS trigram_urls (trigram_id INT NOT NULL, url_id INT NOT NULL);
@@ -311,12 +328,12 @@ def store(url, timeout=None):
     If `timeout` is provided it is forwarded to HTTP fetch.
     """
     #print("Starting storing")
-    m=time.time()
+    #m=time.time()
 
     content = get_main_text(url, timeout=timeout)
 
     #print(f"Getting main text: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
     if content != False:
         # The url contains real text to scrape
@@ -327,7 +344,7 @@ def store(url, timeout=None):
         return
 
     #print(f"Spliting text: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
 
     # Check for english language
@@ -336,18 +353,34 @@ def store(url, timeout=None):
         return links
 
     #print(f"Detecting language: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
 
     tokens = tokenizer.tokenize_all(text) #TODO: I want to see how expensive it is to check if each token is in the database already, you'd have to search all of the tokens to find if it's in the database
 
     #print(f"Geeting tokens: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
     if not text:
         log(f"Error Failed to retrieve page text {url}")
         return links
         
+
+    # Clean links, this is copied from scrape.py, should probably have a shred function but it's 10:55pm and I'm tired
+    raw_links = [i for i in links if "mailto:" not in i]
+    cleaned = []
+
+    for link in raw_links:
+        # Get rid of ?post=data
+        clean_link = link.split('?', 1)[0]
+        clean_link = link.split('#')[0]
+        if clean_link not in cleaned:
+            link_domain = get_base_domain(clean_link)
+            if clean_link[0:4] == "http" and get_base_domain(url) != link_domain:
+                cleaned.append(link_domain)
+
+    # A list of the links in the scraped page
+    links = cleaned
 
     # tokens: [words, bigrams, trigrams, prefixes]
     words = set(tokens[0]) if tokens and len(tokens) > 0 else set()
@@ -356,14 +389,14 @@ def store(url, timeout=None):
     prefixes = set(tokens[3]) if tokens and len(tokens) > 3 else set()
 
     #print(f"Splitting into words, bigrams, trigrams, prefixes: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
 
     conn = get_conn()
     cur = conn.cursor()
 
     #print(f"Getting SQL connection and cursor: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
 
     # Upsert the URL and get its id. Use RETURNING id when inserting; else SELECT.
@@ -400,6 +433,14 @@ def store(url, timeout=None):
         extras.execute_values(cur,
             "INSERT INTO prefixes (prefix) VALUES %s ON CONFLICT (prefix) DO NOTHING;",
             extra_vals)
+        
+    if links:
+        extra_vals = [(url, l) for l in links]
+        extras.execute_values(cur,
+            "INSERT INTO urls_references (url, referenced_domain) VALUES %s ON CONFLICT (url) DO NOTHING;",
+            extra_vals,
+            template=None)
+
 
     # Fetch ids for all tokens in bulk
     def fetch_id_map(column, table, items):
@@ -412,7 +453,7 @@ def store(url, timeout=None):
         return {val: id for (id, val) in rows}
     
     #print(f"Putting tokens into database: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
 
     word_map = fetch_id_map('word', 'words', list(words))
@@ -421,7 +462,7 @@ def store(url, timeout=None):
     prefix_map = fetch_id_map('prefix', 'prefixes', list(prefixes))
 
     #print(f"Making token maps: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
 
     # Prepare mapping inserts and bulk insert them
@@ -431,7 +472,7 @@ def store(url, timeout=None):
     prefix_url_pairs = [(prefix_map[p], url_id) for p in prefixes if p in prefix_map]
 
     #print(f"Making inserts: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
     if word_url_pairs:
         extras.execute_values(cur,
@@ -454,7 +495,7 @@ def store(url, timeout=None):
             prefix_url_pairs)
 
     #print(f"SQL executing token_urls: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
 
     conn.commit()
@@ -462,7 +503,7 @@ def store(url, timeout=None):
     conn.close()
 
     #print(f"Committing and closing sql connection: {time.time()-m}")
-    m=time.time()
+    #m=time.time()
 
     return links
 
