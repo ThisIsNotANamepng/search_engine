@@ -18,7 +18,8 @@
 - [ ] Handle scraping pdf files
 - [ ] Handle urls which redirect to another (probably just resolve all urls) (for example https://woo.app)
 - [ ] Still tries to scrape image files, fix that
-- [ ] Add TFIDF to index data
+- [ ] Add logging to store which pages are in which language so we can measure how much of the web is in which language
+- [ ] Add global function for lceaning the links we get (there are duplicate functions in scrape.py and scraper.py)
 
 ## Database
 
@@ -27,7 +28,7 @@
 - [ ] Optimize searching
 - [ ] Enter urls into queue with delay for scraping
 - [x] Set up Redis DB for domain scraping cooldown
-- [ ] Batch job for calculating total_references for the total_references table
+- [ ] Make a batch job for calculating total_references for the total_references table
 
 ## Hardware
 
@@ -40,7 +41,7 @@
 ## Misc
 
 - [x] Write the dashboard for monitoring scraping progress. How many sites/pages have been crawled, how much is stored in the database, how many links have been foloowed, etc. Make a public version?
-- [ ] Look into proxying traffic through cloud services
+- [ ] Look into proxying traffic through cloud services, find the fastest solution while balancing with free student benefits for compute power
 - [ ] Make a config system for new scrapers to pull from, possily integrate with k8?
 - [ ] Make a web page or about page + email address on Github to for abuse complaints
 - [x] Come up wth a name

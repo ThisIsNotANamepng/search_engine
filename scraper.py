@@ -1,11 +1,6 @@
 """
-PostgreSQL-backed scraper module (ported from sqlite3_scraper.py).
+Functions for scraping
 
-Usage:
- - Set `DATABASE_URL` environment variable (or PGHOST/PGUSER/PGPASSWORD/PGDATABASE/PGPORT).
- - Install dependency: `psycopg2-binary`.
-
-This file mirrors the original SQLite implementation but uses psycopg2/Postgres.
 """
 
 import os
@@ -26,6 +21,63 @@ from langdetect import detect
 import signal
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://github.com/ThisIsNotANamepng/search_engine; hagenjj4111@uwec.edu)"
+DEBUG_BREAKPOINT_TIMER = time.time()
+
+# I don't think these are necessary for now (for debug printing)
+BREAKPOINTS = [
+    "Sent to the database",
+    "Get back from the database"
+    "Tokenizing",
+    "Tokenized"
+]
+
+
+def debug_print(text):
+    """
+    Print system stats when DEBUG is set 
+    
+    DEBUG = 1 Prints for each print statement
+    DEBUG = 2 Prints for each print statement and includes timing
+
+    TODO:
+        - All debug print (info_print and failure_print too) should have a option, maybe DEBUG=3 to write all of the debug stuff to a file log as well as printing
+    """
+
+    global DEBUG_BREAKPOINT_TIMER
+
+    def format_time(timestamp):
+        return f"{timestamp:.4f}"
+
+    if "DEBUG" in os.environ:
+
+        if text == "":
+            # Just wants to reset the timer, functions to track the timing for aren't next to each other, need to reset the time in the debug_breakpoint_timer to zero before starting new function
+            DEBUG_BREAKPOINT_TIMER = time.time()
+            return
+        
+        level = os.environ["DEBUG"]
+
+        if level == "1":
+            print(text)
+
+        elif level == "2":
+
+            print(format_time(time.time()-DEBUG_BREAKPOINT_TIMER), text)
+
+            DEBUG_BREAKPOINT_TIMER = time.time()
+
+def info_print(text):
+    # For debugging and printing statements which notify what's happening, not that need to be timed
+
+    if "DEBUG" in os.environ:
+        print('\033[2;34;43m '+text+' \033[0;0m')
+
+        #print(text)
+        
+def failure_print(text):
+    # For when things fail to the point of breaking and don't need timing, just debug logs
+
+    print(text)
 
 def get_conn():
     """Return a new psycopg2 connection using `DATABASE_URL` or PG_* env vars."""
@@ -33,7 +85,7 @@ def get_conn():
     if database_url:
         return psycopg2.connect(database_url)
     else:
-        print("Failed to connect to server")
+        failure_print("Failed to connect to server")
 
     #return psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
 
@@ -237,6 +289,7 @@ def get_main_text(url, timeout=None):
 
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
+        info_print("Not allowed by robots.txt")
         return "", []
 
     headers = {
@@ -285,6 +338,10 @@ def log(message):
     - Misc: Misc {message} {url}
 
     This is for measuring success/error rate in the dashboard
+
+    TODO:
+        - Change the logs table to add a column for error/success/misc
+        - Add a table for success/error rate, an integer in the table should be increase by one for each success/error
     """
     # write to local file
     #with open("scraper.log", "a") as f:
@@ -327,13 +384,11 @@ def store(url, timeout=None):
 
     If `timeout` is provided it is forwarded to HTTP fetch.
     """
-    #print("Starting storing")
-    #m=time.time()
+    #info_print("Starting storing")
 
     content = get_main_text(url, timeout=timeout)
 
-    #print(f"Getting main text: {time.time()-m}")
-    #m=time.time()
+    debug_print("Visited site, got main text and links")
 
     if content != False:
         # The url contains real text to scrape
@@ -341,28 +396,29 @@ def store(url, timeout=None):
         links = content[1]
     else:
         # Url is a file format which cannot be scraped
+        ## TODO: I don't think this completely works, need to test with a abunch of file formats so we don't try to scrape files like images and stuff
+
+        info_print("URL stores a file format we can't scrape")
         return
-
-    #print(f"Spliting text: {time.time()-m}")
-    #m=time.time()
-
 
     # Check for english language
     if detect(text) != 'en':
+        # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
         log(f"Language Not in English {url}")
-        return links
+        info_print("Language not in English, skipping")
 
-    #print(f"Detecting language: {time.time()-m}")
-    #m=time.time()
+        return [links, False]
+
+    debug_print("Detected language")
 
 
     tokens = tokenizer.tokenize_all(text) #TODO: I want to see how expensive it is to check if each token is in the database already, you'd have to search all of the tokens to find if it's in the database
 
-    #print(f"Geeting tokens: {time.time()-m}")
-    #m=time.time()
+    debug_print("Tokenized")
 
     if not text:
         log(f"Error Failed to retrieve page text {url}")
+        failure_print("Error Failed to retrieve page text")
         return links
         
 
@@ -388,16 +444,13 @@ def store(url, timeout=None):
     trigrams = set(tokens[2]) if tokens and len(tokens) > 2 else set()
     prefixes = set(tokens[3]) if tokens and len(tokens) > 3 else set()
 
-    #print(f"Splitting into words, bigrams, trigrams, prefixes: {time.time()-m}")
-    #m=time.time()
+    debug_print("Cleaned links and split tokens into words, bigrams, trigrams, prefixes")
 
 
     conn = get_conn()
     cur = conn.cursor()
 
-    #print(f"Getting SQL connection and cursor: {time.time()-m}")
-    #m=time.time()
-
+    #debug_print("Getting SQL connection and cursor:")
 
     # Upsert the URL and get its id. Use RETURNING id when inserting; else SELECT.
     cur.execute("INSERT INTO urls (url) VALUES (%s) ON CONFLICT (url) DO NOTHING RETURNING id;", (url,))
@@ -452,18 +505,14 @@ def store(url, timeout=None):
         rows = cur.fetchall()
         return {val: id for (id, val) in rows}
     
-    #print(f"Putting tokens into database: {time.time()-m}")
-    #m=time.time()
-
+    debug_print("Added new, unseen tokens to the database")
 
     word_map = fetch_id_map('word', 'words', list(words))
     bigram_map = fetch_id_map('bigram', 'bigrams', list(bigrams))
     trigram_map = fetch_id_map('trigram', 'trigrams', list(trigrams))
     prefix_map = fetch_id_map('prefix', 'prefixes', list(prefixes))
 
-    #print(f"Making token maps: {time.time()-m}")
-    #m=time.time()
-
+    debug_print("Made token maps")
 
     # Prepare mapping inserts and bulk insert them
     word_url_pairs = [(word_map[w], url_id) for w in words if w in word_map]
@@ -471,8 +520,7 @@ def store(url, timeout=None):
     trigram_url_pairs = [(trigram_map[t], url_id) for t in trigrams if t in trigram_map]
     prefix_url_pairs = [(prefix_map[p], url_id) for p in prefixes if p in prefix_map]
 
-    #print(f"Making inserts: {time.time()-m}")
-    #m=time.time()
+    debug_print("Made insert stementes for <token>_url tables")
 
     if word_url_pairs:
         extras.execute_values(cur,
@@ -494,16 +542,13 @@ def store(url, timeout=None):
             "INSERT INTO prefix_urls (prefix_id, url_id) VALUES %s;",
             prefix_url_pairs)
 
-    #print(f"SQL executing token_urls: {time.time()-m}")
-    #m=time.time()
-
+    debug_print("Executed insert statements, stored url.id_token.id pairs")
 
     conn.commit()
     cur.close()
     conn.close()
 
-    #print(f"Committing and closing sql connection: {time.time()-m}")
-    #m=time.time()
+    debug_print("Committed and closed sql connection")
 
     return links
 

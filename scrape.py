@@ -62,6 +62,7 @@ start = timed
 local_queue = []
 queue_return_to_db = []
 prev_base_domain = ""
+page_not_in_english = False
 
 while True:
     #print(1, float("{:.3f}".format(time.time()-timed)))
@@ -72,7 +73,7 @@ while True:
     # Holds a local queue of 30 urls so it doesn't need to interact with the db as much
 
     if len(local_queue) == 0:
-        print("Reloading local queue")
+        scraper.info_print("Reloading local queue")
         scraper.enqueue_urls(queue_return_to_db)
         local_queue = scraper.get_next_urls(LOCAL_QUEUE_LENGTH)
 
@@ -127,6 +128,9 @@ while True:
     timed = time.time()
 
     scraper.log(f"Starting scraping {url}")
+    scraper.debug_print("")
+    big_start = time.time()
+
     #print(3, float("{:.3f}".format(time.time()-timed)))
     timed = time.time()
 
@@ -140,7 +144,15 @@ while True:
 
     try:
         # enforce a network/read timeout for page fetch and parsing
+        ## TODO: I don't think this timeout works, we need to fix it
         links_to_scrape = scraper.store(url, timeout=TIMEOUT_TIME)
+
+        ## TODO: Right now if a page isn't in English we still store the links in that page (they probably are unlikely to also be in Egnlish) so we need to talk abaout whether we still want to queue those links
+        if len(links_to_scrape) > 1:
+            # links_to_scrape is a list of two [links, False] if the page wasn't in English, we set the variable back to the links and make a flag saying that the page wasn't in English, usung that flag in the final print at the end of the loop
+            links_to_scrape = links_to_scrape[0]
+            page_not_in_english = True
+
         #print(5, float("{:.3f}".format(time.time()-timed)))
         timed = time.time()
         total_links=0
@@ -187,7 +199,13 @@ while True:
     #if total_scraped % 10 == 0:
     #    print(f"Scraped {total_scraped} pages. {scraper.queue_size()} URLs left in queue")
     #print(f"Scraped {total_scraped} pages. Total time to scrape:", time.time()-start)
-    print(f"Scraped {url}")
+
+    if page_not_in_english:
+        scraper.info_print(f"Stored links for {url}, total time taken: {str(time.time()-big_start)}")
+        page_not_in_english = False
+    else:
+        scraper.info_print(f"Scraped {url}, total time taken: {str(time.time()-big_start)}")
+
     start=time.time()
 
 scraper.log("Finished scraping")
