@@ -18,19 +18,105 @@ from psycopg2 import sql
 import psycopg2.extras as extras
 from psycopg2.extras import execute_values
 from langdetect import detect
+import csv
 import signal
+from typing import Optional
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://github.com/ThisIsNotANamepng/search_engine; hagenjj4111@uwec.edu)"
 DEBUG_BREAKPOINT_TIMER = time.time()
+# Look for the DEBUG shell varialbe and set a global variable to True or false base don whether it was passed
+DEBUG = "DEBUG" in os.environ
+LEVEL = os.environ["DEBUG"] if DEBUG else False
+URL = ""
 
-# I don't think these are necessary for now (for debug printing)
-BREAKPOINTS = [
-    "Sent to the database",
-    "Get back from the database"
-    "Tokenizing",
-    "Tokenized"
-]
+class CSVTracker:
+    def __init__(self, filename: str = "timing.csv"):
+        self.filename = filename
+        self.columns = [
+            "url",
+            "downloaded_text",
+            "detected_language",
+            "tokenized",
+            "cleaned_and_split",
+            "added_new_tokens",
+            "made_token_maps",
+            "made_insert_statements",
+            "execute_insert_statements",
+            "committed_and_closed",
+            "total"
+        ]
+        self._ensure_file_exists()
 
+    def _ensure_file_exists(self):
+        """Create CSV with headers if it doesn't exist."""
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=self.columns)
+                writer.writeheader()
+
+    def _read_all(self) -> list[dict]:
+        """Read all rows from CSV."""
+        with open(self.filename, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            return list(reader)
+
+    def _write_all(self, rows: list[dict]):
+        """Write all rows to CSV."""
+        with open(self.filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self.columns)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def update(self, url: str, column: str, value) -> bool:
+        """
+        Update a specific column for a given URL.
+        Creates new row if URL doesn't exist.
+
+        Args:
+            url: The URL to update (primary key)
+            column: Column name to update
+            value: Value to set
+
+        Returns:
+            True if successful, False if column invalid
+        """
+        if column not in self.columns:
+            print(f"Error: Invalid column '{column}'. Valid columns: {self.columns}")
+            return False
+
+        rows = self._read_all()
+
+        # Find existing row or create new one
+        row_found = False
+        for row in rows:
+            if row.get("url") == url:
+                row[column] = value
+                row_found = True
+                break
+
+        if not row_found:
+            # Create new row with URL and empty values
+            new_row = {col: "" for col in self.columns}
+            new_row["url"] = url
+            new_row[column] = value
+            rows.append(new_row)
+
+        self._write_all(rows)
+        return True
+
+    def get(self, url: str) -> Optional[dict]:
+        """Get a row by URL."""
+        rows = self._read_all()
+        for row in rows:
+            if row.get("url") == url:
+                return row
+        return None
+
+    def get_all(self) -> list[dict]:
+        """Get all rows."""
+        return self._read_all()
+
+TIMING_TRACKER = CSVTracker("timing.csv") if LEVEL == "3" else ""
 
 def debug_print(text):
     """
@@ -38,33 +124,77 @@ def debug_print(text):
     
     DEBUG = 1 Prints for each print statement
     DEBUG = 2 Prints for each print statement and includes timing
+    DEBUG = 3 Prints for each print statement and includes timing and saves data to timing.csv
 
     TODO:
         - All debug print (info_print and failure_print too) should have a option, maybe DEBUG=3 to write all of the debug stuff to a file log as well as printing
     """
 
     global DEBUG_BREAKPOINT_TIMER
+    global DEBUG
+    global LEVEL
 
     def format_time(timestamp):
         return f"{timestamp:.4f}"
 
-    if "DEBUG" in os.environ:
+    if DEBUG:
 
         if text == "":
             # Just wants to reset the timer, functions to track the timing for aren't next to each other, need to reset the time in the debug_breakpoint_timer to zero before starting new function
             DEBUG_BREAKPOINT_TIMER = time.time()
             return
         
-        level = os.environ["DEBUG"]
-
-        if level == "1":
+        if LEVEL == "1":
             print(text)
 
-        elif level == "2":
+        elif LEVEL == "2":
 
             print(format_time(time.time()-DEBUG_BREAKPOINT_TIMER), text)
 
             DEBUG_BREAKPOINT_TIMER = time.time()
+
+        elif LEVEL == "3":
+            global TIMING_TRACKER
+            global URL
+
+            print(format_time(time.time()-DEBUG_BREAKPOINT_TIMER), text)
+            timing = format_time(time.time()-DEBUG_BREAKPOINT_TIMER)
+
+            # From the debug message that's passed we can derive a unique key for the columns in the debug csv file
+            if "Visi" == text[0:4]:
+                # "Visited site, got main text and links"
+                code = "downloaded_text"
+            elif "Dete" == text[0:4]:
+                # "Detected language"
+                code = "detected_language"
+            elif "Toke" == text[0:4]:
+                # "Tokenized"
+                code = "tokenized"
+            elif "Clea" == text[0:4]:
+                # "Cleaned links and split tokens into words, bigrams, trigrams, prefixes"
+                code = "cleaned_and_split"
+            elif "Adde" == text[0:4]:
+                # "Added new, unseen tokens to the database"
+                code = "added_new_tokens"
+            elif "Made t" == text[0:6]:
+                # "Made token maps"
+                code = "made_token_maps"
+            elif "Made i" == text[0:6]:
+                # "Made insert stementes for <token>_url tables"
+                code = "made_insert_statements"
+            elif "Exec" == text[0:4]:
+                # "Executed insert statements, stored url.id_token.id pairs"
+                code = "execute_insert_statements"
+            elif "Comm" == text[0:4]:
+                # "Committed and closed sql connection"
+                code = "committed_and_closed"
+            else:
+                print(f"Code not found: {text}  ::  {text[0:5]}")
+
+            TIMING_TRACKER.update(URL, code, timing)
+
+            DEBUG_BREAKPOINT_TIMER = time.time()
+
 
 def info_print(text):
     # For debugging and printing statements which notify what's happening, not that need to be timed
@@ -385,6 +515,8 @@ def store(url, timeout=None):
     If `timeout` is provided it is forwarded to HTTP fetch.
     """
     #info_print("Starting storing")
+    global URL
+    URL = url
 
     content = get_main_text(url, timeout=timeout)
 
@@ -400,7 +532,7 @@ def store(url, timeout=None):
 
         info_print("URL stores a file format we can't scrape")
         return
-
+    
     # Check for english language
     if detect(text) != 'en':
         # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
