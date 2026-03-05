@@ -207,4 +207,4 @@ while True:
 
     start=time.time()
 
-scraper.log("Finished scraping")
+    scraper.log("Finished scraping")
