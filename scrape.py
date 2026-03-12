@@ -171,6 +171,21 @@ while True:
         if clean_link not in seen:
             seen.add(clean_link)
             cleaned.append(clean_link)
+    
+            # Increment reference count for unique cleaned links
+        if cleaned:
+            conn = scraper.get_conn()
+            cur = conn.cursor()
+
+            cur.execute("""
+                UPDATE urls
+                SET reference_count = reference_count + 1
+                WHERE url = ANY(%s);
+            """, (cleaned,))
+
+            conn.commit()
+            cur.close()
+            conn.close()
 
     # filter_new_urls checks both the queue and stored urls in one go
     links_to_add_to_queue = scraper.filter_new_urls(cleaned)
