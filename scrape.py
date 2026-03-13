@@ -18,13 +18,13 @@ total_scraped = 0
 
 # This is legacy from running on a single machine, we can probably delete this now that we have a shared queue
 # Seed URLs into DB-backed queue (skip those already in DB)
-"""
+
 with open("seed_urls.csv", "r") as f:
     for line in f:
         url = line.strip()
         if url and not scraper.exists(url, 'url'):
             scraper.enqueue_url(url)
-"""
+
 
 scraper.log("Started scraping")
 
@@ -73,6 +73,7 @@ while True:
         scraper.info_print("Reloading local queue")
         #print("Returning to queue:", queue_return_to_db)
         scraper.enqueue_urls(queue_return_to_db)
+        #print("Queue to return", queue_return_to_db)
         #print("Enqueued")
         local_queue = scraper.get_next_urls(LOCAL_QUEUE_LENGTH)
         #print("Adding to lcal queue:")
@@ -145,11 +146,11 @@ while True:
     # enforce a network/read timeout for page fetch and parsing
     ## TODO: I don't think this timeout works, we need to fix it
     links_to_scrape = scraper.store(url, timeout=TIMEOUT_TIME)
-    #print(links_to_scrape)
+    #print("first links_to_scrape", links_to_scrape)
 
 
     ## TODO: Right now if a page isn't in English we still store the links in that page (they probably are unlikely to also be in English) so we need to talk abaout whether we still want to queue those links
-    if links_to_scrape != None and len(links_to_scrape) > 1:
+    if links_to_scrape != None and len(links_to_scrape) > 1 and not links_to_scrape[1]:
         # links_to_scrape is a list of two [links, False] if the page wasn't in English, we set the variable back to the links and make a flag saying that the page wasn't in English, usung that flag in the final print at the end of the loop
         links_to_scrape = links_to_scrape[0]
         page_not_in_english = True
@@ -158,14 +159,19 @@ while True:
 
     links_to_add_to_queue = []
     # Clean, deduplicate and filter links in bulk for performance
-    raw_links = [i for i in links_to_scrape if "mailto:" not in i]
+    #print("links_to_scrape:", links_to_scrape)
+    #raw_links = [i for i in links_to_scrape if "mailto:" not in i]
+    #print("raw_links", raw_links)
 
 
     seen = set()
     cleaned = []
 
+    #print("HERE raw_links:", raw_links)
+
+    """
     for link in raw_links:
-        #print(link)
+        print("link:", link)
         # Get rid of ?post=data and #section data
         total_links += 1
         clean_link = link.split('?', 1)[0]
@@ -173,9 +179,15 @@ while True:
         if clean_link not in seen:
             seen.add(clean_link)
             cleaned.append(clean_link)
+    """
 
+    # Raw_links should be cleaned by the cleaning function in scraper.py, so I'm taking the cleaning stuff out here
+    cleaned = links_to_scrape
+
+    #print("CLEANED", cleaned)
+    
     # Batch add url references after cleaning
-    if cleaned:
+    if cleaned and len(cleaned) > 0 and not cleaned[1]:
         conn = scraper.get_conn()
         cur = conn.cursor()
 
@@ -189,16 +201,17 @@ while True:
         cur.close()
         conn.close()
 
+    #print("cleaned:", cleaned)
+
 
     # filter_new_urls checks both the queue and stored urls in one go
     links_to_add_to_queue = scraper.filter_new_urls(cleaned)
 
-    #print("Adding:", links_to_add_to_queue)
+    #print("Adding links-to_add_to_queue:", links_to_add_to_queue)
     scraper.enqueue_urls(links_to_add_to_queue)
 
     scraper.log(f"Scraped {url}")
     total_scraped += 1
-    timed = time.time()
 
     # With this in, I can't find errors so I'm taking out the try: phrase. This will mean that scrapers can crash and stop scraping, but we can set up K3 to restart them and report the errors
     #except Exception as e:

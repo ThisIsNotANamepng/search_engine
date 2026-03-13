@@ -1,6 +1,6 @@
 # Search Engine:
 
-
+"""
 #Aaron's attribute normalization functions
 '''
 prefix_score = ceil(len(prefix_matches)/3)
@@ -16,13 +16,7 @@ where word_score = len(word)/2
 # popularity = reference_count
 # search_output = relevance * popularity
 
-
-
-
-#Original Time Taken b4 Aaron:
-#   0.22978639602661133 sec
-#AFTER
-#   
+"""
 
 import tokenizer
 import scraper
@@ -31,7 +25,7 @@ import math
 
 
 def search(query):
-    start = time.time()
+    #start = time.time()
     """Run search against the Postgres DB via `scraper.get_conn()`.
 
     Uses array parameters with `ANY(%s)` so empty token groups are handled safely.
@@ -149,7 +143,7 @@ def search(query):
     print("")
     #print("Time taken:", time.time() - start)
     results = cur.fetchall()
-    print("Time taken:", time.time() - start)
+    #print("Time taken:", time.time() - start)
 
     print(results)
 

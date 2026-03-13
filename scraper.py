@@ -252,7 +252,7 @@ def create_database():
     );
     CREATE TABLE IF NOT EXISTS urls (
         url VARCHAR(2048) NOT NULL UNIQUE,
-        id INT NOT NULL DEFAULT nextval('urls_id_seq') PRIMARY KEY
+        id INT NOT NULL DEFAULT nextval('urls_id_seq') PRIMARY KEY,
         reference_count INT NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS urls_references (
@@ -559,6 +559,7 @@ def store(url, timeout=None):
         # The url contains real text to scrape
         text = content[0]
         links = content[1]
+        #print("raw_links", links)
     else:
         # Url is a file format which cannot be scraped
         ## TODO: I don't think this completely works, need to test with a abunch of file formats so we don't try to scrape files like images and stuff
@@ -567,7 +568,7 @@ def store(url, timeout=None):
         return
     
     # Making sure there is text at all. I chose 4 arbitrarily
-    if len(text) < 4:
+    if text != None and len(text) < 4:
         return [links, False]
     
     # Check for english language
@@ -585,25 +586,33 @@ def store(url, timeout=None):
 
     debug_print("Tokenized")
 
+    """
     ##TODO: This can probably be deleted because I added a statement checking if text is longer that 5 characters beofre echking the language
     if not text:
         log(f"Error Failed to retrieve page text {url}")
         failure_print("Error Failed to retrieve page text")
         return links
+    """
         
 
     # Clean links, this is copied from scrape.py, should probably have a shred function but it's 10:55pm and I'm tired
-    raw_links = [i for i in links if "mailto:" not in i]
+    # This above comment cuased issues. The cleaning here is for cleaning links to add to the scraping, while cleaning in scrape.py is for references so it just need to be the base domains
+    #raw_links = [i for i in links if "mailto:" not in i] # Taking this out because we handle this case below
+    raw_links = links
     cleaned = []
+    link_domains = []
 
     for link in raw_links:
-        # Get rid of ?post=data
+        #print("link:", link)
+        # Get rid of ?post=data and #section data
         clean_link = link.split('?', 1)[0]
-        clean_link = link.split('#')[0]
+        clean_link = clean_link.split('#', 1)[0]
         if clean_link not in cleaned:
             link_domain = get_base_domain(clean_link)
-            if clean_link[0:4] == "http" and get_base_domain(url) != link_domain:
-                cleaned.append(link_domain)
+            link_domains.append(link_domain)
+            if clean_link[0:4] == "http":
+                cleaned.append(clean_link)
+
 
     # A list of the links in the scraped page
     links = cleaned
@@ -953,12 +962,14 @@ def enqueue_urls(urls):
 
 
 def filter_new_urls(urls):
-    """Return a list of URLs from `urls` that are not present in the
+    """
+    Return a list of URLs from `urls` that are not present in the
     `url_queue` table and not already stored in `urls` table.
 
     This performs two bulk lookups (one against `url_queue`, one against
     `urls`) and preserves the input order while removing duplicates.
     """
+
     if not urls:
         return []
 
