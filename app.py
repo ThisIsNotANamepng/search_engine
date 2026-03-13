@@ -45,10 +45,10 @@ def dashboard():
                 WHEN message LIKE 'Sc%' THEN 'scraped'
                 WHEN message LIKE 'Bl%' THEN 'blocked'
                 WHEN message LIKE 'Er%' THEN 'error'
-                ELSE 'other'
             END AS status,
             COUNT(*) AS count
         FROM logs
+        WHERE message LIKE 'Sc%' OR message LIKE 'Bl%' OR message LIKE 'Er%'
         GROUP BY status;
     """)
     status_counts = cur.fetchall()
