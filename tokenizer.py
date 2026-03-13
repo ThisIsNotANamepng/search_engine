@@ -32,7 +32,7 @@ def tokenize_bigrams(text):
     #print(grams[1:])
 
     flat_list = []
-    for i in grams[1:]:
+    for i in grams:
         for j in i:
             flat_list.append(''.join(j))
     output_list = set(flat_list)
@@ -56,7 +56,7 @@ def tokenize_trigrams(text):
         grams.append(list(trigrams(i)))
 
     flat_list = []
-    for i in grams[1:]:
+    for i in grams:
         for j in i:
             flat_list.append(''.join(j))
     output_list = set(flat_list)
