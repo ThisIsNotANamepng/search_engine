@@ -1,0 +1,149 @@
+:root {
+  --bg: #1a1e1c;
+  --fg: #333a35;
+  --border: #434945;
+  --text: #ccd3cf;
+}
+
+@keyframes fadeIn {
+  to {
+      opacity: 1;
+  }
+}
+
+* {
+  font-family: "Forum", serif;
+  font-weight: 400;
+}
+
+body > h1 {
+  font-size: 48px;
+  margin-top: 10px;
+  margin-bottom: 10px;
+}
+
+body > h3 {
+  font-size: 24px;
+  margin-top: 10px;
+  margin-bottom: 10px;
+}
+
+body > p {
+  font-size: 24px;
+}
+
+html {
+  background-color: var(--bg);
+  /* pad center items on phone screens */
+  padding-left: 15px;
+  padding-right: 15px; 
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+body {
+  text-align: center;
+  max-width: 800px;
+  margin: 0;
+  padding: 0;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+}
+
+button {
+  font-size: 20px;
+  background-color: var(--fg);
+  color: var(--text);
+  border: 3px #434349 solid;
+  border-radius: 20px;
+  width: 150px;
+  height: 60px;
+  transition: 100ms;
+  transition-timing-function: ease-in-out;
+  box-shadow: 0px 0px 10px #1a1a1e99;
+}
+
+button:hover {
+  scale: 1.05;
+  box-shadow: 0px 0px 12px #3d3d44b4;
+}
+
+#button-container {
+  display: flex;
+  flex-direction: row;
+  gap: 10px;
+  justify-content: center;
+  margin-bottom: 25px;
+}
+
+#main-title {
+    font-size: 90px;
+}
+
+#search-header {
+    padding: 200px;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+    opacity: 0;
+    animation: fadeIn 2s forwards;
+}
+
+#search-header form {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    max-width: 600px;
+}
+
+
+#search-input {
+    flex: 1;
+    height: 50px;
+    background-color: #2d3a2d; /* green from palette */
+    color: var(--text);
+    border: 2px solid var(--border);
+    border-radius: 25px 0 0 25px;
+    padding: 0 20px;
+    font-size: 18px;
+    outline: none;
+    transition: border-color 0.3s ease;
+}
+
+#search-input:focus {
+    border-color: #4a5d4a; /* lighter green */
+}
+
+#submit-btn {
+    height: 50px;
+    background-color: #2d3a2d;
+    color: var(--text);
+    border: 2px solid var(--border);
+    border-left: none;
+    border-radius: 0 25px 25px 0;
+    padding: 0 20px;
+    font-size: 18px;
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+}
+
+#submit-btn:hover {
+    background-color: #4a5d4a;
+}
+
+@media (max-width: 700px) {
+  #button-container {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  button {
+    margin: auto;
+  }
+}

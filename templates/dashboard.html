@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stultus Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+/* =====================
+   Base
+===================== */
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: Inter, system-ui, sans-serif;
+    background: #0f172a;
+    color: #e5e7eb;
+}
+
+.container {
+    padding: 32px;
+}
+
+h1 {
+    margin: 0 0 32px;
+    font-size: 28px;
+}
+
+/* =====================
+   Grid System (12 cols)
+===================== */
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    grid-auto-rows: minmax(160px, auto);
+    gap: 24px;
+}
+
+/* Horizontal span */
+.col-3  { grid-column: span 3; }
+.col-4  { grid-column: span 4; }
+.col-6  { grid-column: span 6; }
+.col-8  { grid-column: span 8; }
+.col-12 { grid-column: span 12; }
+
+/* Vertical span */
+.row-1 { grid-row: span 1; }
+.row-2 { grid-row: span 2; }
+.row-3 { grid-row: span 3; }
+
+/* =====================
+   Card
+===================== */
+.card {
+    background: #020617;
+    border-radius: 16px;
+    padding: 20px;
+    border: 1px solid #1e293b;
+    box-shadow: 0 20px 40px rgba(0,0,0,.45);
+    display: flex;
+    flex-direction: column;
+}
+
+/* =====================
+   Metric (Number Only)
+===================== */
+.metric {
+    justify-content: center;
+}
+
+.metric-label {
+    font-size: 12px;
+    color: #94a3b8;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+}
+
+.metric-value {
+    font-size: 44px;
+    font-weight: 700;
+    margin-top: 6px;
+}
+
+.metric.accent {
+    background:
+        radial-gradient(circle at top left,
+        rgba(59,130,246,.15),
+        transparent 60%),
+        #020617;
+}
+
+/* =====================
+   Charts / Titles
+===================== */
+.card h2 {
+    margin: 0 0 16px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: #93c5fd;
+}
+
+.card canvas {
+    flex: 1;
+}
+
+/* =====================
+   Table
+===================== */
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th, td {
+    padding: 10px;
+    border-bottom: 1px solid #1e293b;
+    font-size: 14px;
+}
+
+th {
+    color: #93c5fd;
+    text-align: left;
+    font-weight: 600;
+}
+
+/* =====================
+   Responsive
+===================== */
+@media (max-width: 1000px) {
+    .dashboard-grid {
+        grid-template-columns: repeat(6, 1fr);
+    }
+}
+
+@media (max-width: 600px) {
+    .dashboard-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+
+/* scrollable table that fills its card */
+.table-box {
+  flex: 1 1 0;          /* fill remaining height */
+  overflow: auto;     /* scroll when content overflows */
+  border: 1px solid #1e293b;
+  border-radius: 6px;
+}
+
+.table-box table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table-box th,
+.table-box td {
+  padding: 10px;
+  font-size: 14px;
+  border-bottom: 1px solid #1e293b;
+}
+
+.table-box th {
+  position: sticky;   /* keep header visible while scrolling */
+  top: 0;
+  background: #020617;
+  color: #93c5fd;
+  z-index: 1;
+}
+
+</style>
+</head>
+
+<body>
+<div class="container">
+    <h1>Stultus Index Dashboard</h1>
+
+    <div class="dashboard-grid">
+
+        <!-- Metrics -->
+        <div class="card metric accent col-3 row-1">
+            <div class="metric-label">Database Size</div>
+            <div class="metric-value">{{ db_size }}</div>
+        </div>
+
+        <div class="card metric col-3 row-1">
+            <div class="metric-label">Total URLs</div>
+            <div class="metric-value">{{ url_count }}</div>
+        </div>
+
+        <div class="card metric col-3 row-1">
+            <div class="metric-label">Unique Domains</div>
+            <div class="metric-value">{{ unique_domains }}</div>
+        </div>
+
+        <div class="card metric col-3 row-1">
+            <div class="metric-label">URLS/Minute</div>
+            <div class="metric-value">{{ scrapes_per_minute }}</div>
+        </div>
+
+
+        <div class="card col-4 row-2">
+            <h2>Scraped vs Blocked (Pie)</h2>
+            <canvas id="pie_scraped_vs_blocked"></canvas>
+        </div>
+
+        <div class="card col-8 row-2">
+            <h2>Scraped vs Blocked (Bar)</h2>
+            <canvas id="bar_scraped_vs_blocked"></canvas>
+        </div>
+
+        <div class="card col-8 row-2">
+            <h2>Scrapes per Day</h2>
+            <canvas id="scrapes_per_minute"></canvas>
+        </div>
+        
+
+        <div class="card col-4 row-2">
+            <h2>Last URLs Scraped</h2>
+            <table>
+                <tr>
+                    <th>URL</th>
+                    <th>Time Scraped (UTC)</th>
+                </tr>
+                {% for s in last_10_scraped %}
+                <tr>
+                    <td>{{ s[0] }}</td>
+                    <td>{{ s[1] }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+
+
+        <div class="card col-8 row-2">
+            <h2>Pages in the Index</h2>
+            <canvas id="cumulative_scrapes_per_day"></canvas>
+        </div>
+
+
+        <div class="card col-4 row-2">
+        <h2>Active Scrapers</h2>
+        <div class="table-box">
+            <table>
+            <thead>
+                <tr>
+                <th>IP (K8)</th>
+                <th>Scraped</th>
+                <th>Alive Since</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in scrapers %}
+                <tr>
+                <td>{{ s.ip }}</td>
+                <td>{{ s.urls_scraped }}</td>
+                <td>{{ s.started_at }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+            </table>
+        </div>
+        </div>
+
+
+
+
+        <!-- Search Speed Metrics -->
+        <div class="card metric col-3 row-1">
+            <div class="metric-label">Search speed - "Something here"</div>
+            <div class="metric-value">0.25s</div>
+        </div>
+
+        <div class="card metric col-3 row-1">
+            <div class="metric-label">Search speed - "University of Wisconsin, Eau Claire"</div>
+            <div class="metric-value">0.32s</div>
+        </div>
+
+        <div class="card metric col-3 row-1">
+            <div class="metric-label">Search speed - "How much wood could a woodchuck chuck if a woodchuck could chuck wood?"</div>
+            <div class="metric-value">0.49s</div>
+        </div>
+
+        <div class="card metric col-3 row-1">
+            <div class="metric-label">Search speed - "Why does worf lose every fight?"</div>
+            <div class="metric-value">0.37s</div>
+        </div>
+
+
+    </div>
+</div>
+
+<script>
+    const statusCounts = {{ status_counts | safe }};
+    const scrapesOverTime = {{ scrapes_over_time | safe }};
+    const cumScrapesOverTime = {{ cumulative_scrapes_per_day | safe }};
+
+    const labels = statusCounts.map(s => s.status);
+    const values = statusCounts.map(s => s.count);
+
+    new Chart(document.getElementById("pie_scraped_vs_blocked"), {
+        type: "pie",
+        data: { labels, datasets: [{ data: values }] }
+    });
+
+    new Chart(document.getElementById("bar_scraped_vs_blocked"), {
+        type: "bar",
+        data: { labels, datasets: [{ label: "Count", data: values }] }
+    });
+
+    new Chart(document.getElementById("scrapes_per_minute"), {
+        type: "line",
+        data: {
+            labels: scrapesOverTime.map(d => d.minute),
+            datasets: [{
+                label: "Scrapes / Day",
+                data: scrapesOverTime.map(d => d.count),
+                tension: 0.3
+            }]
+        }
+    });
+
+    new Chart(document.getElementById("cumulative_scrapes_per_day"), {
+        type: "line",
+        data: {
+            labels: cumScrapesOverTime.map(w => w.day),
+            datasets: [{
+                label: "Scrapes / Day",
+                data: cumScrapesOverTime.map(w => w.cumulative_scrapes),
+                tension: 0.0
+            }]
+        }
+    });
+
+
+    // Reload every minute
+    setInterval(() => {
+        location.reload();
+    }, 60000);
+
+</script>
+</body>
+</html>
