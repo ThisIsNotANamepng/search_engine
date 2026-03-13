@@ -63,7 +63,7 @@ class CSVTracker:
     def _write_all(self, rows: list[dict]):
         """Write all rows to CSV."""
         with open(self.filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWrsiter(f, fieldnames=self.columns)
+            writer = csv.DictWriter(f, fieldnames=self.columns)
             writer.writeheader()
             writer.writerows(rows)
 
