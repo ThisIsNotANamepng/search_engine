@@ -31,7 +31,7 @@ import math
 
 
 def search(query):
-    start = time.time()
+    #start = time.time()
     """Run search against the Postgres DB via `scraper.get_conn()`.
 
     Uses array parameters with `ANY(%s)` so empty token groups are handled safely.
