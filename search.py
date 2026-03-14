@@ -60,7 +60,7 @@ def search(query):
         WITH
         word_matches AS (
             SELECT wu.url_id,
-                COUNT(*) * 20 AS word_score --for each word match to the search on a website, it gives a 20x scalar 
+                COUNT(*) * 25 AS word_score --for each word match to the search on a website, it gives a 20x scalar 
             FROM word_urls wu
             JOIN words w ON w.id = wu.word_id
             WHERE w.word = ANY(%s)
@@ -78,7 +78,7 @@ def search(query):
 
         trigram_matches AS (
             SELECT tu.url_id,
-                COUNT(*) * 1.5 AS trigram_score  -- 1.5x weight
+                COUNT(*) * 1.0 AS trigram_score  -- 1.5x weight
             FROM trigram_urls tu
             JOIN trigrams t ON t.id = tu.trigram_id
             WHERE t.trigram = ANY(%s)
@@ -123,7 +123,7 @@ def search(query):
                         word_count
                     ) / word_count
                 ) AS relevance,
-                (3.0 - ((c.reference_count::float8 + 1.0) / c.reference_count::float8))::double precision AS ref_score,
+                (2.0 - (POWER(c.reference_count, 1.0/1.2) / c.reference_count))::double precision AS ref_score,
                 c.reference_count
             FROM combined c
             JOIN urls u ON u.id = c.url_id
@@ -175,5 +175,5 @@ def search(query):
 
 # Example usage:
 # query = input("Search query: ")
-#query = "disney"
-#search(query)
+query = "disney"
+search(query)
