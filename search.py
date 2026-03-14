@@ -60,7 +60,7 @@ def search(query):
         WITH
         word_matches AS (
             SELECT wu.url_id,
-                COUNT(*) * 25 AS word_score --for each word match to the search on a website, it gives a 20x scalar 
+                COUNT(*) * 100 AS word_score --for each word match to the search on a website, it gives a 20x scalar 
             FROM word_urls wu
             JOIN words w ON w.id = wu.word_id
             WHERE w.word = ANY(%s)
