@@ -139,7 +139,7 @@ footer .externalUrl:last-child {
 #search-input {
   flex: 1;
   height: 50px;
-  background-color: #2d3a2d; /* green from palette */
+  background-color: #2d3a2d;
   color: var(--text);
   border: 2px solid var(--border);
   border-radius: 25px 0 0 25px;
@@ -151,7 +151,7 @@ footer .externalUrl:last-child {
 }
 
 #search-input:focus {
-  border-color: #4a5d4a; /* lighter green */
+  border-color: #4a5d4a;
 }
 
 #submit-btn {
