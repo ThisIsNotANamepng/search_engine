@@ -187,7 +187,7 @@ while True:
     #print("CLEANED", cleaned)
     
     # Batch add url references after cleaning
-    if cleaned and len(cleaned) > 1 and len(cleaned[0]) == 0:
+    if cleaned and len(cleaned) > 1:
         print(len(cleaned))
         current_domain = scraper.get_base_domain(url)
 
