@@ -12,7 +12,8 @@ Graphs:
 - 
 """
 
-from flask import Flask, render_template
+from flask import Flask, render_template, request, jsonify
+import search
 import psycopg2
 import psycopg2.extras
 import json
@@ -190,11 +191,15 @@ def dashboard():
 def creators():
     return render_template("creators.html")
 
-
 @app.route("/")
 def index():
-
     return render_template("index.html")
+
+@app.route("/search")
+def perform_search():
+    query_string = request.args.get("q")
+    search_results = search.search(query_string)
+    return render_template("search.html", search_results=search_results)
 
 
 if __name__ == "__main__":
