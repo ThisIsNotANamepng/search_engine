@@ -199,7 +199,7 @@ def index():
 def perform_search():
     query_string = request.args.get("q")
     search_results = search.search(query_string)
-    return render_template("search.html", search_results=search_results)
+    return render_template("search.html", search_results=search_results, query_string=query_string)
 
 
 if __name__ == "__main__":

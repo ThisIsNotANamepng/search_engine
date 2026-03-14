@@ -3,6 +3,8 @@
   --fg: #333a35;
   --border: #434945;
   --text: #ccd3cf;
+  --link: #518f97;
+  --link-hover: #69b7c2;
 }
 
 * {
@@ -48,6 +50,13 @@ h1 {
 
 p {
   font-size: 24px;
+}
+
+a {
+  color: var(--link);
+}
+a:hover {
+  color: var(--link-hover);
 }
 
 #motto-footer {

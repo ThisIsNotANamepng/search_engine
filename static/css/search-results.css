@@ -30,10 +30,23 @@ h1 {
 #results-container {
   display: flex;
   flex-direction: column;
+  gap: 15px;
   align-items: center;
-  padding: 10px;
+  padding: 15px;
   border: 3px solid var(--border);
   border-radius: 15px;
+}
+
+.result {
+  width: 100%;
+  /* border: 3px solid var(--border); */
+  /* border-radius: 15px; */
+}
+
+.result p {
+  margin-top: 5px;
+  margin-bottom: 5px;
+  font-size: 18px;
 }
 
 @media (max-width: 700px) {

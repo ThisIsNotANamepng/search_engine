@@ -16,7 +16,17 @@
             </form>
         </div>
         <div id="results-container">
-        
+            {% for url, score, relevance, ref_score, reference_count in search_results %}
+                <div class="result">
+                    <div id="text-buffer" style="margin:15px">
+                        <a href="{{ url }}">{{ url }}</a>
+                        <p>Search Score: {{ score }}</p>
+                        <p>Relevance: {{ relevance }}</p>
+                        <p>Ref Score: {{ ref_score }}</p>
+                        <p>Reference Ct:{{ reference_count }}</p>
+                    </div>
+                </div>
+            {% endfor %}
         </div>
     </body>
     <footer id="motto-footer">Website made by hand with love. ♡</footer>
