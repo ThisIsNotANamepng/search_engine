@@ -452,11 +452,9 @@ def get_main_text(url, timeout=None):
         "From": "hagenjj4111@uwec.edu"
     }
 
-    signal.signal(signal.SIGALRM, handler)
-    signal.alarm(timeout)
-
+    # Requests handles connect/read timeouts; avoid signal in threads.
     try:
-        r = requests.get(url, headers=headers, timeout=(5, 10))
+        r = requests.get(url, headers=headers, timeout=(5, timeout or 10))
 
         content_type = r.headers.get("Content-Type", "").lower()
 
@@ -484,9 +482,6 @@ def get_main_text(url, timeout=None):
     except requests.exceptions.RequestException as e:
         log(f"Error HTTP error fetching: {url} : {e}")
         return "", []
-    finally:
-        #print(5)
-        signal.alarm(0)
 
     
     return text_from_html(content, url)
