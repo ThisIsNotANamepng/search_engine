@@ -9,8 +9,8 @@
 </head>
     <body>
         <div id="search-header">
+            <h1 id="main-title"><a href="/" style="color:var(--text);text-decoration:none;">Stultus</a></h1>
             <form action="/search" method="get">
-                <h1 id="main-title">Stultus</h1>
                 <input id="search-input" name="q" type="search" placeholder=" Search..." value="{{ query_string }}">
                 <input id="submit-btn" type="submit" value="🔍">
             </form>
@@ -24,17 +24,17 @@
                             <a href="{{ url }}">{{ url }}</a>
                         </div>
                         <div>
-                            <p>Search Score: {{ score }}</p>
-                            <p>Relevance: {{ relevance }}</p>                            
+                            <p>Search Score: {{'%0.2f'|format(score)}}</p>
+                            <p>Relevance: {{ '%0.2f'|format(relevance) }}</p>                            
                         </div>
                         <div>
-                            <p>Ref Score: {{ ref_score }}</p>
-                            <p>Reference Ct: {{ reference_count }}</p>
+                            <p>Ref Score: {{ '%0.2f'|format(ref_score) }}</p>
+                            <p>Reference Ct: {{ '%0.2f'|format(reference_count) }}</p>
                         </div>
                         </div>
                 </div>
             {% endfor %}
         </div>
-        <footer id="motto-footer">Website made by hand with love. ♡</footer>
+        <!-- <footer id="motto-footer">Website made by hand with love. ♡</footer> -->
     </body>
 </html>
