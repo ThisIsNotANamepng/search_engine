@@ -136,16 +136,20 @@ while True:
     scraper.debug_print("")
     big_start = time.time()
 
-
-    """
-    if scraper.exists(url, 'url'):
+    if scraper.is_domain_blocked(scraper.get_base_domain(url)):
+        scraper.info_print(f"Domain is blocked, skipping {url}")
         continue
-    """
-    
+
     #try: # I took this try statement out, see note at the `except` ending
     # enforce a network/read timeout for page fetch and parsing
     ## TODO: I don't think this timeout works, we need to fix it
     links_to_scrape = scraper.store(url, timeout=TIMEOUT_TIME)
+
+    if links_to_scrape == scraper.RATE_LIMITED:
+        scraper.enqueue_url(url)
+        redis_client.set(f"domain:{base_domain}", 1, ex=300)
+        scraper.info_print(f"Rate limited, re-queued {url} with 5-min cooldown")
+        continue
     #print("first links_to_scrape", links_to_scrape)
 
 

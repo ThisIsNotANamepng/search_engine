@@ -25,6 +25,7 @@ import signal
 from typing import Optional
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
+RATE_LIMITED = "rate_limited"
 
 _BIGRAM_ID_MAP = None
 _TRIGRAM_ID_MAP = None
@@ -305,6 +306,12 @@ def create_database():
     CREATE TABLE IF NOT EXISTS word_urls (word_id INT NOT NULL, url_id INT NOT NULL);
 
     CREATE TABLE IF NOT EXISTS weights (type TEXT PRIMARY KEY, weight FLOAT NOT NULL);
+
+    CREATE TABLE IF NOT EXISTS blocked_domains (
+        domain VARCHAR(512) PRIMARY KEY,
+        reason VARCHAR(128),
+        blocked_at TIMESTAMP DEFAULT now()
+    );
     """)
 
 
@@ -529,12 +536,18 @@ def get_main_text(url, timeout=None):
             return False
 
         """
+        if r.status_code in (401, 403):
+            block_domain(url, f"HTTP {r.status_code}")
+            return False
+
+        if r.status_code == 429:
+            log(f"Error Rate limited {url}")
+            return RATE_LIMITED
+
         # Check for text only
         if not content_type.startswith("text/"):
             log(f"Error Invalid data type {url}")
             return False
-
-        # TODO: Add check for concerning http error codes
 
         content = r.content
             
@@ -601,6 +614,33 @@ def get_base_domain(url):
     return host
 
 
+def block_domain(url, reason=""):
+    domain = get_base_domain(url)
+    if not domain:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO blocked_domains (domain, reason) VALUES (%s, %s) ON CONFLICT (domain) DO NOTHING;",
+        (domain, reason)
+    )
+    cur.execute("DELETE FROM url_queue WHERE url LIKE %s;", (f"%{domain}%",))
+    conn.commit()
+    cur.close()
+    conn.close()
+    log(f"Blocked domain {domain} reason={reason}")
+
+
+def is_domain_blocked(domain):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM blocked_domains WHERE domain = %s;", (domain,))
+    blocked = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return blocked
+
+
 def store(url, timeout=None):
     """
     Store the page at `url` and return discovered links.
@@ -616,6 +656,8 @@ def store(url, timeout=None):
 
     debug_print("Visited site, got main text and links")
 
+    if content == RATE_LIMITED:
+        return RATE_LIMITED
 
     if content != False:
         # The url contains real text to scrape
