@@ -485,7 +485,6 @@ def get_main_text(url, timeout=None):
         # Only allow HTML content
         if not (
             content_type.startswith("text/html")
-            or content_type.startswith("application/xhtml+xml")
         ):
             log(f"Error Invalid data type {url}")
             return False
