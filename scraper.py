@@ -7,6 +7,8 @@ import os
 import time
 import requests
 import socket
+import string
+import itertools
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 from urllib.parse import urlparse, urljoin
@@ -23,6 +25,10 @@ import signal
 from typing import Optional
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
+RATE_LIMITED = "rate_limited"
+
+_BIGRAM_ID_MAP = None
+_TRIGRAM_ID_MAP = None
 DEBUG_BREAKPOINT_TIMER = time.time()
 # Look for the DEBUG shell varialbe and set a global variable to True or false base don whether it was passed
 DEBUG = "DEBUG" in os.environ
@@ -300,6 +306,12 @@ def create_database():
     CREATE TABLE IF NOT EXISTS word_urls (word_id INT NOT NULL, url_id INT NOT NULL);
 
     CREATE TABLE IF NOT EXISTS weights (type TEXT PRIMARY KEY, weight FLOAT NOT NULL);
+
+    CREATE TABLE IF NOT EXISTS blocked_domains (
+        domain VARCHAR(512) PRIMARY KEY,
+        reason VARCHAR(128),
+        blocked_at TIMESTAMP DEFAULT now()
+    );
     """)
 
 
@@ -308,6 +320,40 @@ def create_database():
     conn.close()
 
     set_default_weights()
+    populate_static_ngrams()
+
+def populate_static_ngrams():
+    """Pre-populate all the bigrams/trigrams so store() doesn't have to re-insert every time"""
+    chars = string.ascii_lowercase
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    # bigram crap
+    bigram_values = [(''.join(b),) for b in itertools.product(chars, repeat=2)]
+
+    extras.execute_values(cur, "INSERT INTO bigrams (bigram) VALUES %s ON CONFLICT (bigram) DO NOTHING;", bigram_values)
+
+    # trigram crap
+    trigram_values = [(''.join(stupidthinghole),) for stupidthinghole in itertools.product(chars, repeat=3)]
+    extras.execute_values(cur, "INSERT INTO trigrams (trigram) VALUES %s ON CONFLICT (trigram) DO NOTHING;", trigram_values)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def load_static_token_maps():
+    global _BIGRAM_ID_MAP, _TRIGRAM_ID_MAP
+    if _BIGRAM_ID_MAP is not None:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT bigram, id FROM bigrams;")
+    _BIGRAM_ID_MAP = {row[0].strip(): row[1] for row in cur.fetchall()}
+    cur.execute("SELECT trigram, id FROM trigrams;")
+    _TRIGRAM_ID_MAP = {row[0].strip(): row[1] for row in cur.fetchall()}
+    cur.close()
+    conn.close()
+
 
 def set_default_weights():
     conn = get_conn()
@@ -473,14 +519,30 @@ def get_main_text(url, timeout=None):
         "From": "crawler@stultus.rip"
     }
 
-    ##TODO: I don't think this (timeout) works
     signal.signal(signal.SIGALRM, handler)
-    signal.alarm(timeout)
+    signal.alarm(timeout or 0)
 
     try:
         r = requests.get(url, headers=headers, timeout=(5, 10))
 
         content_type = r.headers.get("Content-Type", "").lower()
+
+        """
+        # We want to do pdf in the fiture, for now we don't scrape pdfs
+
+        # Check for text and pdf only
+        if not content_type.startswith("text/") and not content_type == "application/pdf":
+            log(f"Error Invalid data type {url}")
+            return False
+
+        """
+        if r.status_code in (401, 403):
+            block_domain(url, f"HTTP {r.status_code}")
+            return False
+
+        if r.status_code == 429:
+            log(f"Error Rate limited {url}")
+            return RATE_LIMITED
 
         # Only allow HTML content
         if not (
@@ -488,8 +550,6 @@ def get_main_text(url, timeout=None):
         ):
             log(f"Error Invalid data type {url}")
             return False
-
-        # TODO: Add check for concerning http error codes
 
         content = r.content
             
@@ -556,12 +616,40 @@ def get_base_domain(url):
     return host
 
 
+def block_domain(url, reason=""):
+    domain = get_base_domain(url)
+    if not domain:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO blocked_domains (domain, reason) VALUES (%s, %s) ON CONFLICT (domain) DO NOTHING;",
+        (domain, reason)
+    )
+    cur.execute("DELETE FROM url_queue WHERE url LIKE %s;", (f"%{domain}%",))
+    conn.commit()
+    cur.close()
+    conn.close()
+    log(f"Blocked domain {domain} reason={reason}")
+
+
+def is_domain_blocked(domain):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM blocked_domains WHERE domain = %s;", (domain,))
+    blocked = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return blocked
+
+
 def store(url, timeout=None):
     """
     Store the page at `url` and return discovered links.
 
     If `timeout` is provided it is forwarded to HTTP fetch.
     """
+    load_static_token_maps()
     #info_print("Starting storing")
     global URL
     URL = url
@@ -570,6 +658,8 @@ def store(url, timeout=None):
 
     debug_print("Visited site, got main text and links")
 
+    if content == RATE_LIMITED:
+        return RATE_LIMITED
 
     if content != False:
         # The url contains real text to scrape
@@ -696,18 +786,6 @@ def store(url, timeout=None):
             extra_vals,
             template=None)
 
-    if bigrams:
-        extra_vals = [(b,) for b in bigrams]
-        extras.execute_values(cur,
-            "INSERT INTO bigrams (bigram) VALUES %s ON CONFLICT (bigram) DO NOTHING;",
-            extra_vals)
-
-    if trigrams:
-        extra_vals = [(t,) for t in trigrams]
-        extras.execute_values(cur,
-            "INSERT INTO trigrams (trigram) VALUES %s ON CONFLICT (trigram) DO NOTHING;",
-            extra_vals)
-
     if prefixes:
         extra_vals = [(p,) for p in prefixes]
         extras.execute_values(cur,
@@ -735,8 +813,8 @@ def store(url, timeout=None):
     debug_print("Added new, unseen tokens to the database")
 
     word_map = fetch_id_map('word', 'words', list(words))
-    bigram_map = fetch_id_map('bigram', 'bigrams', list(bigrams))
-    trigram_map = fetch_id_map('trigram', 'trigrams', list(trigrams))
+    bigram_map = _BIGRAM_ID_MAP
+    trigram_map = _TRIGRAM_ID_MAP
     prefix_map = fetch_id_map('prefix', 'prefixes', list(prefixes))
 
     debug_print("Made token maps")
