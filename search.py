@@ -21,7 +21,6 @@ where word_score = len(word)/2
 import tokenizer
 import scraper
 import time
-import math
 import os
 
 DEBUG = "DEBUG" in os.environ
@@ -60,7 +59,7 @@ def search(query):
         WITH
         word_matches AS (
             SELECT wu.url_id,
-                COUNT(*) * 100 AS word_score --for each word match to the search on a website, it gives a 20x scalar 
+                COUNT(*) * 20 AS word_score --for each word match to the search on a website, it gives a 20x scalar 
             FROM word_urls wu
             JOIN words w ON w.id = wu.word_id
             WHERE w.word = ANY(%s)
@@ -69,7 +68,7 @@ def search(query):
 
         bigram_matches AS (
             SELECT bu.url_id,
-                COUNT(*) * 1.0 AS bigram_score  -- 1x weight
+                COUNT(*) * 1 AS bigram_score  -- 1x weight
             FROM bigram_urls bu
             JOIN bigrams b ON b.id = bu.bigram_id
             WHERE b.bigram = ANY(%s)
@@ -78,7 +77,7 @@ def search(query):
 
         trigram_matches AS (
             SELECT tu.url_id,
-                COUNT(*) * 1.0 AS trigram_score  -- 1.5x weight
+                COUNT(*) * 1 AS trigram_score  -- 1.5x weight
             FROM trigram_urls tu
             JOIN trigrams t ON t.id = tu.trigram_id
             WHERE t.trigram = ANY(%s)
@@ -88,7 +87,7 @@ def search(query):
         prefix_matches AS (
             SELECT 
                 pu.url_id,
-                    COUNT(*) * 10 AS prefix_score --gives 10x scalar when a prefix match is detected for each prefix on a website
+                    COUNT(*) * 2 AS prefix_score --gives 10x scalar when a prefix match is detected for each prefix on a website
             FROM prefix_urls pu
             JOIN prefixes p ON p.id = pu.prefix_id
             WHERE p.prefix = ANY(%s)
@@ -115,15 +114,7 @@ def search(query):
             SELECT
                 u.url,
                 u.title,
-                (
-                    (
-                        prefix_score +
-                        bigram_score +
-                        trigram_score +
-                        word_score +
-                        word_count
-                    ) / word_count
-                ) AS relevance,
+                ((prefix_score + bigram_score + trigram_score + word_score + word_count) / word_count) AS relevance,
                 (2.0 - (POWER(c.reference_count, 1.0/1.2) / c.reference_count))::double precision AS ref_score,
                 c.reference_count
             FROM combined c
