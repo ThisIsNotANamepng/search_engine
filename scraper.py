@@ -629,9 +629,14 @@ def store(url, timeout=None):
 
     for link in raw_links:
         #print("link:", link)
-        # Get rid of ?post=data and #section data
-        clean_link = link.split('?', 1)[0]
-        clean_link = clean_link.split('#', 1)[0]
+        clean_link = link.split('?', 1)[0] #gets rid of anything after a ?
+        clean_link = clean_link.split('#', 1)[0] #gets rid of anything after a #
+
+        slash_index = clean_link.rfind("/") #finds where the last "/" is in a string and returns the index of that
+        clean_link_length = len(clean_link)-1 #returns max index value of the link
+        if slash_index == clean_link_length:
+            clean_link = clean_link[:-1] #gets rid of the "/" if a link ends with it
+            
         if clean_link not in cleaned:
             link_domain = get_base_domain(clean_link)
             link_domains.append(link_domain)
