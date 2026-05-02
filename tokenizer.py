@@ -7,8 +7,9 @@ from nltk.util import bigrams
 from nltk.util import trigrams
 from nltk.corpus import stopwords
 
-nltk.download('punkt', quiet=True)
-nltk.download('stopwords', quiet=True)
+# Already downloaded when building the container, theoretically shouldn't need any more changes because the dockerfile also sets the env variable pointing to the data
+#nltk.download('punkt', quiet=True)
+#nltk.download('stopwords', quiet=True)
 
 STOP_WORDS = list(stopwords.words('english'))
 
