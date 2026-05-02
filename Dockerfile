@@ -9,7 +9,7 @@ RUN git clone --depth 1 https://github.com/ThisIsNotANamepng/search_engine.git
 RUN python3 -m venv /env
 RUN /env/bin/pip install -r search_engine/requirements.txt
 
-RUN python -m nltk.downloader -d /usr/share/nltk_data punkt_tab stopwords
+RUN /env/bin/python3 -m nltk.downloader -d /usr/share/nltk_data punkt_tab stopwords
 ENV NLTK_DATA=/usr/share/nltk_data
 
 WORKDIR /search_engine
