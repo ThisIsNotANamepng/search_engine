@@ -23,6 +23,7 @@ from langdetect import detect
 import csv
 import signal
 from typing import Optional
+import sqlite3
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
 RATE_LIMITED = "rate_limited"
@@ -611,8 +612,8 @@ def get_base_domain(url):
     if not host:
         return ""
     ext = tldextract.extract(host)
-    if ext.registered_domain:
-        return ext.registered_domain
+    if ext.top_domain_under_public_suffix:
+        return ext.top_domain_under_public_suffix
     return host
 
 
@@ -1126,3 +1127,21 @@ def domain_free_for_scraping(domain, redis_client):
 
     key = f"domain:{domain}"
     return not redis_client.exists(key)
+
+def check_url_in_blocklist(url):
+    """
+    Takes url, checks if base domain in the blocklist.db
+
+    Returns True if the domain is in the blocklist (cannot scrape), False if not
+    """
+
+    domain = get_base_domain(url)
+
+    conn = sqlite3.connect("blocklist.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * from blocklist where domain=(?)", (domain,))
+    result = cursor.fetchone()
+    conn.close()
+
+    return(result is not None)
+

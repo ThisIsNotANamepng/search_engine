@@ -11,3 +11,6 @@ env/
 scraper.log
 timing.csv
 *.swp
+cleaned_hosts.txt
+hosts.txt
+blocklist.db

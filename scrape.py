@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import os
 import redis
 from typing import List, Tuple
+import sqlite3
 
 TIMEOUT_TIME = 10  # seconds to wait for fetching a page before skipping
 LOCAL_QUEUE_LENGTH = 60 # number of URLs to hold locally for scraping
@@ -131,6 +132,10 @@ while True:
             continue
     """
     if url == "": continue  # If the local_queue is 0 and the loop above ends but the url isn't valid (not in redis and not prev_base_domain) the invalid url will be use for the scraping code below, thus we only assign url a value if it passes all checks
+    
+    if scraper.check_url_in_blocklist(url):
+        scraper.log("Misc URL found in malicious domain blocklist, exiting")
+        continue
 
     scraper.log(f"Starting scraping {url}")
     scraper.debug_print("")
