@@ -23,11 +23,18 @@
 //	PROXY_MAX_PER_HOST      pooled idle conns per host       (default 64)
 //	PROXY_AUTH              optional "user:pass" basic auth  (default none)
 //	PROXY_UPSTREAM          next-hop proxy URL for /fetch    (default none)
+//	PROXY_TLS_CERT          PEM cert path; if set with KEY,  (default unset)
+//	                        listener serves HTTPS instead of HTTP
+//	PROXY_TLS_KEY           PEM key path (paired with CERT)  (default unset)
+//	PROXY_TLS_INSECURE      if set, this proxy skips TLS     (default unset)
+//	                        verification when dialing
+//	                        PROXY_UPSTREAM (self-signed OK)
 //	DEBUG                   if set, log each request + time  (default unset)
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -109,6 +116,11 @@ func newProxy() *proxy {
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		DisableCompression:    true, // pass bytes through; let the scraper decode
+	}
+	if os.Getenv("PROXY_TLS_INSECURE") != "" {
+		// Used when PROXY_UPSTREAM is https:// with a self-signed cert.
+		// Encrypts the hop but does not authenticate the peer.
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
 	var auth string
@@ -424,9 +436,24 @@ func main() {
 		close(idleClosed)
 	}()
 
-	log.Printf("forward proxy listening on %s", addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("listen error: %v", err)
+	certFile := os.Getenv("PROXY_TLS_CERT")
+	keyFile := os.Getenv("PROXY_TLS_KEY")
+	tlsEnabled := certFile != "" && keyFile != ""
+
+	scheme := "http"
+	if tlsEnabled {
+		scheme = "https"
+	}
+	log.Printf("forward proxy listening on %s://%s", scheme, addr)
+
+	var listenErr error
+	if tlsEnabled {
+		listenErr = srv.ListenAndServeTLS(certFile, keyFile)
+	} else {
+		listenErr = srv.ListenAndServe()
+	}
+	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
+		log.Fatalf("listen error: %v", listenErr)
 	}
 	<-idleClosed
 	log.Printf("stopped")
