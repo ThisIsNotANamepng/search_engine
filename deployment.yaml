@@ -1,22 +1,22 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: test-stultus
+  name: stultus
   labels:
-    app: test-stultus
+    app: stultus
 spec:
   replicas: 6
   selector:
     matchLabels:
-      app: test-stultus
+      app: stultus
   template:
     metadata:
       labels:
-        app: test-stultus
+        app: stultus
     spec:
       containers:
-        - name: test-stultus
-          image: ilikecontainers/test_stultus_scraper:1.0.4
+        - name: stultus
+          image: ilikecontainers/stultus_scraper:1.0.0
           imagePullPolicy: Always
           env:
             - name: DATABASE_URL
@@ -24,3 +24,5 @@ spec:
                 secretKeyRef:
                   name: db-secret
                   key: DATABASE_URL
+            - name: SCRAPER_PROXY
+              value: "http://proxy-a:8888"
