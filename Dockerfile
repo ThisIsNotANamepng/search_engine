@@ -7,7 +7,7 @@ RUN apt update && apt install -y \
 RUN git clone --depth 1 https://github.com/ThisIsNotANamepng/search_engine.git
 
 RUN python3 -m venv /env
-RUN /env/bin/pip install -r search_engine/requirments.txt
+RUN /env/bin/pip install -r search_engine/requirements.txt
 
 WORKDIR /search_engine
 
