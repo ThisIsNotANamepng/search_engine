@@ -30,3 +30,8 @@ spec:
                 secretKeyRef:
                   name: db-secret
                   key: SCRAPER_PROXY
+            - name: SCRAPER_PROXY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: SCRAPER_PROXY_PASSWORD

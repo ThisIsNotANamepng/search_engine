@@ -21,7 +21,10 @@
 //	PROXY_READ_HEADER_TO    header read timeout              (default 10s)
 //	PROXY_MAX_IDLE_CONNS    pooled idle conns total          (default 4096)
 //	PROXY_MAX_PER_HOST      pooled idle conns per host       (default 64)
-//	PROXY_AUTH              optional "user:pass" basic auth  (default none)
+//	PROXY_PASSWORD          shared-secret required on every  (default none)
+//	                        inbound request as the
+//	                        X-Proxy-Auth header. Also sent
+//	                        upstream on /fetch chain hops.
 //	PROXY_UPSTREAM          next-hop proxy URL for /fetch    (default none)
 //	PROXY_TLS_CERT          PEM cert path; if set with KEY,  (default unset)
 //	                        listener serves HTTPS instead of HTTP
@@ -34,8 +37,8 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"io"
 	"log"
@@ -90,7 +93,7 @@ func envInt(key string, def int) int {
 type proxy struct {
 	transport      *http.Transport
 	dialer         *net.Dialer
-	authHeader     string // "Basic xxx" or ""
+	password       string // shared secret; empty disables auth
 	connectTimeout time.Duration
 	upstream       *url.URL // next-hop proxy for /fetch chaining; nil = terminal
 	debug          bool     // if true, log each request and its duration
@@ -123,10 +126,7 @@ func newProxy() *proxy {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
-	var auth string
-	if a := os.Getenv("PROXY_AUTH"); a != "" {
-		auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(a))
-	}
+	password := os.Getenv("PROXY_PASSWORD")
 
 	var upstream *url.URL
 	if u := os.Getenv("PROXY_UPSTREAM"); u != "" {
@@ -140,7 +140,7 @@ func newProxy() *proxy {
 	return &proxy{
 		transport:      tr,
 		dialer:         d,
-		authHeader:     auth,
+		password:       password,
 		connectTimeout: connectTO,
 		upstream:       upstream,
 		debug:          os.Getenv("DEBUG") != "",
@@ -148,15 +148,15 @@ func newProxy() *proxy {
 }
 
 func (p *proxy) checkAuth(r *http.Request) bool {
-	if p.authHeader == "" {
+	if p.password == "" {
 		return true
 	}
-	return r.Header.Get("Proxy-Authorization") == p.authHeader
+	got := r.Header.Get("X-Proxy-Auth")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(p.password)) == 1
 }
 
 func (p *proxy) requireAuth(w http.ResponseWriter) {
-	w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
-	http.Error(w, "proxy auth required", http.StatusProxyAuthRequired)
+	http.Error(w, "proxy auth required", http.StatusUnauthorized)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -262,6 +262,9 @@ func (p *proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		if v := r.Header.Get(h); v != "" {
 			outReq.Header.Set(h, v)
 		}
+	}
+	if p.upstream != nil && p.password != "" {
+		outReq.Header.Set("X-Proxy-Auth", p.password)
 	}
 
 	if p.debug {

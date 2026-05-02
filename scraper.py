@@ -31,6 +31,8 @@ RATE_LIMITED = "rate_limited"
 # (configured on A via PROXY_UPSTREAM), which then makes the real outbound
 # request. Unset to fetch directly without a proxy.
 SCRAPER_PROXY = os.environ.get("SCRAPER_PROXY", "").rstrip("/")
+SCRAPER_PROXY_PASSWORD = os.environ.get("SCRAPER_PROXY_PASSWORD", "")
+_PROXY_HEADERS = {"X-Proxy-Auth": SCRAPER_PROXY_PASSWORD} if SCRAPER_PROXY_PASSWORD else {}
 
 _BIGRAM_ID_MAP = None
 _TRIGRAM_ID_MAP = None
@@ -488,7 +490,7 @@ def allowed_by_robots(url, user_agent):
     try:
         rp.set_url(robots_url)
         if SCRAPER_PROXY:
-            resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent}, timeout=5)
+            resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
         else:
             resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
         if resp.status_code != 200:
@@ -533,7 +535,7 @@ def get_main_text(url, timeout=None):
 
     try:
         if SCRAPER_PROXY:
-            r = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers=headers, timeout=(5, 10))
+            r = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10))
         else:
             r = requests.get(url, headers=headers, timeout=(5, 10))
 
