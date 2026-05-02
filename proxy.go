@@ -126,7 +126,7 @@ func newProxy() *proxy {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
-	password := os.Getenv("PROXY_PASSWORD")
+	password := strings.TrimSpace(os.Getenv("PROXY_PASSWORD"))
 
 	var upstream *url.URL
 	if u := os.Getenv("PROXY_UPSTREAM"); u != "" {

@@ -12,6 +12,9 @@ RUN /env/bin/pip install -r search_engine/requirements.txt
 RUN /env/bin/python3 -m nltk.downloader -d /usr/share/nltk_data punkt_tab stopwords
 ENV NLTK_DATA=/usr/share/nltk_data
 
+# Apparently tldextract gets its data from publicsuffix.org, so we need to have it download its cache when building the container
+RUN /env/bin/python3 -c "import tldextract; tldextract.extract('http://example.com')"
+
 WORKDIR /search_engine
 
 CMD ["/env/bin/python3", "scrape.py"]

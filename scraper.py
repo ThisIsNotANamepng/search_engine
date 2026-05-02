@@ -1142,12 +1142,55 @@ def domain_free_for_scraping(domain, redis_client):
     key = f"domain:{domain}"
     return not redis_client.exists(key)
 
+def _refresh_blocklist_if_stale():
+    """
+    If the local blocklist.db is missing or its last_updated row is older
+    than an hour, re-download it from db01 (port 8002/blocklist.db)
+    """
+
+    needs_refresh = True
+    if os.path.exists("blocklist.db"):
+        try:
+            conn = sqlite3.connect("blocklist.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT last_updated FROM last_updated LIMIT 1")
+            row = cursor.fetchone()
+            conn.close()
+            if row is not None:
+                needs_refresh = (time.time() - float(row[0])) > 3600
+        except (sqlite3.Error, ValueError, TypeError):
+            needs_refresh = True
+
+    if not needs_refresh:
+        return
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        failure_print("Cannot refresh blocklist: DATABASE_URL not set")
+        return
+    host = urlparse(database_url).hostname
+    if not host:
+        failure_print("Cannot refresh blocklist: no host in DATABASE_URL")
+        return
+
+    download_url = f"http://{host}:8002/blocklist.db"
+    tmp_path = "blocklist.db.tmp"
+    with requests.get(download_url, stream=True, timeout=30) as resp:
+        resp.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+    os.replace(tmp_path, "blocklist.db")
+
 def check_url_in_blocklist(url):
     """
     Takes url, checks if base domain in the blocklist.db
 
     Returns True if the domain is in the blocklist (cannot scrape), False if not
     """
+
+    _refresh_blocklist_if_stale()
 
     domain = get_base_domain(url)
 

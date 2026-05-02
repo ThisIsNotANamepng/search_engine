@@ -17,7 +17,7 @@ spec:
       containers:
         - name: stultus
           #image: docker.io/ilikecontainers/stultus:1.0.0
-          image: db01:5000/stultus:latest # Chud indexing nodes can't reach the internet, db01 is now a registry
+          image: db01:5000/stultus:1.0.5 # db01 is the registry because in nodes can't reach docker
           imagePullPolicy: Always
           env:
             - name: DATABASE_URL
