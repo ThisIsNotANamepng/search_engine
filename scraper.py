@@ -487,7 +487,10 @@ def allowed_by_robots(url, user_agent):
     # to the parser via `rp.parse()`.
     try:
         rp.set_url(robots_url)
-        resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
+        if SCRAPER_PROXY:
+            resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent}, timeout=5)
+        else:
+            resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
         if resp.status_code != 200:
             # If robots.txt not found or inaccessible, assume allowed
             return True
