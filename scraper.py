@@ -27,6 +27,10 @@ import sqlite3
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
 RATE_LIMITED = "rate_limited"
+# Entry point of the proxy chain (proxy A). Proxy A forwards to proxy B
+# (configured on A via PROXY_UPSTREAM), which then makes the real outbound
+# request. Unset to fetch directly without a proxy.
+SCRAPER_PROXY = os.environ.get("SCRAPER_PROXY", "").rstrip("/")
 
 _BIGRAM_ID_MAP = None
 _TRIGRAM_ID_MAP = None
@@ -35,6 +39,7 @@ DEBUG_BREAKPOINT_TIMER = time.time()
 DEBUG = "DEBUG" in os.environ
 LEVEL = os.environ["DEBUG"] if DEBUG else False
 URL = ""
+
 
 class CSVTracker:
     def __init__(self, filename: str = "timing.csv"):
@@ -524,7 +529,10 @@ def get_main_text(url, timeout=None):
     signal.alarm(timeout or 0)
 
     try:
-        r = requests.get(url, headers=headers, timeout=(5, 10))
+        if SCRAPER_PROXY:
+            r = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers=headers, timeout=(5, 10))
+        else:
+            r = requests.get(url, headers=headers, timeout=(5, 10))
 
         content_type = r.headers.get("Content-Type", "").lower()
 
@@ -673,6 +681,7 @@ def store(url, timeout=None):
         # Url is a file format which cannot be scraped
         ## TODO: I don't think this completely works, need to test with a abunch of file formats so we don't try to scrape files like images and stuff
 
+        print(content)
         info_print("URL stores a file format we can't scrape")
         return
     
@@ -1145,3 +1154,5 @@ def check_url_in_blocklist(url):
 
     return(result is not None)
 
+if not SCRAPER_PROXY:
+    info_print("Not using scraper proxy")

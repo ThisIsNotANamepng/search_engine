@@ -5,6 +5,10 @@
 //     that offer it) and streams the response back.
 //   - HTTPS: handles CONNECT, hijacks the client conn, splices it to a fresh
 //     TCP conn to the origin. TLS stays end-to-end; the proxy never decrypts.
+//   - GET /fetch?url=<target>: URL-forwarding endpoint that supports chaining
+//     proxies. If PROXY_UPSTREAM is set, the request is forwarded to
+//     <upstream>/fetch?url=<target>; otherwise the target is fetched directly.
+//     Origin status, headers, and body are streamed back to the caller.
 //
 // Designed to run as a Service in k3s. Single binary, no deps. Scale by
 // raising the Deployment replica count.
@@ -18,6 +22,8 @@
 //	PROXY_MAX_IDLE_CONNS    pooled idle conns total          (default 4096)
 //	PROXY_MAX_PER_HOST      pooled idle conns per host       (default 64)
 //	PROXY_AUTH              optional "user:pass" basic auth  (default none)
+//	PROXY_UPSTREAM          next-hop proxy URL for /fetch    (default none)
+//	DEBUG                   if set, log each request + time  (default unset)
 package main
 
 import (
@@ -28,6 +34,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -78,6 +85,8 @@ type proxy struct {
 	dialer         *net.Dialer
 	authHeader     string // "Basic xxx" or ""
 	connectTimeout time.Duration
+	upstream       *url.URL // next-hop proxy for /fetch chaining; nil = terminal
+	debug          bool     // if true, log each request and its duration
 }
 
 func newProxy() *proxy {
@@ -107,11 +116,22 @@ func newProxy() *proxy {
 		auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(a))
 	}
 
+	var upstream *url.URL
+	if u := os.Getenv("PROXY_UPSTREAM"); u != "" {
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			log.Fatalf("invalid PROXY_UPSTREAM %q: %v", u, err)
+		}
+		upstream = parsed
+	}
+
 	return &proxy{
 		transport:      tr,
 		dialer:         d,
 		authHeader:     auth,
 		connectTimeout: connectTO,
+		upstream:       upstream,
+		debug:          os.Getenv("DEBUG") != "",
 	}
 }
 
@@ -128,6 +148,14 @@ func (p *proxy) requireAuth(w http.ResponseWriter) {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if p.debug {
+		start := time.Now()
+		summary := requestSummary(r)
+		log.Printf("→ %s %s from %s", r.Method, summary, r.RemoteAddr)
+		defer func() {
+			log.Printf("← %s %s in %s", r.Method, summary, time.Since(start))
+		}()
+	}
 	if !p.checkAuth(r) {
 		p.requireAuth(w)
 		return
@@ -136,7 +164,126 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleConnect(w, r)
 		return
 	}
+	if r.URL.Path == "/fetch" {
+		p.handleFetch(w, r)
+		return
+	}
 	p.handleHTTP(w, r)
+}
+
+// requestSummary picks the most useful one-line description of an inbound
+// request for debug logging. For /fetch it surfaces the wrapped target URL;
+// for absolute-form proxy requests it shows the URL as the client sent it;
+// otherwise it falls back to host + request URI.
+func requestSummary(r *http.Request) string {
+	if r.URL.Path == "/fetch" {
+		if t := r.URL.Query().Get("url"); t != "" {
+			return "/fetch?url=" + t
+		}
+	}
+	if r.URL.IsAbs() {
+		return r.URL.String()
+	}
+	if r.Method == http.MethodConnect {
+		return r.Host
+	}
+	return r.Host + r.URL.RequestURI()
+}
+
+// fetchHeaders is the set of client request headers that get forwarded along
+// each chain hop and ultimately to the origin. Hop-by-hop and proxy-control
+// headers are deliberately excluded.
+var fetchHeaders = []string{
+	"User-Agent",
+	"From",
+	"Accept",
+	"Accept-Language",
+	"Accept-Encoding",
+	"Cookie",
+	"Referer",
+	"If-None-Match",
+	"If-Modified-Since",
+}
+
+// handleFetch implements the chained URL-forwarding endpoint:
+//
+//	GET /fetch?url=<absolute target URL>
+//
+// If p.upstream is set, the request is forwarded to <upstream>/fetch?url=<target>;
+// otherwise the target is fetched directly. Origin status, headers, and body
+// are streamed back to the caller. Each Go request runs in its own goroutine,
+// so concurrency is unbounded by design — rely on the transport's pool limits.
+func (p *proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	target := r.URL.Query().Get("url")
+	if target == "" {
+		http.Error(w, "missing url query param", http.StatusBadRequest)
+		return
+	}
+	parsedTarget, err := url.Parse(target)
+	if err != nil || !parsedTarget.IsAbs() || (parsedTarget.Scheme != "http" && parsedTarget.Scheme != "https") {
+		http.Error(w, "url must be an absolute http(s) URL", http.StatusBadRequest)
+		return
+	}
+
+	var nextURL string
+	if p.upstream != nil {
+		u := *p.upstream
+		u.Path = "/fetch"
+		q := url.Values{}
+		q.Set("url", target)
+		u.RawQuery = q.Encode()
+		nextURL = u.String()
+	} else {
+		nextURL = target
+	}
+
+	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, nextURL, nil)
+	if err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	for _, h := range fetchHeaders {
+		if v := r.Header.Get(h); v != "" {
+			outReq.Header.Set(h, v)
+		}
+	}
+
+	if p.debug {
+		hop := "origin"
+		if p.upstream != nil {
+			hop = "upstream proxy"
+		}
+		log.Printf("⇒ /fetch forwarding to %s: %s", hop, nextURL)
+	}
+
+	roundStart := time.Now()
+	resp, err := p.transport.RoundTrip(outReq)
+	if err != nil {
+		log.Printf("fetch upstream error: dialing %s (target=%s): %v", nextURL, target, err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if p.debug {
+		log.Printf("⇐ /fetch upstream %s -> %d in %s", nextURL, resp.StatusCode, time.Since(roundStart))
+	}
+
+	dst := w.Header()
+	for k, vv := range resp.Header {
+		if _, drop := hopByHop[http.CanonicalHeaderKey(k)]; drop {
+			continue
+		}
+		clone := make([]string, len(vv))
+		copy(clone, vv)
+		dst[k] = clone
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func (p *proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
