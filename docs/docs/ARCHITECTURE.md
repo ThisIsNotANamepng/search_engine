@@ -15,4 +15,4 @@ So instead we need to keep track of exactly when we touch each domain. This woul
 ##
 
 
-![My graph of the system Architecture](img/Architecture.jpg)
+![My graph of the system Architecture](/img/Architecture.jpg)
