@@ -46,7 +46,7 @@ $env:DATABASE_URL = "postgres://postgres:postgressPassword@postgressIP:5432/sear
 app.py             Dashboard & searching pages
 search.py          Searching functions & algorithms
 scrape.py          Main scraping script (relies on utils.py)
-utils.py         Functions called to scrape (relies tokenizer)
+utils.py           Functions called to scrape (relies tokenizer)
 tokenizer.py       Tokenize the scraped data to be added to the database
 seed_urls.csv      Website URLs to jumpstart the crawler queue
 templates          
