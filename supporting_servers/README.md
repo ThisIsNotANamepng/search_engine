@@ -1,6 +1,6 @@
 # Supporting Servers
 
-Scrapers need two additional servers running on the head node besides the database
+Scrapers need three additional servers running on the head node besides the database
 
 ## Blocklist
 
@@ -13,3 +13,9 @@ The script `update_local_blocklist.py` downloads Steven Black's host file and co
 The way we have our scrapers set up internally, a proxy is run on the head node and another copy on the cloud proxy server. It's a vibe coded go file `proxy.go`
 
 I'll put the commands to run the proxies here later
+
+## Site Text Storage
+
+In addition to storing the tokenized text in the search index, we also store a copy of the text of all indexed websites for research purposes.
+
+The file to run is `web_storage_server.py`
