@@ -2,7 +2,7 @@
 
 This is a living document describing how our networking and clustering is set up
 
-## How to srt up the K8 cluster
+## How to set up the K8 cluster
 
 *As of right now is untested, this is in the planning phase
 
