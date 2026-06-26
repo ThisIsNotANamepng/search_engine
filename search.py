@@ -19,7 +19,7 @@ where word_score = len(word)/2
 """
 
 import tokenizer
-import scraper
+import utils
 import time
 import os
 

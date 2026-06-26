@@ -1,4 +1,4 @@
-import scraper
+import utils
 
 conn = utils.get_conn()
 cur = conn.cursor()
