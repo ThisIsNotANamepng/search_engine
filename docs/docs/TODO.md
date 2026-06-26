@@ -1,6 +1,12 @@
 (# Todo:
 
-(Update it with the progres you've made, add whatever you need to)
+(Update it with the progress you've made, add whatever you need to)
+
+## Summer 2026 Cleanup
+
+- [ ] Add standardized comments describing the inputs/outputs for all utils.py functions
+- [ ] Make the tests code work for testing new algorithms and speed
+- [ ] 
 
 ## Web Crawling
 
