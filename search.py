@@ -37,11 +37,11 @@ def debug_print(text, text1=""):
 
 def search(query):
     #start = time.time()
-    """Run search against the Postgres DB via `scraper.get_conn()`.
+    """Run search against the Postgres DB via `utils.get_conn()`.
 
     Uses array parameters with `ANY(%s)` so empty token groups are handled safely.
     """
-    conn = scraper.get_conn()
+    conn = utils.get_conn()
     cur = conn.cursor()
 
     tokenized = tokenizer.tokenize_all(query)

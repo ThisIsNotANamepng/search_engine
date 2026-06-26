@@ -104,7 +104,7 @@ def dashboard():
     print(4, time.time()-start)
     start=time.time()
 
-    # Cummalative scrapes per day
+    # Cumulative scrapes per day
     cur.execute("""
         SELECT 
             date_trunc('day', ts) AS day,

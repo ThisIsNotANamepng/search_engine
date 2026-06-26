@@ -2,7 +2,7 @@
 The scraper file, run to begin scraping
 """
 
-import scraper
+import utils
 import time
 from urllib.parse import urlparse
 import os
@@ -13,7 +13,7 @@ import sqlite3
 TIMEOUT_TIME = 10  # seconds to wait for fetching a page before skipping
 LOCAL_QUEUE_LENGTH = 60 # number of URLs to hold locally for scraping
 
-scraper.create_database()
+utils.create_database()
 
 total_scraped = 0
 
@@ -23,11 +23,11 @@ total_scraped = 0
 with open("seed_urls.csv", "r") as f:
     for line in f:
         url = line.strip()
-        if url and not scraper.exists(url, 'url'):
-            scraper.enqueue_url(url)
+        if url and not utils.exists(url, 'url'):
+            utils.enqueue_url(url)
 
 
-scraper.log("Started scraping")
+utils.log("Started scraping")
 
 redis_address = os.getenv("DATABASE_URL")
 redis_address = redis_address[redis_address.index("@")+1:] # Get the IP of the DB server, the redis server will be on the same machine
@@ -48,9 +48,9 @@ redis_client = redis.Redis(
 """
 # Redis db testing
 start=time.time()
-print(scraper.domain_free_for_scraping("example.com", redis_client))
-scraper.mark_domain("example.com", redis_client)
-print(scraper.domain_free_for_scraping("example.com", redis_client))
+print(utils.domain_free_for_scraping("example.com", redis_client))
+utils.mark_domain("example.com", redis_client)
+print(utils.domain_free_for_scraping("example.com", redis_client))
 
 print(time.time()-start)
 """
@@ -71,12 +71,12 @@ while True:
     # Holds a local queue of 30 urls so it doesn't need to interact with the db as much
 
     if len(local_queue) == 0:
-        scraper.info_print("Reloading local queue")
+        utils.info_print("Reloading local queue")
         #print("Returning to queue:", queue_return_to_db)
-        scraper.enqueue_urls(queue_return_to_db)
+        utils.enqueue_urls(queue_return_to_db)
         #print("Queue to return", queue_return_to_db)
         #print("Enqueued")
-        local_queue = scraper.get_next_urls(LOCAL_QUEUE_LENGTH)
+        local_queue = utils.get_next_urls(LOCAL_QUEUE_LENGTH)
         #print("Adding to lcal queue:")
         #print(local_queue)
         #print(local_queue)
@@ -92,7 +92,7 @@ while True:
         if base_domain != prev_base_domain:
             # Case 1: base domain of the current url is NOT the same as the one scraped in the previous iteration
 
-            next_url_is_free = scraper.domain_free_for_scraping(base_domain, redis_client)
+            next_url_is_free = utils.domain_free_for_scraping(base_domain, redis_client)
             #print(2)
 
             if next_url_is_free:
@@ -121,39 +121,39 @@ while True:
         
     """
     # Legacy from when we asked the db for the next url one at a time
-    url = scraper.pop_next_url()
+    url = utils.pop_next_url()
 
 
     if url is None:
         # either rotated due to domain-balancing or queue empty
-        if scraper.queue_size() == 0:
+        if utils.queue_size() == 0:
             break
         else:
             continue
     """
     if url == "": continue  # If the local_queue is 0 and the loop above ends but the url isn't valid (not in redis and not prev_base_domain) the invalid url will be use for the scraping code below, thus we only assign url a value if it passes all checks
     
-    if scraper.check_url_in_blocklist(url):
-        scraper.log("Misc URL found in malicious domain blocklist, exiting")
+    if utils.check_url_in_blocklist(url):
+        utils.log("Misc URL found in malicious domain blocklist, exiting")
         continue
 
-    scraper.log(f"Starting scraping {url}")
-    scraper.debug_print("")
+    utils.log(f"Starting scraping {url}")
+    utils.debug_print("")
     big_start = time.time()
 
-    if scraper.is_domain_blocked(scraper.get_base_domain(url)):
-        scraper.info_print(f"Domain is blocked, skipping {url}")
+    if utils.is_domain_blocked(utils.get_base_domain(url)):
+        utils.info_print(f"Domain is blocked, skipping {url}")
         continue
 
     #try: # I took this try statement out, see note at the `except` ending
     # enforce a network/read timeout for page fetch and parsing
     ## TODO: I don't think this timeout works, we need to fix it
-    links_to_scrape = scraper.store(url, timeout=TIMEOUT_TIME)
+    links_to_scrape = utils.store(url, timeout=TIMEOUT_TIME)
 
-    if links_to_scrape == scraper.RATE_LIMITED:
-        scraper.enqueue_url(url)
+    if links_to_scrape == utils.RATE_LIMITED:
+        utils.enqueue_url(url)
         redis_client.set(f"domain:{base_domain}", 1, ex=300)
-        scraper.info_print(f"Rate limited, re-queued {url} with 5-min cooldown")
+        utils.info_print(f"Rate limited, re-queued {url} with 5-min cooldown")
         continue
     #print("first links_to_scrape", links_to_scrape)
 
@@ -190,7 +190,7 @@ while True:
             cleaned.append(clean_link)
     """
 
-    # Raw_links should be cleaned by the cleaning function in scraper.py, so I'm taking the cleaning stuff out here
+    # Raw_links should be cleaned by the cleaning function in utils.py, so I'm taking the cleaning stuff out here
     cleaned = links_to_scrape
 
     #print("CLEANED", cleaned)
@@ -198,17 +198,17 @@ while True:
     # Batch add url references after cleaning
     if cleaned and len(cleaned) > 1:
         print(len(cleaned))
-        current_domain = scraper.get_base_domain(url)
+        current_domain = utils.get_base_domain(url)
 
         if len(cleaned) > 1:
-            external_links = [link for link in cleaned if scraper.get_base_domain(link) != current_domain]
-        elif scraper.get_base_domain(cleaned[0]) != current_domain:
+            external_links = [link for link in cleaned if utils.get_base_domain(link) != current_domain]
+        elif utils.get_base_domain(cleaned[0]) != current_domain:
             external_links = cleaned[0]
 
         print(external_links)
 
         if external_links:
-            conn = scraper.get_conn()
+            conn = utils.get_conn()
             cur = conn.cursor()
 
             cur.execute("""
@@ -225,33 +225,33 @@ while True:
 
 
     # filter_new_urls checks both the queue and stored urls in one go
-    links_to_add_to_queue = scraper.filter_new_urls(cleaned)
+    links_to_add_to_queue = utils.filter_new_urls(cleaned)
 
     #print("Adding links-to_add_to_queue:", links_to_add_to_queue)
-    scraper.enqueue_urls(links_to_add_to_queue)
+    utils.enqueue_urls(links_to_add_to_queue)
 
-    scraper.log(f"Scraped {url}")
+    utils.log(f"Scraped {url}")
     total_scraped += 1
 
     # With this in, I can't find errors so I'm taking out the try: phrase. This will mean that scrapers can crash and stop scraping, but we can set up K3 to restart them and report the errors
     #except Exception as e:
-    #    scraper.log(f"Error scraping {url}: {e}")
-    #    scraper.failure_print(e)
+    #    utils.log(f"Error scraping {url}: {e}")
+    #    utils.failure_print(e)
 
     # Add url to the cooldown redis db
-    scraper.mark_domain(base_domain, redis_client)
+    utils.mark_domain(base_domain, redis_client)
 
 
     #if total_scraped % 10 == 0:
-    #    print(f"Scraped {total_scraped} pages. {scraper.queue_size()} URLs left in queue")
+    #    print(f"Scraped {total_scraped} pages. {utils.queue_size()} URLs left in queue")
     #print(f"Scraped {total_scraped} pages. Total time to scrape:", time.time()-start)
 
     if page_not_in_english:
-        scraper.info_print(f"Stored links for {url}, total time taken: {str(time.time()-big_start)}")
+        utils.info_print(f"Stored links for {url}, total time taken: {str(time.time()-big_start)}")
         page_not_in_english = False
     else:
-        scraper.info_print(f"Scraped {url}, total time taken: {str(time.time()-big_start)}")
+        utils.info_print(f"Scraped {url}, total time taken: {str(time.time()-big_start)}")
 
     start=time.time()
 
-scraper.log("Finished scraping")
+utils.log("Finished scraping")

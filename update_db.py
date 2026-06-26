@@ -1,6 +1,6 @@
 import scraper
 
-conn = scraper.get_conn()
+conn = utils.get_conn()
 cur = conn.cursor()
 
 cur.execute("""
