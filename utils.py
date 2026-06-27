@@ -209,7 +209,6 @@ def debug_print(text):
 
             DEBUG_BREAKPOINT_TIMER = time.time()
 
-
 def info_print(text):
     # For debugging and printing statements which notify what's happening, not that need to be timed
 
@@ -362,7 +361,6 @@ def load_static_token_maps():
     cur.close()
     conn.close()
 
-
 def set_default_weights():
     conn = get_conn()
     cur = conn.cursor()
@@ -389,37 +387,8 @@ def set_default_weights():
     cur.close()
     conn.close()
 
-def exists(text, type_):
-    # Keep function for compatibility but prefer upserts/bulk operations
-    # Not used anymore
 
-    # Returns true if token has been used in the database, false if it's new
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    if type_ == "word":
-        cur.execute("SELECT 1 FROM words WHERE word = %s;", (text,))
-    elif type_ == "bigram":
-        cur.execute("SELECT 1 FROM bigrams WHERE bigram = %s;", (text,))
-    elif type_ == "trigram":
-        cur.execute("SELECT 1 FROM trigrams WHERE trigram = %s;", (text,))
-    elif type_ == "prefix":
-        cur.execute("SELECT 1 FROM prefixes WHERE prefix = %s;", (text,))
-    elif type_ == "url":
-        cur.execute("SELECT 1 FROM urls WHERE url = %s;", (text,))
-    else:
-        cur.close()
-        conn.close()
-        return False
-
-    found = cur.fetchone() is not None
-
-    cur.close()
-    conn.close()
-    return found
-
-# HTML text extraction utilities
+# ----- HTML text extraction utilities
 def tag_visible(element):
     if element.parent.name in ["style", "script", "head", "title", "meta", "[document]"]:
         return False
@@ -427,7 +396,29 @@ def tag_visible(element):
         return False
     return True
 
-def text_from_html(body, url):
+def extract_data_from_html(body, url):
+    """
+    Takes in the bs4 soup and returns the text, links, title, and favicon link from the page
+
+    Args:
+        body : string
+            The html of a page
+        url : string
+            The url of the page
+
+    Returns:
+        tuple
+            (combined_text, links, title, icon_link)
+            combined_text : string
+                The visible text in the page
+            links : list
+                All of the links on the page, as defined by <a> tags
+            title : string
+                The title of the page, as defined by the <title> tag
+            icon_link : string
+                The url to the favicon of the page
+    """
+
     # Use lxml parser for speed
     soup = BeautifulSoup(body, "lxml")
     title = soup.find('title')
@@ -437,7 +428,7 @@ def text_from_html(body, url):
         #print("Found none title")
     else:
         title = title.string
-        #print("Foound title:,", title)
+        #print("Found title:,", title)
 
     icon_link = (
         soup.find('link', rel='shortcut icon') or
@@ -479,14 +470,25 @@ def text_from_html(body, url):
     return combined_text, links, title, icon_link
 
 def allowed_by_robots(url, user_agent):
-        
+    """
+    Uses the robots.txt of the site and the user agent of the scraper to determine whether the scraper is allowed to scrape the page
+
+    Args:
+        url : string
+            The url of the page you are scraping
+        user_agent : string
+            The user agent defined in the constant at the top of utils.py
+
+    Returns:
+        boolean
+            Allowed to scrape if True, not allowed if False
+    """
+
     parsed = urlparse(url)
     robots_url = urljoin(f"{parsed.scheme}://{parsed.netloc}", "robots.txt")
 
     rp = RobotFileParser()
-    # Avoid RobotFileParser.read() which uses urllib without a timeout and may block.
-    # Instead, fetch robots.txt with `requests` using a timeout and feed the contents
-    # to the parser via `rp.parse()`.
+
     try:
         rp.set_url(robots_url)
         if SCRAPER_PROXY:
@@ -507,12 +509,31 @@ def allowed_by_robots(url, user_agent):
 
     return rp.can_fetch(user_agent, url)
 
-
 def get_main_text(url, timeout=None):
-    """Fetch URL and extract visible text and links.
+    """
+    Download the html of a page and pass it to functions to extract the text
+    
+    Args:
+        url : string
+            The url of the page you are scraping
+        timeout : int
+            The number of seconds to wait before timing out a connection (might not work, needs testing)
 
-    `timeout` is passed to `requests.get` (both connect and read timeout).
-    On network errors or timeouts, returns empty text and empty links list.
+    Returns:
+        tuple
+            Directly from extract_data_from_html(), (combined_text, links, title, icon_link)
+            combined_text : string
+                The visible text in the page
+            links : list
+                All of the links on the page, as defined by <a> tags
+            title : string
+                The title of the page, as defined by the <title> tag
+            icon_link : string
+                The url to the favicon of the page
+
+    Notes:
+        On network errors or timeouts, returns empty text and empty links list
+        Maybe think about changing to a Raise error instead of returning empty
     """
 
     def handler(signum, frame):
@@ -535,26 +556,17 @@ def get_main_text(url, timeout=None):
 
     try:
         if SCRAPER_PROXY:
-            r = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10))
+            request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10))
         else:
-            r = requests.get(url, headers=headers, timeout=(5, 10))
+            request = requests.get(url, headers=headers, timeout=(5, 10))
 
-        content_type = r.headers.get("Content-Type", "").lower()
+        content_type = request.headers.get("Content-Type", "").lower()
 
-        """
-        # We want to do pdf in the fiture, for now we don't scrape pdfs
-
-        # Check for text and pdf only
-        if not content_type.startswith("text/") and not content_type == "application/pdf":
-            log(f"Error Invalid data type {url}")
+        if request.status_code in (401, 403):
+            block_domain(url, f"HTTP {request.status_code}")
             return False
 
-        """
-        if r.status_code in (401, 403):
-            block_domain(url, f"HTTP {r.status_code}")
-            return False
-
-        if r.status_code == 429:
+        if request.status_code == 429:
             log(f"Error Rate limited {url}")
             return RATE_LIMITED
 
@@ -565,7 +577,7 @@ def get_main_text(url, timeout=None):
             log(f"Error Invalid data type {url}")
             return False
 
-        content = r.content
+        content = request.content
             
     except TimeoutError:
         log(f"Error Total timeout exceeded {url}")
@@ -578,22 +590,28 @@ def get_main_text(url, timeout=None):
         signal.alarm(0)
 
     
-    return text_from_html(content, url)
+    return extract_data_from_html(content, url)
 
 def log(message):
     """
     Logs the message in the database logs
 
-    Logs must be in this format:
-    - Errors: Error {error message} {url}
-    - Scraped: Scraped {url}
-    - Misc: Misc {message} {url}
-
-    This is for measuring success/error rate in the dashboard
+    Args:
+        message : string
+            The message for the logs
+        
+    Returns:
+        Nothing
 
     TODO:
         - Change the logs table to add a column for error/success/misc
         - Add a table for success/error rate, an integer in the table should be increase by one for each success/error
+    
+    Notes:
+        Logs must be in this format:
+        - Errors: Error {error message} {url}
+        - Scraped: Scraped {url}
+        - Misc: Misc {message} {url}
     """
     # write to local file
     #with open("scraper.log", "a") as f:
@@ -604,21 +622,22 @@ def log(message):
     except Exception:
         pass
 
-
-def get_scraped_urls():
-    visited = set()
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT url FROM urls;")
-    rows = cur.fetchall()
-    for (url,) in rows:
-        visited.add(url)
-    cur.close()
-    conn.close()
-    return visited
-
-
 def get_base_domain(url):
+    """
+    Return the base domain name of a given url
+
+    Args:
+        url : string
+            A url of a page
+
+    Returns:
+        string
+            The base domain of the given url (minus the https:// and the /subpage)
+
+    TODO:
+        - Add to this doc whether the domain is returned with a / on the end
+    """
+
     if "://" not in url:
         url = "http://" + url
     host = urlparse(url).hostname
@@ -629,33 +648,67 @@ def get_base_domain(url):
         return ext.top_domain_under_public_suffix
     return host
 
-
 def block_domain(url, reason=""):
+    """
+    Add a domain to the list (in the database) of domains we don't scrape
+    
+    Args:
+        url : string
+            The url which we aren't allowed to scrape
+        reason : string
+            The reason for not being allowed
+    
+    Returns:
+        Nothing
+
+    TODO:
+        - I don't think we use this blocked_domains table anywhere else, we should integrate that into scraping so we actually check it
+
+    Notes:
+        We don't use the reason variable at all, but we totally couple if we wanted
+    """
     domain = get_base_domain(url)
     if not domain:
         return
+    
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO blocked_domains (domain, reason) VALUES (%s, %s) ON CONFLICT (domain) DO NOTHING;",
-        (domain, reason)
-    )
+
+    cur.execute("INSERT INTO blocked_domains (domain, reason) VALUES (%s, %s) ON CONFLICT (domain) DO NOTHING;", (domain, reason))
     cur.execute("DELETE FROM url_queue WHERE url LIKE %s;", (f"%{domain}%",))
+
     conn.commit()
     cur.close()
     conn.close()
+
     log(f"Blocked domain {domain} reason={reason}")
 
-
 def is_domain_blocked(domain):
+    """
+    Checks the db table to determine whether a domain is allowed to be scraped
+    
+    Args:
+        domain : string
+            The domain to check
+    
+    Return:
+        boolean
+            True if the domain is blocked, False if not
+
+    TODO:
+        - This only checks the table in the big db for when we hit a domain which returns an error code that indicates we should stop scraping. We check the local distributed sqlite3 dbs which are created from malware blocklists in a different spot in the code, we should combine those two functions into one
+    """
+
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("SELECT 1 FROM blocked_domains WHERE domain = %s;", (domain,))
+
     blocked = cur.fetchone() is not None
     cur.close()
     conn.close()
-    return blocked
 
+    return blocked
 
 def store(url, timeout=None):
     """
@@ -709,14 +762,6 @@ def store(url, timeout=None):
 
     debug_print("Tokenized")
 
-    """
-    ##TODO: This can probably be deleted because I added a statement checking if text is longer that 5 characters beofre echking the language
-    if not text:
-        log(f"Error Failed to retrieve page text {url}")
-        failure_print("Error Failed to retrieve page text")
-        return links
-    """
-        
 
     # Clean links, this is copied from scrape.py, should probably have a shred function but it's 10:55pm and I'm tired
     # This above comment cuased issues. The cleaning here is for cleaning links to add to the scraping, while cleaning in scrape.py is for references so it just need to be the base domains
@@ -872,7 +917,6 @@ def store(url, timeout=None):
 
     return links
 
-
 def delete_url(url):
     conn = get_conn()
     cur = conn.cursor()
@@ -902,8 +946,6 @@ def delete_url(url):
     conn.commit()
     cur.close()
     conn.close()
-
-
 
 # Queue and logging helpers (Postgres-backed)
 def enqueue_url(url):

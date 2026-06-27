@@ -10,7 +10,7 @@ And to build something cool. 🔥
 
 We are students, the goal of this project is to learn. To that end, we don't use AI to code. We can use AI to come up with ideas, to guide how we design our code, but we don't use AI to vibe code.
 
-[![Real Good AI Use Rating of 2: Brainstorming](/docs/docs/img/2_REAL_rating.png)](https://www.realgoodai.org/real-rating)
+[![Real Good AI Use Rating of 2: Brainstorming Only](/docs/docs/img/2_REAL_rating.png)](https://www.realgoodai.org/real-rating)
 
 ## Indexes to index
 
