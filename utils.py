@@ -40,6 +40,9 @@ DEBUG_BREAKPOINT_TIMER = time.time()
 # Look for the DEBUG shell varialbe and set a global variable to True or false base don whether it was passed
 DEBUG = "DEBUG" in os.environ
 LEVEL = os.environ["DEBUG"] if DEBUG else False
+# When True, suppress all external database access (set once from scrape.py's --nodb flag).
+# Like DEBUG above, this is a module-level switch so call sites don't have to thread a flag.
+NODB = False
 URL = ""
 
 
@@ -469,6 +472,24 @@ def extract_data_from_html(body, url):
 
     return combined_text, links, title, icon_link
 
+def determine_language(text):
+    """
+    Determines the language of a given text using langdetect
+
+    Args:
+        text : string
+            The text to determine
+
+    Returns:
+        string
+            The two character code (https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes)
+
+    TODO:
+        - Determine how long this process takes with long documents, and if it's a noticeable slowdown experiment with only passing a part of the page for detection
+    """
+
+    return detect(text)
+
 def allowed_by_robots(url, user_agent):
     """
     Uses the robots.txt of the site and the user agent of the scraper to determine whether the scraper is allowed to scrape the page
@@ -509,9 +530,9 @@ def allowed_by_robots(url, user_agent):
 
     return rp.can_fetch(user_agent, url)
 
-def get_main_text(url, timeout=None):
+def get_page_html(url, timeout=None):
     """
-    Download the html of a page and pass it to functions to extract the text
+    Download the html of a page
     
     Args:
         url : string
@@ -542,6 +563,7 @@ def get_main_text(url, timeout=None):
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
         info_print("Not allowed by robots.txt")
+        ## TODO: Add a line to send this domain to the redis or postgres db so that we don't even attempt to scrape this domain again
         #Changed this from: return "", [], []
         #return False, [], []
         return False
@@ -589,8 +611,8 @@ def get_main_text(url, timeout=None):
         #print(5)
         signal.alarm(0)
 
-    
-    return extract_data_from_html(content, url)
+    return content
+    #return extract_data_from_html(content, url)
 
 def log(message):
     """
@@ -606,6 +628,7 @@ def log(message):
     TODO:
         - Change the logs table to add a column for error/success/misc
         - Add a table for success/error rate, an integer in the table should be increase by one for each success/error
+        - Add a column to the table for the url so we don't have to parse all message to find those pertaining to a url
     
     Notes:
         Logs must be in this format:
@@ -613,13 +636,16 @@ def log(message):
         - Scraped: Scraped {url}
         - Misc: Misc {message} {url}
     """
-    # write to local file
-    #with open("scraper.log", "a") as f:
-    #    f.write(str(time.time()) + ": " + message + "\n")
-    # Write to database logs
+
+    if NODB:
+        debug_print(message)
+        return
+
     try:
         log_db(message)
     except Exception:
+        ## TODO: This message isn't compliant with the proper debug_print formatting, fix that and make the formatting guidelines more clear
+        debug_print("FAILURE COULDN'T WRITE TO DATABASE")
         pass
 
 def get_base_domain(url):
@@ -710,68 +736,24 @@ def is_domain_blocked(domain):
 
     return blocked
 
-def store(url, timeout=None):
+def clean_links(raw_links):
     """
-    Store the page at `url` and return discovered links.
+    Takes in raw links and cleans them for storage in the index. Removes ? post parameter and # things and non-http links and any trailing slashes /
 
-    If `timeout` is provided it is forwarded to HTTP fetch.
+    Args:
+        raw_links : list[string]
+            A list of strings which are raw links from the internet
+    
+    Returns:
+        raw_links : list[strings]
+            A list of strings which are clean links
     """
-    load_static_token_maps()
-    #info_print("Starting storing")
-    global URL
-    URL = url
-
-    content = get_main_text(url, timeout=timeout)
-
-    debug_print("Visited site, got main text and links")
-
-    if content == RATE_LIMITED:
-        return RATE_LIMITED
-
-    if content != False:
-        # The url contains real text to scrape
-        text = content[0]
-        links = content[1]
-        title = content[2]
-        icon_link = content[3]
-        #print("raw_links", links)
-    else:
-        # Url is a file format which cannot be scraped
-        ## TODO: I don't think this completely works, need to test with a abunch of file formats so we don't try to scrape files like images and stuff
-
-        print(content)
-        info_print("URL stores a file format we can't scrape")
-        return
-    
-    # Making sure there is text at all. I chose 4 arbitrarily
-    if text != None and len(text) < 4:
-        return [links, False]
-    
-    # Check for english language
-    if detect(text) != 'en':
-        # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
-        log(f"Language Not in English {url}")
-        info_print("Language not in English, skipping")
-
-        return [links, False]
-
-    debug_print("Detected language")
-
-
-    tokens = tokenizer.tokenize_all(text) #TODO: I want to see how expensive it is to check if each token is in the database already, you'd have to search all of the tokens to find if it's in the database
-
-    debug_print("Tokenized")
-
 
     # Clean links, this is copied from scrape.py, should probably have a shred function but it's 10:55pm and I'm tired
-    # This above comment cuased issues. The cleaning here is for cleaning links to add to the scraping, while cleaning in scrape.py is for references so it just need to be the base domains
-    #raw_links = [i for i in links if "mailto:" not in i] # Taking this out because we handle this case below
-    raw_links = links
+    # This above comment caused issues. The cleaning here is for cleaning links to add to the scraping, while cleaning in scrape.py is for references so it just need to be the base domains
     cleaned = []
-    link_domains = []
 
     for link in raw_links:
-        #print("link:", link)
         clean_link = link.split('?', 1)[0] #gets rid of anything after a ?
         clean_link = clean_link.split('#', 1)[0] #gets rid of anything after a #
 
@@ -781,14 +763,70 @@ def store(url, timeout=None):
             clean_link = clean_link[:-1] #gets rid of the "/" if a link ends with it
             
         if clean_link not in cleaned:
-            link_domain = get_base_domain(clean_link)
-            link_domains.append(link_domain)
             if clean_link[0:4] == "http":
                 cleaned.append(clean_link)
 
+    return cleaned
 
-    # A list of the links in the scraped page
-    links = cleaned
+
+def store(content, url):
+    """
+    Stores the data (text, links, title, icon_link) of a given page in the index database
+    """
+    global URL
+    URL = url
+
+    # No database available (e.g. --nodb debugging run): nothing below this point can run
+    # without a connection, so bail out before any DB access.
+    if NODB: return
+
+    load_static_token_maps()
+
+    #content = get_page_html(url, timeout=timeout)
+
+    debug_print("Visited site, got main text and links")
+
+    ## TODO: Changes moving some loop jurisdiction likely broke the need to return the rate limiting, need to fix that. Need to do what we need to do when we hit a rate limit here in this function, and then handle getting a rate limit signal in the scrape.py loop
+    if content == RATE_LIMITED:
+        return RATE_LIMITED
+
+    if content != False:
+        # The url contains real text to scrape
+        text = content[0]
+        links = content[1]
+        title = content[2]
+        icon_link = content[3]
+    else:
+        # Url is a file format which cannot be scraped
+        ## TODO: I don't think this completely works, need to test with a bunch of file formats so we don't try to scrape files like images and stuff
+
+        print(content)
+        info_print("URL stores a file format we can't scrape")
+        return
+    
+    # Making sure there is text at all. I chose 4 arbitrarily
+    if text != None and len(text) < 4:
+        return [links, False]
+    
+    """
+    # MOVED THIS TO SCRAPE.PY  
+    # Check for english language
+    if detect(text) != 'en':
+        # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
+        log(f"Language Not in English {url}")
+        info_print("Language not in English, skipping")
+
+        return [links, False]
+
+    debug_print("Detected language")
+    """
+
+    # Tokenize the text of the page
+    tokens = tokenizer.tokenize_all(text)
+    debug_print("Tokenized")
+
+    # A clean list of the links in the scraped page
+    links = clean_links(links)
 
     # tokens: [word_list, bigram_list, trigram_list, prefix_list, words, bigrams, trigrams, prefixes]
     word_list = tokens[0] if tokens and len(tokens) > 0 else []
@@ -804,8 +842,6 @@ def store(url, timeout=None):
 
     conn = get_conn()
     cur = conn.cursor()
-
-    #print(cur)
 
     #debug_print("Getting SQL connection and cursor:")
 
@@ -836,9 +872,7 @@ def store(url, timeout=None):
         len(prefix_list)
     ))
     
-    #print("Ececuted into db fine")
-
-    # Bulk insert words/bigrams/trigrams/prefixes using execute_values for speed.
+    # Bulk insert words/bigrams/trigrams/prefixes using execute_values.
     if words:
         extra_vals = [(w,) for w in words]
         extras.execute_values(cur,
@@ -1178,7 +1212,7 @@ def mark_domain(domain, redis_client):
     redis_client.set(key, 1, nx=True, ex=10)
 
 def domain_free_for_scraping(domain, redis_client):
-    # Checks if domain has been scrpaed in the last 10 seconds
+    # Checks the redis db if domain has been scraped in the last 10 seconds
     # True for not in db and can be scraped, False for not
 
     key = f"domain:{domain}"

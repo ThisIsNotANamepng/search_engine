@@ -12,12 +12,16 @@ Graphs:
 - 
 """
 
+import os, sys, time
+
+# search.py lives in the directory above this one
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from flask import Flask, render_template, request, jsonify
 import search
 import psycopg2
 import psycopg2.extras
 import json
-import os, time
 
 app = Flask(__name__)
 

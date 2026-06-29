@@ -32,21 +32,3 @@ Here's a checklist of all of the things we do when scraping
 A diagram of how the process of scraping works through the various functions
 
 Run the main loop in scrape.py
-
-1. Main loop gets next urls to scrape from queue using `utils.get_next_urls`, returns urls not to scrape to queue with `utils.enqueue_urls`
-2. Main loop checks url with `utils.domain_free_for_scraping`
-3. Main loop checks url with `utils.check_url_in_blocklist`
-4. Main loop extracts links from url with `utils.store`
-5. `utils.store` calls `utils.get_main_text` which gets the html of the given page
-6. `utils.get_main_text` checks of the scraper is allowed by the domain's `robots.txt`
-7. `utils.get_main_text` checks for 401/403 http codes, and 423 rate limited code
-8. `utils.get_main_text` checks if the response is html (not a pdf, etc)
-9. `utils.get_main_text` passes html to `utils.extract_data_from_html` which converts to bs4 soup
-10. `utils.extract_data_from_html` extracts the page text, links, favicon link, and page title and retuns them
-11. `utils.get_main_text` returns the value of `utils.extract_data_from_html` back to `utils.store`
-12. `utils.store` checks for English in the text
-13. `utils.store` tokenizes, cleans, and stores in database
-14. Main loop stores links from step 4 in the queue
-15. Restart
-
-It seems that scrape.py only deals with links, its at the link layer. utils.py deals with links and html and the db
