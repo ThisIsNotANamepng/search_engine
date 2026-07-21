@@ -41,9 +41,7 @@ def dashboard():
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    start=time.time()
-
-    # Scraped vs Blocked counts
+    # Scraped vs Blocked vs Error counts, uses logs_message_pattern_idx
     cur.execute("""
         SELECT
             CASE
@@ -58,56 +56,26 @@ def dashboard():
     """)
     status_counts = cur.fetchall()
 
-    print(1, time.time()-start)
-    start=time.time()
-
     # Total unique domains
     cur.execute("""
-        SELECT COUNT(DISTINCT 
-            CASE 
-                WHEN url LIKE 'http://%' THEN 
-                    SUBSTRING(url FROM '^http://([^/]+)')
-                WHEN url LIKE 'https://%' THEN 
-                    SUBSTRING(url FROM '^https://([^/]+)')
-                ELSE 
-                    SUBSTRING(url FROM '^([^/]+)')
-            END
-        ) as unique_domains
+        SELECT COUNT(DISTINCT SUBSTRING(url FROM '^(?:https?://)?([^/]+)'))
+            AS unique_domains
         FROM urls;
     """)
     unique_domains = cur.fetchone()['unique_domains']
 
-    print(2, time.time()-start)
-    start=time.time()
-
-    # Scrapes per minute
+    # Scrapes in the last minute (uses logs_scraped_ts_idx partial index)
     cur.execute("""
-        SELECT COUNT(*) 
-        FROM logs 
-        WHERE ts >= now() - INTERVAL '1 minute'
-        AND message LIKE 'Sc%';
+        SELECT COUNT(*) AS count
+        FROM logs
+        WHERE message LIKE 'Scraped%'
+        AND ts >= now() - INTERVAL '1 minute';
     """)
     scrapes_per_minute = cur.fetchone()['count']
 
-    print(3, time.time()-start)
-    start=time.time()
-
-    # Scrapes per minute over time
+    # Daily + cumulative scrapes in one pass
     cur.execute("""
-        SELECT date_trunc('day', ts) AS minute, COUNT(*) AS count
-        FROM logs
-        WHERE message LIKE 'Sc%'
-        GROUP BY minute
-        ORDER BY minute;
-    """)
-    scrapes_over_time = cur.fetchall()
-
-    print(4, time.time()-start)
-    start=time.time()
-
-    # Cumulative scrapes per day
-    cur.execute("""
-        SELECT 
+        SELECT
             date_trunc('day', ts) AS day,
             COUNT(*) AS daily_scrapes,
             SUM(COUNT(*)) OVER (ORDER BY date_trunc('day', ts)) AS cumulative_scrapes
@@ -117,29 +85,24 @@ def dashboard():
         ORDER BY day;
     """)
     cumulative_scrapes_per_day = cur.fetchall()
+    scrapes_over_time = [
+        {"minute": r["day"], "count": r["daily_scrapes"]}
+        for r in cumulative_scrapes_per_day
+    ]
 
-    print(5, time.time()-start)
-    start=time.time()
-
-    # Last 8 urls
+    # Last 8 urls (uses logs_scraped_id_idx partial index)
     cur.execute("""
-        SELECT *
+        SELECT message, ts
         FROM logs
         WHERE message LIKE 'Scraped%'
         ORDER BY id DESC
         LIMIT 8;
-        
     """)
     last_10_scraped = cur.fetchall()
-    real_last_10_scraped = []
-    for i in last_10_scraped:
-        real_last_10_scraped.append((
-            i['message'][i['message'].index(" "):],
-            i['ts']
-        ))
-
-    print(6, time.time()-start)
-    start=time.time()
+    real_last_10_scraped = [
+        (i['message'][i['message'].index(" "):], i['ts'])
+        for i in last_10_scraped
+    ]
 
     # Active scrapers (last three minutes)
     cur.execute("""
@@ -149,31 +112,21 @@ def dashboard():
             MIN(ts) AS started_at,
             MAX(ts) AS last_seen
         FROM logs
-        WHERE message LIKE 'Sc%'
+        WHERE message LIKE 'Scraped%'
         GROUP BY ip
         HAVING MAX(ts) >= NOW() - INTERVAL '3 minutes';
     """)
     scrapers = cur.fetchall()
 
-    print(7, time.time()-start)
-    start=time.time()
-
-    # URLs in database
-    cur.execute("SELECT COUNT(*) AS count FROM urls;")
-    url_count = cur.fetchone()["count"]
-
-
-    print(8, time.time()-start)
-    start=time.time()
-
-    # Postgres DB size
+    # URL count and DB size
     cur.execute("""
-        SELECT pg_size_pretty(pg_database_size(current_database())) AS size;
+        SELECT
+            (SELECT COUNT(*) FROM urls) AS url_count,
+            pg_size_pretty(pg_database_size(current_database())) AS db_size;
     """)
-    db_size = cur.fetchone()["size"]
-
-    print(9, time.time()-start)
-    start=time.time()
+    totals = cur.fetchone()
+    url_count = totals["url_count"]
+    db_size = totals["db_size"]
 
     cur.close()
     conn.close()

@@ -322,6 +322,21 @@ def create_database():
         reason VARCHAR(128),
         blocked_at TIMESTAMP DEFAULT now()
     );
+
+    -- These all speed up requests for stats from frontend/app.py and probably other places in the future
+    -- text_pattern_ops lets "message LIKE 'Sc%'" prefix scans use an index.
+    CREATE INDEX IF NOT EXISTS logs_message_pattern_idx
+        ON logs (message text_pattern_ops);
+    -- Partial indexes for the scrape-only queries: last-N by id, per-minute and per-day counts by ts, and active-scraper grouping by ip
+    CREATE INDEX IF NOT EXISTS logs_scraped_id_idx
+        ON logs (id DESC) WHERE message LIKE 'Scraped%';
+    CREATE INDEX IF NOT EXISTS logs_scraped_ts_idx
+        ON logs (ts) WHERE message LIKE 'Scraped%';
+    CREATE INDEX IF NOT EXISTS logs_scraped_ip_ts_idx
+        ON logs (ip, ts) WHERE message LIKE 'Scraped%';
+    -- Functional index matching the unique-domains regex in the dashboard
+    CREATE INDEX IF NOT EXISTS urls_domain_idx
+        ON urls ((SUBSTRING(url FROM '^(?:https?://)?([^/]+)')));
     """)
 
 

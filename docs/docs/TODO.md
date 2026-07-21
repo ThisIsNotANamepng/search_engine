@@ -15,18 +15,18 @@
 - [x] Dockerize scraping for kubernetes deployment
     - [ ] Add checks for stalled scraping, reporting to the dashboard
 - [ ] Come up with more chracteristics about scraped domains to store and use in search algorithm
-- [x] Make rock-solid domain wait times, don't hit a domain accross all scrapers in less than 5 seconds
+- [x] Make rock-solid domain wait times, don't hit a domain across all scrapers in less than 5 seconds
 - [ ] **Respect 400/500 error responses and stop crawling the domain**
 - [ ] Look for and respect Crawl-Delay in robots.txt
-- [ ] Should report http reponses to local lookup table and therefore the index database
+- [ ] Should report http responses to local lookup table and therefore the index database
 - [ ] Sending data to the database should spawn a new process instead of waiting for the database transaction to finish
 - [ ] Wikipedia is under strain due to AI crawlers, manually download the wikipedia from Wikimedia dumps and scrape the local dump instead of scraping
 - [ ] Handle scraping pdf files
 - [ ] Handle urls which redirect to another (probably just resolve all urls) (for example https://woo.app)
 - [ ] Still tries to scrape image files, fix that
 - [ ] Add logging to store which pages are in which language so we can measure how much of the web is in which language
-- [ ] Add global function for lceaning the links we get (there are duplicate functions in scrape.py and utils.py)
-- [ ] Investigate potentially wighting some parts of the website to matter more in the search algorithm 
+- [ ] Add global function for cleaning the links we get (there are duplicate functions in scrape.py and utils.py)
+- [ ] Investigate potentially weighing some parts of the website to matter more in the search algorithm 
 
 ## Database
 
