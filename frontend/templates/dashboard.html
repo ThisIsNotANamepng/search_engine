@@ -268,6 +268,61 @@ th {
 
 
 
+        <!-- Crawler nodes (replaces the k8s control plane) -->
+        <div class="card col-12 row-2">
+            <h2>Crawler Nodes</h2>
+            <div class="table-box">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Node</th>
+                            <th>Status</th>
+                            <th>Running / Desired</th>
+                            <th>CPU</th>
+                            <th>RAM</th>
+                            <th>Last Seen (s ago)</th>
+                            <th>Scale</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for n in nodes %}
+                        {% set stale = n.age_s is not none and n.age_s > node_stale_seconds %}
+                        <tr>
+                            <td>
+                                {{ n.node_id }}
+                                {% if n.hostname and n.hostname != n.node_id %}
+                                    <span style="color:#64748b">({{ n.hostname }})</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if stale %}
+                                    <span style="color:#f87171">● stale</span>
+                                {% else %}
+                                    <span style="color:#4ade80">● live</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ n.alive_count }} / {{ n.desired_count }}</td>
+                            <td>{{ n.cpu_percent | round(0) if n.cpu_percent is not none else '–' }}%</td>
+                            <td>{{ n.mem_percent | round(0) if n.mem_percent is not none else '–' }}%</td>
+                            <td>{{ n.age_s | round(0) if n.age_s is not none else '–' }}</td>
+                            <td style="white-space:nowrap">
+                                <button onclick="scaleNode('{{ n.node_id }}', {{ n.desired_count - 1 }})">−</button>
+                                <input id="scale-{{ n.node_id }}" type="number" min="0"
+                                       value="{{ n.desired_count }}"
+                                       style="width:60px;background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:6px;padding:4px">
+                                <button onclick="scaleNode('{{ n.node_id }}', document.getElementById('scale-{{ n.node_id }}').value)">Set</button>
+                                <button onclick="scaleNode('{{ n.node_id }}', {{ n.desired_count + 1 }})">＋</button>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="7" style="color:#64748b">No crawler nodes have reported in yet.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+
         <!-- Search Speed Metrics -->
         <div class="card metric col-3 row-1">
             <div class="metric-label">Search speed - "Something here"</div>
@@ -335,6 +390,20 @@ th {
         }
     });
 
+
+    // Set a crawler node's desired count. The node agent picks it up on its
+    // next heartbeat; we reload so the table reflects the new target.
+    function scaleNode(nodeId, desired) {
+        desired = Math.max(0, parseInt(desired, 10) || 0);
+        fetch(`/nodes/${nodeId}/scale`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ desired })
+        })
+        .then(r => { if (!r.ok) return r.json().then(e => Promise.reject(e)); })
+        .then(() => location.reload())
+        .catch(e => alert("Scale failed: " + (e.error || "unknown error")));
+    }
 
     // Reload every minute
     setInterval(() => {

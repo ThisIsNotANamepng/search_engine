@@ -6,9 +6,23 @@ Stultus is a full search engine system made by UWEC students with hand-built int
 
 And to build something cool. 🔥
 
-## No AI
+## AI Usage
 
-We are students, the goal of this project is to learn. To that end, we don't use AI to code. We can use AI to come up with ideas, to guide how we design our code, but we don't use AI to vibe code.
+We are students, the goal of this project is to learn. To that end, we don't use AI to code the scraper. We can use AI to come up with ideas, to guide how we design our code, but we don't use AI to vibe code.
+
+The supporting servers such as the web text storage server and proxy server are exceptions to this, as learning how to implement those efficiently would have limited us to 
+
+- Scraper: Brainstorming only
+- Blocklist serving and parsing: No AI
+- Web text storage server: Major AI
+- Proxy server: Full AI
+- Dashboard: Moderate AI
+- Searching: No AI
+- Docker images: Brainstorming
+- Coordination server: Major AI
+- Docs: No AI
+
+This roughly equates to an average of ~2.4 on a scale of 0-5 of AI usage (not considering size of each task)
 
 [![Real Good AI Use Rating of 2: Brainstorming Only](/docs/docs/img/2_REAL_rating.png)](https://www.realgoodai.org/real-rating)
 

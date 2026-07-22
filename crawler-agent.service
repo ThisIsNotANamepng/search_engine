@@ -1,0 +1,67 @@
+# Stultus crawler node agent — the ONE thing systemd keeps alive per box.
+# The agent then spawns/supervises/scales the actual scrape.py crawlers.
+#
+# Install on each crawler box:
+#   1. Put your secrets/config in /etc/stultus/crawler.env (see below).
+#   2. Edit WorkingDirectory / ExecStart paths to match where the repo + venv live.
+#   3. sudo cp crawler-agent.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now crawler-agent
+#   4. Watch it:   journalctl -u crawler-agent -f
+#
+# The agent runs on the host and drives containerd via ctr; the crawlers run as
+# containers. ctr talks to the containerd socket (/run/containerd/containerd.sock),
+# which is root-owned, so run this unit as root (the default below).
+#
+# The crawler image must exist in the CTR_NAMESPACE (default "stultus"). The
+# agent auto-pulls it on startup; if your registry is plain HTTP (like the old
+# db01:5000 k8s registry) set CTR_PLAIN_HTTP=1. To pre-load it by hand instead:
+#   ctr -n stultus images pull --plain-http db01:5000/stultus:1.0.5
+#
+# /etc/stultus/crawler.env should contain (one KEY=VALUE per line, no quotes):
+#   HEAD_URL=http://db01:5000
+#   CRAWLER_IMAGE=db01:5000/stultus:1.0.5   # same image you ran under k8s
+#   CTR_PLAIN_HTTP=1                        # if the registry is plain HTTP
+#   DATABASE_URL=postgresql://user:pass@db01:5432/stultus
+#   SCRAPER_PROXY=...
+#   SCRAPER_PROXY_PASSWORD=...
+#   WEB_TEXT_STORAGE_SERVER_ADDRESS=http://db01:8003
+#   INITIAL_DESIRED=4
+#   NODE_ID=db03            # optional; defaults to the hostname
+#   CRAWLER_RUN_ARGS=--memory-limit 1073741824   # optional per-container limits (bytes)
+#
+# Containers run with --net-host by default (the old k8s CNI is gone), so they
+# use the host's network to reach the proxy/Postgres/storage server. Set
+# CRAWLER_NET_HOST=0 only if you've configured CNI yourself.
+#
+# CRAWLER_ENV (which of the above vars get forwarded into each container)
+# defaults to DATABASE_URL,SCRAPER_PROXY,SCRAPER_PROXY_PASSWORD,
+# WEB_TEXT_STORAGE_SERVER_ADDRESS,DEBUG — override it if your image needs others.
+
+[Unit]
+Description=Stultus crawler node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- edit these two paths for the box ---
+WorkingDirectory=/home/jack/code/search_engine
+ExecStart=/home/jack/code/search_engine/.env/bin/python node_agent.py
+# ----------------------------------------
+EnvironmentFile=/etc/stultus/crawler.env
+
+# Keep the agent itself alive; it in turn keeps the crawlers alive.
+Restart=always
+RestartSec=3
+
+# On stop, the agent SIGTERMs its crawlers; give it room to do so.
+KillMode=mixed
+TimeoutStopSec=30
+
+# Optional resource caps for the whole crawler slice on this box.
+# CPUQuota=400%
+# MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

@@ -36,6 +36,114 @@ def get_db():
         sslmode="disable"
     )
 
+# A node is considered stale (agent silent / box down) if we haven't heard a
+# heartbeat from it in this many seconds.
+NODE_STALE_SECONDS = 30
+
+def init_control_schema():
+    """
+    Create the crawler_nodes table used by the node agents' heartbeats. This is
+    the whole 'control plane' state that replaced Kubernetes: one row per box,
+    holding the desired crawler count (set from the dashboard) and the latest
+    reported liveness/host stats.
+    """
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS crawler_nodes (
+                node_id       TEXT PRIMARY KEY,
+                hostname      TEXT,
+                desired_count INTEGER NOT NULL DEFAULT 0,
+                alive_count   INTEGER NOT NULL DEFAULT 0,
+                cpu_percent   REAL,
+                mem_percent   REAL,
+                procs         JSONB,
+                first_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_seen     TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+# Runs at import so it's created under gunicorn too. DATABASE_URL is required
+# above, so a failure here is a real, fail-fast configuration problem.
+init_control_schema()
+
+@app.route("/agent/heartbeat", methods=["POST"])
+def agent_heartbeat():
+    """
+    Receive a heartbeat from a node agent and return its desired crawler count.
+
+    The desired count is authoritative on the head: a brand-new node adopts the
+    count the agent reports (its INITIAL_DESIRED); after that the dashboard owns
+    it and this endpoint never overwrites it.
+    """
+    data = request.get_json(silent=True) or {}
+    node_id = data.get("node_id")
+    if not node_id:
+        return jsonify({"error": "missing node_id"}), 400
+
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO crawler_nodes
+                (node_id, hostname, desired_count, alive_count,
+                 cpu_percent, mem_percent, procs, last_seen)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (node_id) DO UPDATE SET
+                hostname    = EXCLUDED.hostname,
+                alive_count = EXCLUDED.alive_count,
+                cpu_percent = EXCLUDED.cpu_percent,
+                mem_percent = EXCLUDED.mem_percent,
+                procs       = EXCLUDED.procs,
+                last_seen   = now()
+            RETURNING desired_count;
+        """, (
+            node_id,
+            data.get("hostname"),
+            int(data.get("desired_count", 0)),   # only used on first INSERT
+            int(data.get("alive_count", 0)),
+            data.get("cpu_percent"),
+            data.get("mem_percent"),
+            json.dumps(data.get("procs", [])),
+        ))
+        desired_count = cur.fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({"desired_count": desired_count})
+
+@app.route("/nodes/<node_id>/scale", methods=["POST"])
+def scale_node(node_id):
+    """Set a node's desired crawler count. The agent picks it up on next heartbeat."""
+    data = request.get_json(silent=True) or {}
+    try:
+        desired = int(data.get("desired"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "desired must be an integer"}), 400
+    if desired < 0:
+        return jsonify({"error": "desired must be >= 0"}), 400
+
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE crawler_nodes SET desired_count = %s WHERE node_id = %s;",
+            (desired, node_id),
+        )
+        updated = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    if not updated:
+        return jsonify({"error": "unknown node"}), 404
+    return jsonify({"node_id": node_id, "desired_count": desired})
+
 @app.route("/dashboard")
 def dashboard():
     conn = get_db()
@@ -128,6 +236,23 @@ def dashboard():
     url_count = totals["url_count"]
     db_size = totals["db_size"]
 
+    # Crawler nodes (from the node agents' heartbeats). `age_s` lets the
+    # template flag a node whose agent has gone silent.
+    cur.execute("""
+        SELECT
+            node_id,
+            hostname,
+            desired_count,
+            alive_count,
+            cpu_percent,
+            mem_percent,
+            last_seen,
+            EXTRACT(EPOCH FROM (now() - last_seen)) AS age_s
+        FROM crawler_nodes
+        ORDER BY node_id;
+    """)
+    nodes = cur.fetchall()
+
     cur.close()
     conn.close()
 
@@ -142,6 +267,8 @@ def dashboard():
         scrapes_per_minute=scrapes_per_minute,
         last_10_scraped=real_last_10_scraped,
         cumulative_scrapes_per_day=json.dumps(cumulative_scrapes_per_day, default=str),
+        nodes=nodes,
+        node_stale_seconds=NODE_STALE_SECONDS,
     )
 
 @app.route("/creators")
