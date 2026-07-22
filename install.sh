@@ -3,5 +3,5 @@
 
 python3 -m venv .env
 source .env/bin/activate
-pip install langdetect psycopg2 nltk tldextract bs4 attrs requests redis lxml
+pip install langdetect psycopg2 nltk tldextract bs4 attrs requests redis lxml gunicorn trafilatura
 

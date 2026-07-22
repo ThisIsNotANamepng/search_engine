@@ -17,6 +17,7 @@ blocklist.db
 supporting_servers/cleaned_hosts.txt
 supporting_servers/hosts.txt
 supporting_servers/blocklist.db
+supporting_servers/data/
 reeds-secrets-he-doesnt-want-to-share.md
 
 supporting_servers/data/*

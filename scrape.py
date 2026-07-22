@@ -31,15 +31,20 @@ import os
 import redis
 from typing import List, Tuple
 import argparse
+import trafilatura
 
 # TODO: TIMEOUT_LENGTH should be passed to the utils.mark_domain() function because it has a hardcoded 10 seconds cooldown which is passed to the redis db when adding a domain
 TIMEOUT_TIME = 10  # seconds to wait for fetching a page before skipping
 LOCAL_QUEUE_LENGTH = 100 # number of URLs to hold locally for scraping
 
+WEB_TEXT_STORAGE_SERVER_ADDRESS = os.getenv("WEB_TEXT_STORAGE_SERVER_ADDRESS")
+
 parser = argparse.ArgumentParser()
 
 parser.add_argument("-u", "--url", help="Single URL to scrape")
 parser.add_argument("-f", "--file", help="URL file to scrape")
+
+## TODO: Make --nodb also not use the blocklist and web text storage. Or add an option to just test some combination of those dbs
 parser.add_argument("-ndb", "--nodb", action='store_true', help="Don't use redis or postgres db")
 
 args = parser.parse_args()
@@ -186,7 +191,8 @@ while True:
     #links_to_scrape = utils.store(url, timeout=TIMEOUT_TIME)
 
     raw_html = utils.get_page_html(url)
-    page_data = utils.extract_data_from_html(raw_html, url)
+    page_data = utils.extract_data_from_html(raw_html, url) #[combined_text, links, title, icon_link]
+    page_data[0] = trafilatura.extract(page_data[0])
 
     # Check for english language
     if utils.determine_language(page_data[0]) != 'en':
@@ -195,14 +201,23 @@ while True:
         utils.info_print("Language not in English, skipping")
 
         ## TODO: Change this and the store() function so that we can pass only links and nothing else
+        ## TODO: Doesn't this store pages if it's not English? Why is this store command here? It should just pass the links but we haven't implemented that right?
         utils.store(page_data, url)
 
         #return [links, False]
         page_not_in_english = True
         utils.debug_print("Detected language")
 
+        utils.debug_print("Sending to web text storage server")
+        utils.send_page_text(WEB_TEXT_STORAGE_SERVER_ADDRESS, url, text=page_data[0], title=page_data[2])
+
+
     else:
+
+        utils.debug_print("Sending to web text storage server")
         utils.store(page_data, url)
+        utils.send_page_text(WEB_TEXT_STORAGE_SERVER_ADDRESS, url, text=page_data[0], title=page_data[2])
+
 
     """
     ## TODO: This changed with the big change, links_to_scrape no longer exists

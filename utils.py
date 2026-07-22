@@ -24,6 +24,8 @@ import csv
 import signal
 from typing import Optional
 import sqlite3
+import zlib
+import trafilatura
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
 RATE_LIMITED = "rate_limited"
@@ -45,6 +47,8 @@ LEVEL = os.environ["DEBUG"] if DEBUG else False
 NODB = False
 URL = ""
 
+# Chunk size for sending page text to the web text storage server
+WEB_STORAGE_CHUNK_SIZE = 64 * 1024
 
 class CSVTracker:
     def __init__(self, filename: str = "timing.csv"):
@@ -425,8 +429,8 @@ def extract_data_from_html(body, url):
             The url of the page
 
     Returns:
-        tuple
-            (combined_text, links, title, icon_link)
+        list
+            [combined_text, links, title, icon_link]
             combined_text : string
                 The visible text in the page
             links : list
@@ -485,7 +489,7 @@ def extract_data_from_html(body, url):
     # Join all text fragments into one string
     combined_text = " ".join(texts)
 
-    return combined_text, links, title, icon_link
+    return [combined_text, links, title, icon_link]
 
 def determine_language(text):
     """
@@ -1292,6 +1296,66 @@ def check_url_in_blocklist(url):
     conn.close()
 
     return(result is not None)
+
+# ================= Functions for sending data to the web text storage server
+def _gzip_chunks(source, gzip_level=6):
+    
+    #Yield gzip-compressed chunks from source, an iterable of str/bytes pieces. Compresses incrementally so the full compressed body is never held at once
+    
+    compressor = zlib.compressobj(gzip_level, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    for piece in source:
+        if isinstance(piece, str):
+            piece = piece.encode("utf-8")
+        out = compressor.compress(piece)
+        if out:
+            yield out
+    tail = compressor.flush()
+    if tail:
+        yield tail
+
+def send_page_text(server, url, text=None, path=None, title=None, gzip_level=6, chunk_size=WEB_STORAGE_CHUNK_SIZE, timeout=60):
+    """
+    Send one page's text to the storage server streamed with gzip
+
+    Provide exactly one of:
+        text: a str (or bytes) already in memory, or
+        path:  a path to a file on disk to stream from (best for very large text, since it never loads the whole file into memory)
+
+    """
+
+    if (text is None) == (path is None):
+        raise ValueError("pass exactly one of `text` or `path`")
+
+    def source():
+        if path is not None:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        else:
+            data = text.encode("utf-8") if isinstance(text, str) else text
+            for i in range(0, len(data), chunk_size):
+                yield data[i:i + chunk_size]
+
+    params = {"url": url}
+    if title is not None:
+        params["title"] = title
+
+    resp = requests.post(
+        server.rstrip("/") + "/store",
+        params=params,
+        data=_gzip_chunks(source(), gzip_level),  # generator => streamed upload
+        headers={
+            "Content-Encoding": "gzip",
+            "Content-Type": "text/plain; charset=utf-8",
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.text
+
 
 if not SCRAPER_PROXY:
     info_print("Not using scraper proxy")
