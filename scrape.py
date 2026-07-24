@@ -191,6 +191,18 @@ while True:
     #links_to_scrape = utils.store(url, timeout=TIMEOUT_TIME)
 
     raw_html = utils.get_page_html(url)
+
+    if raw_html == utils.RATE_LIMITED:
+        if not args.nodb:
+            utils.enqueue_url(url)  # requeue for later
+            redis_client.set(f"domain:{base_domain}", 1, ex=600)  # 5-min cooldown
+        utils.info_print(f"Rate limited, re-queued with 10 minute cooldown {url}")
+        continue
+
+    if raw_html is False:
+        utils.info_print(f"Fetch failed (blocked/timeout/non-HTML), skipping {url}")
+        continue
+
     page_data = utils.extract_data_from_html(raw_html, url) #[combined_text, links, title, icon_link]
     page_data[0] = trafilatura.extract(page_data[0])
 
@@ -218,15 +230,6 @@ while True:
         utils.store(page_data, url)
         utils.send_page_text(WEB_TEXT_STORAGE_SERVER_ADDRESS, url, text=page_data[0], title=page_data[2])
 
-
-    """
-    ## TODO: This changed with the big change, links_to_scrape no longer exists
-    if links_to_scrape == utils.RATE_LIMITED:
-        utils.enqueue_url(url)
-        redis_client.set(f"domain:{base_domain}", 1, ex=300)
-        utils.info_print(f"Rate limited, re-queued {url} with 5-min cooldown") ##TODO: Maybe talk about having a different cooldown timer? Not too important
-        continue
-    """
 
     total_links = 0
 
