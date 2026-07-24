@@ -72,16 +72,52 @@ import shlex
 import signal
 import socket
 import subprocess
+import urllib.request
+import urllib.error
 
-import requests
-import psutil
+# Intentionally stdlib-only: workers may have no internet (no pip/PyPI), so the
+# agent must run on a bare Python 3 with nothing installed. Host CPU/RAM come
+# from /proc; the heartbeat uses urllib instead of requests.
 
 
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
+def _clean(raw):
+    """
+    Value up to any inline '#' comment, whitespace stripped. `ctr`/`docker`
+    --env-file take the whole line after '=' literally (no inline comments), so
+    a line like `INITIAL_DESIRED=1  # note` yields the value "1  # note". We
+    tolerate that for the numeric/flag settings here. NOT applied to free-form
+    strings (passwords, URLs) where '#' can be a legitimate character.
+    """
+    return raw.split("#", 1)[0].strip()
+
+
 def _flag(name, default):
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+    return _clean(os.getenv(name, default)).lower() in ("1", "true", "yes", "on")
+
+
+def _int_env(name, default):
+    raw = os.getenv(name)
+    if raw is None or not _clean(raw):
+        return default
+    try:
+        return int(_clean(raw))
+    except ValueError:
+        print(f"[node_agent {NODE_ID}] invalid {name}={raw!r}, using {default}", flush=True)
+        return default
+
+
+def _float_env(name, default):
+    raw = os.getenv(name)
+    if raw is None or not _clean(raw):
+        return default
+    try:
+        return float(_clean(raw))
+    except ValueError:
+        print(f"[node_agent {NODE_ID}] invalid {name}={raw!r}, using {default}", flush=True)
+        return default
 
 
 HEAD_URL = os.getenv("HEAD_URL", "").rstrip("/")
@@ -107,10 +143,10 @@ CRAWLER_CMD = shlex.split(os.getenv("CRAWLER_CMD", ""))
 _SAFE_NODE = re.sub(r"[^a-zA-Z0-9]+", "-", NODE_ID).strip("-") or "node"
 CONTAINER_PREFIX = f"stultus-{_SAFE_NODE}"
 
-INITIAL_DESIRED = int(os.getenv("INITIAL_DESIRED", "1"))
-HEARTBEAT_INTERVAL = float(os.getenv("HEARTBEAT_INTERVAL", "10"))
-RECONCILE_INTERVAL = float(os.getenv("RECONCILE_INTERVAL", "1"))
-TERM_GRACE = float(os.getenv("TERM_GRACE", "10"))
+INITIAL_DESIRED = _int_env("INITIAL_DESIRED", 1)
+HEARTBEAT_INTERVAL = _float_env("HEARTBEAT_INTERVAL", 10.0)
+RECONCILE_INTERVAL = _float_env("RECONCILE_INTERVAL", 1.0)
+TERM_GRACE = _float_env("TERM_GRACE", 10.0)
 
 # Crash backoff: a slot that dies waits BASE * 2**(consecutive restarts), capped.
 # A slot that stayed up longer than HEALTHY_UPTIME has its restart count reset,
@@ -122,6 +158,53 @@ HEALTHY_UPTIME = 30.0
 
 def log(msg):
     print(f"[node_agent {NODE_ID}] {msg}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# Host stats (stdlib only, from /proc — no psutil)
+# --------------------------------------------------------------------------- #
+_prev_cpu = None  # (total_jiffies, idle_jiffies) from the last cpu_percent() call
+
+
+def cpu_percent():
+    """
+    Whole-host CPU utilisation since the previous call, from /proc/stat. Like
+    psutil.cpu_percent(interval=None): the first call primes and returns 0.0.
+    """
+    global _prev_cpu
+    try:
+        with open("/proc/stat") as f:
+            fields = [int(x) for x in f.readline().split()[1:]]
+    except OSError:
+        return 0.0
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)  # idle + iowait
+    total = sum(fields)
+    prev = _prev_cpu
+    _prev_cpu = (total, idle)
+    if prev is None:
+        return 0.0
+    dtotal = total - prev[0]
+    didle = idle - prev[1]
+    if dtotal <= 0:
+        return 0.0
+    return round(100.0 * (dtotal - didle) / dtotal, 1)
+
+
+def mem_percent():
+    """Percent of RAM in use, from /proc/meminfo (MemTotal vs MemAvailable)."""
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                info[key] = int(rest.split()[0])  # value is in kB
+    except OSError:
+        return 0.0
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", info.get("MemFree", 0))
+    if total <= 0:
+        return 0.0
+    return round(100.0 * (total - avail) / total, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -203,8 +286,8 @@ class NodeAgent:
         self.slots = {}
         self.desired = INITIAL_DESIRED
         self.running = True
-        # Prime psutil's cpu_percent so later calls return a real delta, not 0.0.
-        psutil.cpu_percent(interval=None)
+        # Prime cpu_percent() so later calls return a real delta, not 0.0.
+        cpu_percent()
 
     # ---- container management ---------------------------------------------- #
     def _spawn(self, slot_id, restarts):
@@ -301,8 +384,8 @@ class NodeAgent:
             "hostname": socket.gethostname(),
             "alive_count": alive,
             "desired_count": self.desired,
-            "cpu_percent": psutil.cpu_percent(interval=None),
-            "mem_percent": psutil.virtual_memory().percent,
+            "cpu_percent": cpu_percent(),
+            "mem_percent": mem_percent(),
             "procs": procs,
         }
 
@@ -311,18 +394,21 @@ class NodeAgent:
         if not HEAD_URL:
             return  # standalone mode: no head, just supervise at INITIAL_DESIRED
         try:
-            resp = requests.post(
+            req = urllib.request.Request(
                 f"{HEAD_URL}/agent/heartbeat",
-                json=self._state(),
-                timeout=5,
+                data=json.dumps(self._state()).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-            resp.raise_for_status()
-            desired = resp.json().get("desired_count")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = json.loads(resp.read().decode())
+            desired = body.get("desired_count")
             if isinstance(desired, int) and desired >= 0 and desired != self.desired:
                 log(f"desired count changed {self.desired} -> {desired}")
                 self.desired = desired
-        except (requests.RequestException, ValueError) as e:
-            # Head unreachable: keep running at the last known desired count.
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # Head unreachable/4xx: keep running at the last known desired count.
+            # (HTTPError is a URLError subclass, so 404s land here too.)
             log(f"heartbeat failed ({e}); holding desired={self.desired}")
 
     # ---- main loop --------------------------------------------------------- #

@@ -306,12 +306,12 @@ th {
                             <td>{{ n.mem_percent | round(0) if n.mem_percent is not none else '–' }}%</td>
                             <td>{{ n.age_s | round(0) if n.age_s is not none else '–' }}</td>
                             <td style="white-space:nowrap">
-                                <button onclick="scaleNode('{{ n.node_id }}', {{ n.desired_count - 1 }})">−</button>
+                                <button onclick="adjustScale('{{ n.node_id }}', -1)">−</button>
                                 <input id="scale-{{ n.node_id }}" type="number" min="0"
                                        value="{{ n.desired_count }}"
                                        style="width:60px;background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:6px;padding:4px">
-                                <button onclick="scaleNode('{{ n.node_id }}', document.getElementById('scale-{{ n.node_id }}').value)">Set</button>
-                                <button onclick="scaleNode('{{ n.node_id }}', {{ n.desired_count + 1 }})">＋</button>
+                                <button onclick="setScale('{{ n.node_id }}', this)">Set</button>
+                                <button onclick="adjustScale('{{ n.node_id }}', 1)">＋</button>
                             </td>
                         </tr>
                         {% else %}
@@ -391,17 +391,29 @@ th {
     });
 
 
-    // Set a crawler node's desired count. The node agent picks it up on its
-    // next heartbeat; we reload so the table reflects the new target.
-    function scaleNode(nodeId, desired) {
-        desired = Math.max(0, parseInt(desired, 10) || 0);
+    // +/− only edit the input locally — nothing is sent to the worker until Set.
+    function adjustScale(nodeId, delta) {
+        const input = document.getElementById('scale-' + nodeId);
+        input.value = Math.max(0, (parseInt(input.value, 10) || 0) + delta);
+    }
+
+    // Set sends the current input value to the worker node. No page reload; the
+    // agent applies it on its next heartbeat and the 60s refresh reflects it.
+    function setScale(nodeId, btn) {
+        const input = document.getElementById('scale-' + nodeId);
+        const desired = Math.max(0, parseInt(input.value, 10) || 0);
+        input.value = desired;
+        const label = btn.textContent;
         fetch(`/nodes/${nodeId}/scale`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ desired })
         })
         .then(r => { if (!r.ok) return r.json().then(e => Promise.reject(e)); })
-        .then(() => location.reload())
+        .then(() => {                       // brief inline confirmation, no reload
+            btn.textContent = "✓";
+            setTimeout(() => { btn.textContent = label; }, 1200);
+        })
         .catch(e => alert("Scale failed: " + (e.error || "unknown error")));
     }
 

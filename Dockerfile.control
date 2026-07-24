@@ -1,0 +1,56 @@
+# Worker-node controller image — the node agent (node_agent.py) that supervises
+# and scales the scraper containers on ONE worker box.
+#
+# This is NOT the scraper image (./Dockerfile) and NOT the head dashboard. It is
+# the "controller" that runs on each worker and drives that worker's OWN
+# containerd to start/stop/scale the scraper containers.
+#
+# node_agent.py is stdlib-only (no pip installs, no repo-local imports), so the
+# image is just Python + the one file. The `ctr` client and the containerd
+# socket are NOT baked in; they are bind-mounted from the host at runtime so the
+# client version always matches the host's containerd (see run notes below).
+#
+# Because it's stdlib-only, you usually DON'T need this image at all on a worker:
+# just copy node_agent.py onto a host that has python3 and run it directly (best
+# on k3s, where an unprivileged container can't mount scraper rootfs). The image
+# remains a convenient way to ship the file to an offline worker via the registry.
+#
+# ─── Build (on a machine that HAS a builder; ctr cannot build images) ────────
+#   podman build -f Dockerfile.control -t db01:5000/stultus-agent:1.0.0 .
+#   podman push --tls-verify=false db01:5000/stultus-agent:1.0.0
+#   # then on each worker:
+#   ctr -n stultus images pull --plain-http db01:5000/stultus-agent:1.0.0
+#
+# ─── Run on a worker ─────────────────────────────────────────────────────────
+# The agent must reach the host's containerd, so bind-mount BOTH the socket and
+# the host ctr binary, and share the host network so it can reach HEAD_URL:
+#
+#   ctr -n stultus run --rm --net-host \
+#     --mount type=bind,src=/run/containerd/containerd.sock,dst=/run/containerd/containerd.sock,options=rbind:rw \
+#     --mount type=bind,src=/usr/local/bin/ctr,dst=/usr/local/bin/ctr,options=rbind:ro \
+#     --env-file /etc/stultus/crawler.env \
+#     db01:5000/stultus-agent:1.0.0 stultus-agent
+#
+# `ctr run` has no restart policy, so let systemd supervise THAT command: point
+# crawler-agent.service's ExecStart at the `ctr run … stultus-agent` line above.
+# The agent then spawns the scraper containers as host-level siblings in the
+# same "stultus" namespace; if the agent container dies, its startup
+# cleanup_stale_containers() sweeps and respawns them on the next boot.
+#
+# (Simpler alternative, if you don't actually need the agent itself in a
+# container: run node_agent.py straight from a venv under crawler-agent.service —
+# no socket mount, no runtime-in-runtime. Same supervision, less machinery.)
+
+FROM debian:stable-slim
+
+RUN apt update && apt install -y python3 python3-venv git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/ThisIsNotANamepng/search_engine.git
+
+WORKDIR /search_engine
+
+# Drives the host containerd via the bind-mounted /usr/local/bin/ctr (the agent's
+# default CTR_BIN), spawning/scaling scraper containers in the CTR_NAMESPACE.
+# node_agent.py is stdlib-only, so the system python3 is all it needs.
+CMD ["python3", "node_agent.py"]
