@@ -20,6 +20,7 @@ from psycopg2 import sql
 import psycopg2.extras as extras
 from psycopg2.extras import execute_values
 from langdetect import detect
+from langdetect.lang_detect_exception import LangDetectException
 import csv
 import signal
 from typing import Optional
@@ -501,13 +502,18 @@ def determine_language(text):
 
     Returns:
         string
-            The two character code (https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes)
+            The two character code (https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes),
+            or 'unknown' if the text has no detectable language features (e.g. only
+            numbers/symbols) — langdetect raises on those instead of returning a code
 
     TODO:
         - Determine how long this process takes with long documents, and if it's a noticeable slowdown experiment with only passing a part of the page for detection
     """
 
-    return detect(text)
+    try:
+        return detect(text)
+    except LangDetectException:
+        return 'unknown'
 
 def allowed_by_robots(url, user_agent):
     """

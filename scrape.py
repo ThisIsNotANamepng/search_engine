@@ -204,32 +204,42 @@ while True:
         continue
 
     page_data = utils.extract_data_from_html(raw_html, url) #[combined_text, links, title, icon_link]
-    page_data[0] = trafilatura.extract(page_data[0])
+    # trafilatura needs the raw HTML to locate the main content — extract_data_from_html
+    # already stripped the tags, so page_data[0] is plain text and trafilatura would
+    # return None on it. Feed it the raw page instead.
+    page_data[0] = trafilatura.extract(raw_html)
 
-    # Check for english language
-    if utils.determine_language(page_data[0]) != 'en':
-        # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
-        utils.log(f"Language Not in English {url}")
-        utils.info_print("Language not in English, skipping")
+    # trafilatura.extract() returns None when it can't pull main text out of the
+    # page (nav-only pages, JS-rendered shells, etc.). There's nothing to
+    # language-detect, store or send in that case, so skip the text handling — but
+    # still fall through to the link processing below so we keep discovering URLs.
+    if page_data[0]:
+        # Check for english language
+        if utils.determine_language(page_data[0]) != 'en':
+            # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
+            utils.log(f"Language Not in English {url}")
+            utils.info_print("Language not in English, skipping")
 
-        ## TODO: Change this and the store() function so that we can pass only links and nothing else
-        ## TODO: Doesn't this store pages if it's not English? Why is this store command here? It should just pass the links but we haven't implemented that right?
-        utils.store(page_data, url)
+            ## TODO: Change this and the store() function so that we can pass only links and nothing else
+            ## TODO: Doesn't this store pages if it's not English? Why is this store command here? It should just pass the links but we haven't implemented that right?
+            utils.store(page_data, url)
 
-        #return [links, False]
-        page_not_in_english = True
-        utils.debug_print("Detected language")
+            #return [links, False]
+            page_not_in_english = True
+            utils.debug_print("Detected language")
 
-        utils.debug_print("Sending to web text storage server")
-        utils.send_page_text(WEB_TEXT_STORAGE_SERVER_ADDRESS, url, text=page_data[0], title=page_data[2])
+            utils.debug_print("Sending to web text storage server")
+            utils.send_page_text(WEB_TEXT_STORAGE_SERVER_ADDRESS, url, text=page_data[0], title=page_data[2])
 
+
+        else:
+
+            utils.debug_print("Sending to web text storage server")
+            utils.store(page_data, url)
+            utils.send_page_text(WEB_TEXT_STORAGE_SERVER_ADDRESS, url, text=page_data[0], title=page_data[2])
 
     else:
-
-        utils.debug_print("Sending to web text storage server")
-        utils.store(page_data, url)
-        utils.send_page_text(WEB_TEXT_STORAGE_SERVER_ADDRESS, url, text=page_data[0], title=page_data[2])
-
+        utils.info_print(f"No extractable text, keeping links only {url}")
 
     total_links = 0
 
