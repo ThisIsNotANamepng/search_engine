@@ -603,7 +603,15 @@ def get_page_html(url, timeout=None):
 
     try:
         if SCRAPER_PROXY:
-            request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10))
+            request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False)
+            redirect_hops = 0
+            while request.is_redirect and redirect_hops < 5:
+                location = request.headers.get("Location", "")
+                if not location:
+                    break
+                url = urljoin(url, location)  # relative Location -> absolute target url
+                request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False)
+                redirect_hops += 1
         else:
             request = requests.get(url, headers=headers, timeout=(5, 10))
 
