@@ -262,7 +262,8 @@ while True:
 
             cur.execute("""
                 UPDATE urls
-                SET reference_count = reference_count + 1
+                SET reference_count = reference_count + 1,
+                    reference_score = POWER( CAST(reference_count AS FLOAT) + 1.0, .166667) --this number is 1/6 which makes it not grow too fast
                 WHERE url = ANY(%s);
             """, (external_links,))
 
