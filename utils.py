@@ -1264,18 +1264,13 @@ def delete_from_queue(url):
 # ------------ Redis functions
 
 def mark_domain(domain, redis_client):
-    # Marks domain as scraped
+    # Called after a scrape finishes: restart the 10 second cooldown so it also counts from the end of a slow scrape
+    redis_client.set(f"domain:{domain}", 1, ex=10)
 
-    key = f"domain:{domain}"
-    # SET key with NX (only if not exists) and EX (expire)
-    redis_client.set(key, 1, nx=True, ex=10)
-
-def domain_free_for_scraping(domain, redis_client):
-    # Checks the redis db if domain has been scraped in the last 10 seconds
-    # True for not in db and can be scraped, False for not
-
-    key = f"domain:{domain}"
-    return not redis_client.exists(key)
+def claim_domain(domain, redis_client):
+    # Atomically claims the domain for 10 seconds (SET NX): True if it was free and is now ours, False if another scraper touched it in the last 10 seconds
+    # Check and claim must be one step, otherwise scrapers that check at the same time all see it free
+    return bool(redis_client.set(f"domain:{domain}", 1, nx=True, ex=10))
 
 def _refresh_blocklist_if_stale():
     """

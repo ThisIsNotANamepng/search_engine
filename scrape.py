@@ -186,7 +186,7 @@ while True:
                     break
 
                 # Checks the redis db
-                next_url_is_free = utils.domain_free_for_scraping(base_domain, redis_client)
+                next_url_is_free = utils.claim_domain(base_domain, redis_client)
 
                 if next_url_is_free:
                     # Case 3: Domain is NOT the same as the previously scraped domain, also NOT in the redis db. Thus, we break this loop and scrape
@@ -225,7 +225,7 @@ while True:
         page_not_in_english = False
 
         if not args.nodb:
-            ## TODO: is_domain_blocked checks if the url is in the main postgres db table for opted-out domains, domain_free_for_scraping checks if the domain is in the redis db, we should talk about whether we need two of them, or if we should just add the opted-out domains to the redis db
+            ## TODO: is_domain_blocked checks if the url is in the main postgres db table for opted-out domains, claim_domain checks if the domain is in the redis db, we should talk about whether we need two of them, or if we should just add the opted-out domains to the redis db
             ## TODO: This should be added to the main check statements above in the loop finding the next good url
             if utils.is_domain_blocked(utils.get_base_domain(url)):
                 utils.info_print(f"Domain is blocked, skipping {url}")
