@@ -1019,6 +1019,17 @@ def store(content, url):
 
     return links
 
+def mark_url_seen(url):
+    """Record a url without indexing its text (no tokens, so it never shows up in search), so filter_new_urls() won't queue it again"""
+    if NODB or len(url) > MAX_URL_LENGTH:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO urls (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (url,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def delete_url(url):
     conn = get_conn()
     cur = conn.cursor()

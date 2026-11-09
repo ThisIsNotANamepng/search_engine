@@ -261,9 +261,8 @@ while True:
                 utils.log(f"Language Not in English {url}")
                 utils.info_print("Language not in English, skipping")
 
-                ## TODO: Change this and the store() function so that we can pass only links and nothing else
-                ## TODO: Doesn't this store pages if it's not English? Why is this store command here? It should just pass the links but we haven't implemented that right?
-                utils.store(page_data, url)
+                # Not indexed, only recorded as seen so other pages linking here don't queue it again
+                utils.mark_url_seen(url)
 
                 #return [links, False]
                 page_not_in_english = True
