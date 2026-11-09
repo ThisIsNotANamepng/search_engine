@@ -730,7 +730,10 @@ def get_base_domain(url):
 
 def block_domain(url, reason=""):
     """
-    Add a domain to the list (in the database) of domains we don't scrape
+    Add the url's host to the list (in the database) of hosts we don't scrape
+
+    Blocks the exact host (spammy.blogspot.com), not the registrable domain, so one 401/403 doesn't block every site on blogspot.com or github.io.
+    Queued urls of the host aren't deleted here; the scraper checks is_domain_blocked() before every url
     
     Args:
         url : string
@@ -741,13 +744,10 @@ def block_domain(url, reason=""):
     Returns:
         Nothing
 
-    TODO:
-        - I don't think we use this blocked_domains table anywhere else, we should integrate that into scraping so we actually check it
-
     Notes:
         We don't use the reason variable at all, but we totally couple if we wanted
     """
-    domain = get_base_domain(url)
+    domain = urlparse(url).hostname
     if not domain:
         return
     
@@ -755,7 +755,6 @@ def block_domain(url, reason=""):
     cur = conn.cursor()
 
     cur.execute("INSERT INTO blocked_domains (domain, reason) VALUES (%s, %s) ON CONFLICT (domain) DO NOTHING;", (domain, reason))
-    cur.execute("DELETE FROM url_queue WHERE url LIKE %s;", (f"%{domain}%",))
 
     conn.commit()
     cur.close()
@@ -763,13 +762,15 @@ def block_domain(url, reason=""):
 
     log(f"Blocked domain {domain} reason={reason}")
 
-def is_domain_blocked(domain):
+def is_domain_blocked(url):
     """
-    Checks the db table to determine whether a domain is allowed to be scraped
+    Checks the db table to determine whether a url's host is allowed to be scraped
+
+    Matches either the exact host (automatic blocks from block_domain) or the registrable domain (e.g. a manual opt-out of example.com also covers www.example.com)
     
     Args:
-        domain : string
-            The domain to check
+        url : string
+            The url to check
     
     Return:
         boolean
@@ -782,7 +783,7 @@ def is_domain_blocked(domain):
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT 1 FROM blocked_domains WHERE domain = %s;", (domain,))
+    cur.execute("SELECT 1 FROM blocked_domains WHERE domain = ANY(%s);", ([urlparse(url).hostname, get_base_domain(url)],))
 
     blocked = cur.fetchone() is not None
     cur.close()

@@ -227,7 +227,7 @@ while True:
         if not args.nodb:
             ## TODO: is_domain_blocked checks if the url is in the main postgres db table for opted-out domains, claim_domain checks if the domain is in the redis db, we should talk about whether we need two of them, or if we should just add the opted-out domains to the redis db
             ## TODO: This should be added to the main check statements above in the loop finding the next good url
-            if utils.is_domain_blocked(utils.get_base_domain(url)):
+            if utils.is_domain_blocked(url):
                 utils.info_print(f"Domain is blocked, skipping {url}")
                 continue
 
