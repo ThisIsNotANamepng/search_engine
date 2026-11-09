@@ -9,6 +9,7 @@ import requests
 import socket
 import string
 import itertools
+import ipaddress
 import weakref
 import functools
 import queue
@@ -629,6 +630,21 @@ def _robots_parser(robots_url, user_agent, day):
     rp.parse(resp.text.splitlines())
     return rp
 
+def is_public_host(url):
+    """
+    True if the url's host resolves only to public internet addresses.
+    Stops the crawler from following links or redirects into our own network (db01, localhost, 10.x, ...) and indexing internal pages.
+    shortcut: the host is resolved again for the real request (DNS rebinding could slip past), fine while our internal services aren't high value, pin the resolved IP if that changes
+    """
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except (socket.gaierror, UnicodeError):
+        return False
+    return all(ipaddress.ip_address(a.split("%", 1)[0]).is_global for a in addresses)  # split drops an IPv6 zone like %eth0
+
 def get_page_html(url, timeout=None):
     """
     Download the html of a page
@@ -659,6 +675,10 @@ def get_page_html(url, timeout=None):
     def handler(signum, frame):
         log(f"Error URL took too long to download {url}")
 
+    if not is_public_host(url):
+        log(f"Error Not a public address {url}")
+        return False
+
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
         info_print("Not allowed by robots.txt")
@@ -675,22 +695,28 @@ def get_page_html(url, timeout=None):
     signal.signal(signal.SIGALRM, handler)
     signal.alarm(timeout or 0)
 
-    # stream=True: only the headers are read here, so status and Content-Type are checked before any body is downloaded
+    def fetch(target):
+        # One hop: redirects are followed below so every target is checked first
+        # stream=True: only the headers are read here, so status and Content-Type are checked before any body is downloaded
+        if SCRAPER_PROXY:
+            return requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": target}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
+        return requests.get(target, headers=headers, timeout=(5, 10), allow_redirects=False, stream=True)
+
     request = None
     try:
-        if SCRAPER_PROXY:
-            request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
-            redirect_hops = 0
-            while request.is_redirect and redirect_hops < 5:
-                location = request.headers.get("Location", "")
-                if not location:
-                    break
-                url = urljoin(url, location)  # relative Location -> absolute target url
-                request.close()
-                request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
-                redirect_hops += 1
-        else:
-            request = requests.get(url, headers=headers, timeout=(5, 10), stream=True)
+        request = fetch(url)
+        redirect_hops = 0
+        while request.is_redirect and redirect_hops < 5:
+            location = request.headers.get("Location", "")
+            if not location:
+                break
+            url = urljoin(url, location)  # relative Location -> absolute target url
+            request.close()
+            if not is_public_host(url):
+                log(f"Error Redirect to a non-public address {url}")
+                return False
+            request = fetch(url)
+            redirect_hops += 1
 
         content_type = request.headers.get("Content-Type", "").lower()
 
