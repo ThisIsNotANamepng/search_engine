@@ -56,6 +56,8 @@ MAX_URL_LENGTH = 2048  # urls.url, url_queue.url, urls_references.*, icon_link
 MAX_TITLE_LENGTH = 128  # urls.title
 MAX_TOKEN_LENGTH = 64  # words.word, prefixes.prefix
 
+MAX_PAGE_BYTES = 5 * 1024 * 1024  # pages bigger than this (after decompression) are skipped
+
 class CSVTracker:
     def __init__(self, filename: str = "timing.csv"):
         self.filename = filename
@@ -622,19 +624,22 @@ def get_page_html(url, timeout=None):
     signal.signal(signal.SIGALRM, handler)
     signal.alarm(timeout or 0)
 
+    # stream=True: only the headers are read here, so status and Content-Type are checked before any body is downloaded
+    request = None
     try:
         if SCRAPER_PROXY:
-            request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False)
+            request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
             redirect_hops = 0
             while request.is_redirect and redirect_hops < 5:
                 location = request.headers.get("Location", "")
                 if not location:
                     break
                 url = urljoin(url, location)  # relative Location -> absolute target url
-                request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False)
+                request.close()
+                request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
                 redirect_hops += 1
         else:
-            request = requests.get(url, headers=headers, timeout=(5, 10))
+            request = requests.get(url, headers=headers, timeout=(5, 10), stream=True)
 
         content_type = request.headers.get("Content-Type", "").lower()
 
@@ -653,8 +658,15 @@ def get_page_html(url, timeout=None):
             log(f"Error Invalid data type {url}")
             return False
 
-        content = request.content
-            
+        # Read at most MAX_PAGE_BYTES; a huge page would otherwise be loaded into memory whole
+        content = bytearray()
+        for chunk in request.iter_content(chunk_size=64 * 1024):
+            content += chunk
+            if len(content) > MAX_PAGE_BYTES:
+                log(f"Error Page too large {url}")
+                return False
+        content = bytes(content)
+
     except TimeoutError:
         log(f"Error Total timeout exceeded {url}")
         return False
@@ -662,8 +674,9 @@ def get_page_html(url, timeout=None):
         log(f"Error HTTP error fetching: {url} : {e}")
         return False
     finally:
-        #print(5)
         signal.alarm(0)
+        if request is not None:
+            request.close()
 
     return content
     #return extract_data_from_html(content, url)
