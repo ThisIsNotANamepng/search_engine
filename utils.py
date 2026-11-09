@@ -1067,30 +1067,22 @@ def queue_size():
     return count
 
 def get_next_urls(num_urls):
-    #print("HT=================")
-    # Returns a list of the next urls in the queue, deletes them from the db queue
+    # Returns a list of the next urls in the queue ([] if empty), deletes them from the db queue
+    # SKIP LOCKED in one statement so concurrent scrapers never claim the same rows
 
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, url FROM url_queue ORDER BY id LIMIT %s;", (num_urls,))
-    rows = cur.fetchall()
+    cur.execute("""
+        DELETE FROM url_queue WHERE id IN (
+            SELECT id FROM url_queue ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
+        ) RETURNING url;
+    """, (num_urls,))
+    urls = [row[0] for row in cur.fetchall()]
 
-    ids = [row[0] for row in rows]
-    urls = [row[1] for row in rows]
-
-    # Nothing in the queue
-    if not rows:
-        cur.close()
-        conn.close()
-        return None
-
-    cur.execute("DELETE FROM url_queue WHERE id = ANY(%s);", (ids,))
     conn.commit()
     cur.close()
     conn.close()
-
-    #print("URLS", urls)
 
     return urls
 
