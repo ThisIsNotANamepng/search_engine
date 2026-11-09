@@ -9,6 +9,7 @@ import requests
 import socket
 import string
 import itertools
+import functools
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 from urllib.parse import urlparse, urljoin
@@ -566,27 +567,29 @@ def allowed_by_robots(url, user_agent):
     parsed = urlparse(url)
     robots_url = urljoin(f"{parsed.scheme}://{parsed.netloc}", "robots.txt")
 
-    rp = RobotFileParser()
-
     try:
-        rp.set_url(robots_url)
-        if SCRAPER_PROXY:
-            resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
-        else:
-            resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
-        if resp.status_code != 200:
-            # If robots.txt not found or inaccessible, assume allowed
-            return True
-        # rp.parse expects an iterable of lines
-        rp.parse(resp.text.splitlines())
-    except requests.exceptions.RequestException:
-        # Network errors/timeouts -> be permissive so we don't block scraping
-        return True
+        # The day number is part of the cache key, so each site's robots.txt is fetched at most once a day per scraper instead of once per page
+        rp = _robots_parser(robots_url, user_agent, int(time.time() // 86400))
     except Exception:
-        # Any unexpected parsing error, be permissive
+        # Network errors/timeouts or an unexpected parsing error -> be permissive so we don't block scraping (not cached, so the next page retries)
         return True
 
-    return rp.can_fetch(user_agent, url)
+    # No robots.txt (not found or inaccessible) -> assume allowed
+    return rp is None or rp.can_fetch(user_agent, url)
+
+@functools.lru_cache(maxsize=10000)
+def _robots_parser(robots_url, user_agent, day):
+    """Fetch and parse one site's robots.txt. Returns None if the site has none (cached); raises on network errors (lru_cache doesn't cache exceptions)"""
+    if SCRAPER_PROXY:
+        resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
+    else:
+        resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
+    if resp.status_code != 200:
+        return None
+    rp = RobotFileParser()
+    # rp.parse expects an iterable of lines
+    rp.parse(resp.text.splitlines())
+    return rp
 
 def get_page_html(url, timeout=None):
     """
