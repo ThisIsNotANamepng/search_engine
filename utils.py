@@ -943,20 +943,19 @@ def store(content, url):
         len(prefix_list)
     ))
     
-    # Bulk insert words/bigrams/trigrams/prefixes using execute_values.
-    if words:
-        extra_vals = [(w,) for w in words]
-        extras.execute_values(cur,
-            "INSERT INTO words (word) VALUES %s ON CONFLICT (word) DO NOTHING;",
-            extra_vals,
-            template=None)
+    # Bulk insert new words/prefixes (bigrams/trigrams are pre-populated).
+    # Only rows that don't exist yet: postgres burns an id for every attempted row even when ON CONFLICT skips it, which overflows the INT ids.
+    # ORDER BY: every scraper locks new tokens in the same order, otherwise two scrapers inserting the same new words deadlock.
+    for column, table, tokens in (("word", "words", words), ("prefix", "prefixes", prefixes)):
+        if tokens:
+            cur.execute(sql.SQL("""
+                INSERT INTO {tbl} ({col})
+                SELECT t FROM unnest(%s::varchar[]) AS t
+                WHERE NOT EXISTS (SELECT 1 FROM {tbl} WHERE {col} = t)
+                ORDER BY t
+                ON CONFLICT ({col}) DO NOTHING;
+            """).format(col=sql.Identifier(column), tbl=sql.Identifier(table)), (list(tokens),))
 
-    if prefixes:
-        extra_vals = [(p,) for p in prefixes]
-        extras.execute_values(cur,
-            "INSERT INTO prefixes (prefix) VALUES %s ON CONFLICT (prefix) DO NOTHING;",
-            extra_vals)
-        
     if links:
         extra_vals = [(url, l) for l in links]
         extras.execute_values(cur, "INSERT INTO urls_references (url, referenced_domain) VALUES %s ON CONFLICT DO NOTHING;", extra_vals, template=None)
