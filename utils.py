@@ -9,6 +9,7 @@ import requests
 import socket
 import string
 import itertools
+import weakref
 import functools
 from bs4 import BeautifulSoup
 from bs4.element import Comment
@@ -245,11 +246,24 @@ def get_conn():
     """Return a new psycopg2 connection using `DATABASE_URL` or PG_* env vars."""
     database_url = os.getenv("DATABASE_URL")
     if database_url:
-        return psycopg2.connect(database_url)
+        conn = psycopg2.connect(database_url)
+        _OPEN_CONNS.add(conn)
+        return conn
     else:
         failure_print("No DATABASE_URL set, not connecting to server")
 
     #return psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
+
+# Every connection get_conn() opened that's still alive, so close_all_connections() can find ones a caller never closed
+_OPEN_CONNS = weakref.WeakSet()
+
+def close_all_connections():
+    """
+    Close every open connection, rolling back anything uncommitted.
+    Used on exit: a transaction cut off by SIGTERM (and still referenced, e.g. by the exception) keeps its row locks until the process ends, so the final requeue of the same urls would wait on it forever
+    """
+    for conn in list(_OPEN_CONNS):
+        conn.close()
 
 def create_database():
     conn = get_conn()

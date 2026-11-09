@@ -112,7 +112,11 @@ def send_page_text(url, page_data):
         utils.log(f"Error Web text storage failed {e!r} {url}")
 
 # On any exit, hand the urls we still hold back to the db queue
-atexit.register(lambda: requeue(local_queue + queue_return_to_db + ([url] if url else [])))
+def on_exit():
+    utils.close_all_connections()  # roll back anything SIGTERM cut off, otherwise its locks block requeueing the same urls
+    requeue(local_queue + queue_return_to_db + ([url] if url else []))
+
+atexit.register(on_exit)
 # Turn the node agent's SIGTERM into a normal exit so atexit runs (python is PID 1 in the container, which ignores SIGTERM without a handler)
 # While claiming urls from the db the exit is deferred: they're deleted from the db before they land in local_queue, so exiting in between would lose them
 claiming_urls = False
