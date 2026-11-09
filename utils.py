@@ -822,6 +822,7 @@ def clean_links(raw_links):
     # Clean links, this is copied from scrape.py, should probably have a shred function but it's 10:55pm and I'm tired
     # This above comment caused issues. The cleaning here is for cleaning links to add to the scraping, while cleaning in scrape.py is for references so it just need to be the base domains
     cleaned = []
+    seen = set()  # same contents as cleaned; a set so checking for duplicates doesn't rescan the list (O(n^2) on pages with thousands of links)
 
     for link in raw_links:
         clean_link = link.split('?', 1)[0] #gets rid of anything after a ?
@@ -832,10 +833,11 @@ def clean_links(raw_links):
         if slash_index == clean_link_length:
             clean_link = clean_link[:-1] #gets rid of the "/" if a link ends with it
             
-        if clean_link not in cleaned:
+        if clean_link not in seen:
             # Gets rid of links that aren't http(s) and are longer than the max url length (as dictated by the postgres length limits)
             if clean_link[0:4] == "http" and len(clean_link) <= MAX_URL_LENGTH:
                 cleaned.append(clean_link)
+                seen.add(clean_link)
 
     return cleaned
 
