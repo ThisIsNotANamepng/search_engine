@@ -1,0 +1,8 @@
+# Development tools: tests, the timing notebook (tests/utils) and the docs site (docs/)
+# The scrapers and servers only need requirements.txt
+-r requirements.txt
+pytest==9.2.0
+ipykernel==7.2.0
+matplotlib==3.10.8
+numpy==2.3.5
+mkdocs-material==9.7.6
