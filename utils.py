@@ -11,6 +11,7 @@ import string
 import itertools
 import weakref
 import functools
+import queue
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 from urllib.parse import urlparse, urljoin
@@ -242,28 +243,51 @@ def failure_print(text):
     else:
         print(text)
 
+class _ReusableConnection(psycopg2.extensions.connection):
+    """
+    A connection whose close() rolls back and keeps it for the next get_conn() instead of disconnecting.
+    Opening a postgres connection costs a new server process and an auth round trip, and a scrape used ~10 per page.
+    At most one is kept idle; a get_conn() while it's in use (nested or another thread) opens its own, so transactions are never shared.
+    """
+    def close(self):
+        if not self.closed and _IDLE_CONNS.qsize() < 1:
+            try:
+                self.rollback()  # leave it like a fresh connection (also clears an aborted transaction)
+                _IDLE_CONNS.put(self)
+                return
+            except psycopg2.Error:
+                pass
+        super().close()
+
+_IDLE_CONNS = queue.SimpleQueue()
+
 def get_conn():
-    """Return a new psycopg2 connection using `DATABASE_URL` or PG_* env vars."""
+    """Return a psycopg2 connection using `DATABASE_URL`, reusing the idle one if there is one. Call close() when done with it"""
+    while True:
+        try:
+            conn = _IDLE_CONNS.get_nowait()
+        except queue.Empty:
+            break
+        if not conn.closed:
+            return conn
     database_url = os.getenv("DATABASE_URL")
     if database_url:
-        conn = psycopg2.connect(database_url)
+        conn = psycopg2.connect(database_url, connection_factory=_ReusableConnection)
         _OPEN_CONNS.add(conn)
         return conn
     else:
         failure_print("No DATABASE_URL set, not connecting to server")
-
-    #return psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
 
 # Every connection get_conn() opened that's still alive, so close_all_connections() can find ones a caller never closed
 _OPEN_CONNS = weakref.WeakSet()
 
 def close_all_connections():
     """
-    Close every open connection, rolling back anything uncommitted.
+    Really close every open connection (idle ones too), rolling back anything uncommitted.
     Used on exit: a transaction cut off by SIGTERM (and still referenced, e.g. by the exception) keeps its row locks until the process ends, so the final requeue of the same urls would wait on it forever
     """
     for conn in list(_OPEN_CONNS):
-        conn.close()
+        psycopg2.extensions.connection.close(conn)  # the base close, not _ReusableConnection's which would keep it
 
 def create_database():
     conn = get_conn()
