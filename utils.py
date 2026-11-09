@@ -220,9 +220,11 @@ def debug_print(text):
                 # "Committed and closed sql connection"
                 code = "committed_and_closed"
             else:
-                print(f"Code not found: {text}  ::  {text[0:5]}")
+                # Not one of the timed steps (e.g. "Sending to web text storage server"): just printed above
+                code = None
 
-            TIMING_TRACKER.update(URL, code, timing)
+            if code:
+                TIMING_TRACKER.update(URL, code, timing)
 
             DEBUG_BREAKPOINT_TIMER = time.time()
 
