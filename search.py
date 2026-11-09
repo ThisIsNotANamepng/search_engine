@@ -114,7 +114,7 @@ def search(query):
             SELECT
                 u.url,
                 u.title,
-                ((prefix_score + bigram_score + trigram_score + word_score + word_count) / word_count) AS relevance,
+                ((prefix_score + bigram_score + trigram_score + word_score + word_count) / word_count::float) AS relevance,
                 (2.0 - (POWER(c.reference_count, 1.0/1.2) / c.reference_count))::double precision AS ref_score,
                 c.reference_count
             FROM combined c
