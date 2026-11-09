@@ -94,36 +94,40 @@ def search(query):
             GROUP BY pu.url_id
         ),
 
+        -- Only urls with at least one match are candidates, so a search doesn't read every url in the index
+        candidates AS (
+            SELECT url_id FROM word_matches
+            UNION SELECT url_id FROM bigram_matches
+            UNION SELECT url_id FROM trigram_matches
+            UNION SELECT url_id FROM prefix_matches
+        ),
+
         combined AS (
             SELECT
-                u.id AS url_id,
+                u.url,
+                u.title,
                 COALESCE(wm.word_score, 0) AS word_score,
                 COALESCE(bm.bigram_score, 0) AS bigram_score,
                 COALESCE(tm.trigram_score, 0) AS trigram_score,
                 COALESCE(pm.prefix_score, 0) AS prefix_score,
                 utc.word_count AS word_count,
                 u.reference_count AS reference_count
-            FROM urls u
-            JOIN url_token_counts utc ON utc.url_id = u.id
-            LEFT JOIN word_matches wm ON wm.url_id = u.id
-            LEFT JOIN bigram_matches bm ON bm.url_id = u.id
-            LEFT JOIN trigram_matches tm ON tm.url_id = u.id
-            LEFT JOIN prefix_matches pm ON pm.url_id = u.id
+            FROM candidates c
+            JOIN urls u ON u.id = c.url_id
+            JOIN url_token_counts utc ON utc.url_id = c.url_id
+            LEFT JOIN word_matches wm ON wm.url_id = c.url_id
+            LEFT JOIN bigram_matches bm ON bm.url_id = c.url_id
+            LEFT JOIN trigram_matches tm ON tm.url_id = c.url_id
+            LEFT JOIN prefix_matches pm ON pm.url_id = c.url_id
         ),
         scored AS(
             SELECT
-                u.url,
-                u.title,
+                url,
+                title,
                 ((prefix_score + bigram_score + trigram_score + word_score + word_count) / word_count::float) AS relevance,
-                (2.0 - (POWER(c.reference_count, 1.0/1.2) / c.reference_count))::double precision AS ref_score,
-                c.reference_count
-            FROM combined c
-            JOIN urls u ON u.id = c.url_id
-            WHERE
-                word_score > 0
-                OR bigram_score > 0
-                OR trigram_score > 0
-                OR prefix_score > 0
+                (2.0 - (POWER(reference_count, 1.0/1.2) / reference_count))::double precision AS ref_score,
+                reference_count
+            FROM combined
             )
 
         SELECT
@@ -134,7 +138,7 @@ def search(query):
             ref_score,
             reference_count
         FROM scored
-        ORDER BY search_output DESC
+        ORDER BY search_output DESC, url  -- url breaks ties so results are stable
         LIMIT 10;
         """
 

@@ -350,6 +350,16 @@ def create_database():
     -- Functional index matching the unique-domains regex in the dashboard
     CREATE INDEX IF NOT EXISTS urls_domain_idx
         ON urls ((SUBSTRING(url FROM '^(?:https?://)?([^/]+)')));
+
+    -- Token -> page lookups (search) and page -> tokens (store() replacing a re-crawled page's postings)
+    CREATE INDEX IF NOT EXISTS idx_word_urls_word_id ON word_urls(word_id);
+    CREATE INDEX IF NOT EXISTS idx_word_urls_url_id ON word_urls(url_id);
+    CREATE INDEX IF NOT EXISTS idx_bigram_urls_bigram_id ON bigram_urls(bigram_id);
+    CREATE INDEX IF NOT EXISTS idx_bigram_urls_url_id ON bigram_urls(url_id);
+    CREATE INDEX IF NOT EXISTS idx_trigram_urls_trigram_id ON trigram_urls(trigram_id);
+    CREATE INDEX IF NOT EXISTS idx_trigram_urls_url_id ON trigram_urls(url_id);
+    CREATE INDEX IF NOT EXISTS idx_prefix_urls_prefix_id ON prefix_urls(prefix_id);
+    CREATE INDEX IF NOT EXISTS idx_prefix_urls_url_id ON prefix_urls(url_id);
     """)
 
 
