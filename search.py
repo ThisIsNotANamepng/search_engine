@@ -36,7 +36,6 @@ def debug_print(text, text1=""):
 
 
 def search(query):
-    #start = time.time()
     """Run search against the Postgres DB via `utils.get_conn()`.
 
     Uses array parameters with `ANY(%s)` so empty token groups are handled safely.
@@ -52,8 +51,6 @@ def search(query):
     prefixes = list(tokenized[3]) if tokenized and len(tokenized) > 3 and tokenized[3] else []
 
 
-    #start = time.time()
-    #print("Time taken:", time.time() - start)
 
     sql_query = """
         WITH
@@ -169,8 +166,3 @@ def search(query):
     cur.close()
     conn.close()
     return results
-
-# Example usage:
-# query = input("Search query: ")
-#query = "jack hagen"
-#print(search(query))

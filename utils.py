@@ -14,7 +14,6 @@ import weakref
 import functools
 import queue
 from bs4 import BeautifulSoup
-from bs4.element import Comment
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
 import tldextract
@@ -26,7 +25,6 @@ from psycopg2.extras import execute_values
 from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
 import csv
-import signal
 from typing import Optional
 import sqlite3
 import zlib
@@ -330,14 +328,6 @@ def create_database():
         referenced_domain VARCHAR(2048) NOT NULL,
         PRIMARY KEY (url, referenced_domain)
     );
-    CREATE TABLE IF NOT EXISTS entities (
-        entity_text VARCHAR(2048) NOT NULL PRIMARY KEY,
-        id INT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS entity_urls (
-        url VARCHAR(2048) NOT NULL PRIMARY KEY,
-        entity_url INT NOT NULL
-    );
                 
     CREATE TABLE IF NOT EXISTS url_token_counts (
         url_id INT PRIMARY KEY REFERENCES urls(id),
@@ -367,8 +357,6 @@ def create_database():
     CREATE TABLE IF NOT EXISTS trigram_urls (trigram_id INT NOT NULL, url_id INT NOT NULL);
     CREATE TABLE IF NOT EXISTS prefix_urls (prefix_id INT NOT NULL, url_id INT NOT NULL);
     CREATE TABLE IF NOT EXISTS word_urls (word_id INT NOT NULL, url_id INT NOT NULL);
-
-    CREATE TABLE IF NOT EXISTS weights (type TEXT PRIMARY KEY, weight FLOAT NOT NULL);
 
     CREATE TABLE IF NOT EXISTS blocked_domains (
         domain VARCHAR(512) PRIMARY KEY,
@@ -407,7 +395,6 @@ def create_database():
     cur.close()
     conn.close()
 
-    set_default_weights()
     populate_static_ngrams()
 
 def populate_static_ngrams():
@@ -453,41 +440,7 @@ def load_static_token_maps():
     cur.close()
     conn.close()
 
-def set_default_weights():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # Upsert default weights
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("word", 1.7))
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("bigram", 1.2))
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("trigram", 1.3))
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("prefix", 1.2))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
 # ----- HTML text extraction utilities
-def tag_visible(element):
-    if element.parent.name in ["style", "script", "head", "title", "meta", "[document]"]:
-        return False
-    if isinstance(element, Comment):
-        return False
-    return True
-
 def extract_data_from_html(body, url):
     """
     Takes in the bs4 soup and returns the text, links, title, and favicon link from the page
@@ -502,7 +455,7 @@ def extract_data_from_html(body, url):
         list
             [combined_text, links, title, icon_link]
             combined_text : string
-                The visible text in the page
+                The main text of the page (menus, footers etc. left out by trafilatura), None if there is none
             links : list
                 All of the links on the page, as defined by <a> tags
             title : string
@@ -538,7 +491,7 @@ def extract_data_from_html(body, url):
             # If there's no link we still send a None variables to the database
             icon_link = None
 
-    # Remove tags that are not relevant for visible text
+    # Links inside these aren't followed
     for tag in soup(["script", "style", "head", "meta", "noscript"]):
         tag.decompose()
 
@@ -546,21 +499,9 @@ def extract_data_from_html(body, url):
     parsed = urlparse(url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-    texts = []
-    links = []
+    links = [urljoin(base_url, a["href"]) for a in soup.find_all("a", href=True)]
 
-    # Single tree traversal for both text and links
-    for element in soup.descendants:
-        if element.name == "a" and element.has_attr("href"):
-            links.append(urljoin(base_url, element["href"]))
-        elif isinstance(element, str):
-            # Only collect non-whitespace text
-            t = element.strip()
-            if t:
-                texts.append(t)
-
-    # Join all text fragments into one string
-    combined_text = " ".join(texts)
+    combined_text = trafilatura.extract(body)
 
     return [combined_text, links, title, icon_link]
 
@@ -645,35 +586,22 @@ def is_public_host(url):
         return False
     return all(ipaddress.ip_address(a.split("%", 1)[0]).is_global for a in addresses)  # split drops an IPv6 zone like %eth0
 
-def get_page_html(url, timeout=None):
+def get_page_html(url):
     """
     Download the html of a page
-    
+
     Args:
         url : string
             The url of the page you are scraping
-        timeout : int
-            The number of seconds to wait before timing out a connection (might not work, needs testing)
 
     Returns:
-        tuple
-            Directly from extract_data_from_html(), (combined_text, links, title, icon_link)
-            combined_text : string
-                The visible text in the page
-            links : list
-                All of the links on the page, as defined by <a> tags
-            title : string
-                The title of the page, as defined by the <title> tag
-            icon_link : string
-                The url to the favicon of the page
-
-    Notes:
-        On network errors or timeouts, returns empty text and empty links list
-        Maybe think about changing to a Raise error instead of returning empty
+        bytes
+            The raw html of the page
+        RATE_LIMITED
+            If the site answered 429
+        False
+            If the page can't or mustn't be scraped (robots.txt, not html, too large, blocked, network error)
     """
-
-    def handler(signum, frame):
-        log(f"Error URL took too long to download {url}")
 
     if not is_public_host(url):
         log(f"Error Not a public address {url}")
@@ -691,9 +619,6 @@ def get_page_html(url, timeout=None):
         "User-Agent": USER_AGENT,
         "From": "crawler@stultus.rip"
     }
-
-    signal.signal(signal.SIGALRM, handler)
-    signal.alarm(timeout or 0)
 
     def fetch(target):
         # One hop: redirects are followed below so every target is checked first
@@ -751,12 +676,10 @@ def get_page_html(url, timeout=None):
         log(f"Error HTTP error fetching: {url} : {e}")
         return False
     finally:
-        signal.alarm(0)
         if request is not None:
             request.close()
 
     return content
-    #return extract_data_from_html(content, url)
 
 def log(message):
     """
@@ -933,45 +856,14 @@ def store(content, url):
 
     load_static_token_maps()
 
-    #content = get_page_html(url, timeout=timeout)
-
     debug_print("Visited site, got main text and links")
 
-    ## TODO: Changes moving some loop jurisdiction likely broke the need to return the rate limiting, need to fix that. Need to do what we need to do when we hit a rate limit here in this function, and then handle getting a rate limit signal in the scrape.py loop
-    if content == RATE_LIMITED:
-        return RATE_LIMITED
-
-    if content != False:
-        # The url contains real text to scrape
-        text = content[0]
-        links = content[1]
-        title = content[2]
-        icon_link = content[3]
-    else:
-        # Url is a file format which cannot be scraped
-        ## TODO: I don't think this completely works, need to test with a bunch of file formats so we don't try to scrape files like images and stuff
-
-        print(content)
-        info_print("URL stores a file format we can't scrape")
-        return
+    text, links, title, icon_link = content
     
     # Making sure there is text at all. I chose 4 arbitrarily
     if text != None and len(text) < 4:
         return [links, False]
     
-    """
-    # MOVED THIS TO SCRAPE.PY  
-    # Check for english language
-    if detect(text) != 'en':
-        # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
-        log(f"Language Not in English {url}")
-        info_print("Language not in English, skipping")
-
-        return [links, False]
-
-    debug_print("Detected language")
-    """
-
     # Tokenize the text of the page
     tokens = tokenizer.tokenize_all(text)
     debug_print("Tokenized")
@@ -1120,36 +1012,6 @@ def mark_url_seen(url):
     cur.close()
     conn.close()
 
-def delete_url(url):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT id FROM urls WHERE url = %s", (url,))
-    row = cur.fetchone()
-    if not row:
-        cur.close()
-        conn.close()
-        return
-
-    url_id = row[0]
-
-    cur.execute("DELETE FROM word_urls WHERE url_id = %s", (url_id,))
-    cur.execute("DELETE FROM bigram_urls WHERE url_id = %s", (url_id,))
-    cur.execute("DELETE FROM trigram_urls WHERE url_id = %s", (url_id,))
-    cur.execute("DELETE FROM prefix_urls WHERE url_id = %s", (url_id,))
-
-    cur.execute("DELETE FROM urls WHERE id = %s", (url_id,))
-
-    # cleanup orphaned entries
-    cur.execute("DELETE FROM words WHERE id NOT IN (SELECT DISTINCT word_id FROM word_urls)")
-    cur.execute("DELETE FROM bigrams WHERE id NOT IN (SELECT DISTINCT bigram_id FROM bigram_urls)")
-    cur.execute("DELETE FROM trigrams WHERE id NOT IN (SELECT DISTINCT trigram_id FROM trigram_urls)")
-    cur.execute("DELETE FROM prefixes WHERE id NOT IN (SELECT DISTINCT prefix_id FROM prefix_urls)")
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
 # Queue and logging helpers (Postgres-backed)
 def enqueue_url(url):
     """Insert a URL into the queue if it's not already present."""
@@ -1160,15 +1022,6 @@ def enqueue_url(url):
     cur.close()
     conn.close()
 
-
-def queue_size():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM url_queue;")
-    count = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    return count
 
 def get_next_urls(num_urls):
     # Returns a list of the next urls in the queue ([] if empty), deletes them from the db queue
@@ -1189,76 +1042,6 @@ def get_next_urls(num_urls):
     conn.close()
 
     return urls
-
-def pop_next_url():
-    """
-    Pop the next URL from the queue and return it.
-    If the queue's first two URLs are from the same base domain, rotate the first URL to the end and return None.
-    If the queue is empty, return None.
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-
-    def get_next_urls(conn, cur):
-        cur.execute("SELECT id, url FROM url_queue ORDER BY id LIMIT 2;")
-        rows = cur.fetchall()
-        if not rows:
-            cur.close()
-            conn.close()
-            return None
-
-        if len(rows) == 1:
-            row = rows[0]
-            cur.execute("DELETE FROM url_queue WHERE id = %s;", (row[0],))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return row[1]
-
-        # Two rows: check domain
-        first_id, first_url = rows[0]
-        
-        second_id, second_url = rows[1]
-
-        return(first_id, first_url, second_id, second_url)
-       
-    def check_for_bad_domain(url):
-        try:
-            second_domain = get_base_domain(second_url)
-            return False
-        except:
-            delete_from_queue(second_url)
-            return True
-
-    data = get_next_urls(conn, cur)
-    first_id = data[0]
-    first_url = data[1]
-    second_id = data[2]
-    second_url = data[3]
-
-    while check_for_bad_domain(second_url):
-        # check_for_bad_domain() returns False for a good domain
-        data = get_next_urls(conn, cur)
-        first_id = data[0]
-        first_url = data[1]
-        second_url = data[3]
-
-    if get_base_domain(first_url) == get_base_domain(second_url):
-        # rotate: remove first then reinsert it so it goes to the end
-        cur.execute("DELETE FROM url_queue WHERE id = %s;", (first_id,))
-        cur.execute("INSERT INTO url_queue (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (first_url,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return None
-
-    # otherwise pop the first
-    cur.execute("DELETE FROM url_queue WHERE id = %s;", (first_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return first_url
-
 
 def get_host_ip():
     """Return the host machine IP address. Try local hostname first, then fallback to external lookup."""
@@ -1283,16 +1066,6 @@ def log_db(message):
     conn.close()
     #print("DB Log time:", time.time()-start)
 
-"""
-def enqueue_urls(urls):
-    conn = get_conn()
-    cur = conn.cursor()
-    for u in urls:
-        cur.execute("INSERT INTO url_queue (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (u,))
-    conn.commit()
-    cur.close()
-    conn.close()
-"""
 def enqueue_urls(urls):
     if not urls:
         return
@@ -1348,20 +1121,6 @@ def filter_new_urls(urls):
     result = [u for u in unique if u not in queued and u not in stored]
     return result
 
-
-def delete_from_queue(url):
-    """Delete `url` from the `url_queue` table.
-
-    Returns the number of rows deleted (0 if not present, 1 if removed).
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM url_queue WHERE url = %s;", (url,))
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    return deleted
 
 # ------------ Redis functions
 

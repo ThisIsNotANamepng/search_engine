@@ -29,15 +29,11 @@ import time
 from urllib.parse import urlparse
 import os
 import redis
-from typing import List, Tuple
 import argparse
-import trafilatura
 import atexit
 import signal
 import sys
 
-# TODO: TIMEOUT_LENGTH should be passed to the utils.mark_domain() function because it has a hardcoded 10 seconds cooldown which is passed to the redis db when adding a domain
-TIMEOUT_TIME = 10  # seconds to wait for fetching a page before skipping
 LOCAL_QUEUE_LENGTH = 100 # number of URLs to hold locally for scraping
 
 WEB_TEXT_STORAGE_SERVER_ADDRESS = os.getenv("WEB_TEXT_STORAGE_SERVER_ADDRESS")
@@ -62,7 +58,6 @@ utils.NODB = args.nodb
 
 if not args.nodb: utils.create_database()
 
-total_scraped = 0
 
 utils.log("Started scraping")
 
@@ -83,8 +78,6 @@ if not args.nodb:
         decode_responses=True  # makes strings instead of bytes
     )
 
-timed = time.time()
-start = timed
 
 # It iterates through the local_queue, scraping when the url is free to be scraped
 # If a url is in the local_queue and cannot be scraped, it is added to queue_return_to_db, which is sent back to be added to the db queue when local_queue is spent (empty)
@@ -235,13 +228,6 @@ while True:
                 utils.info_print(f"Domain is blocked, skipping {url}")
                 continue
 
-        # timeout is the network timeout for page fetching
-        ## TODO: I don't think this timeout works, we need to investigate and potentially fix it
-
-        ## TODO: Right here is where we split this chain of function calls into a series of function calls in this file
-        ## Right now functions are called in a chain by utils.store(), I want each required function to be called in this file  in a new line. This makes it clearer for debugging
-        #links_to_scrape = utils.store(url, timeout=TIMEOUT_TIME)
-
         raw_html = utils.get_page_html(url)
 
         if raw_html == utils.RATE_LIMITED:
@@ -256,7 +242,6 @@ while True:
             continue
 
         page_data = utils.extract_data_from_html(raw_html, url) #[combined_text, links, title, icon_link]
-        page_data[0] = trafilatura.extract(raw_html)
 
         if page_data[0]:
             # Check for english language
@@ -319,7 +304,6 @@ while True:
             utils.mark_domain(base_domain, redis_client)
 
         utils.log(f"Scraped {url}")
-        total_scraped += 1
 
 
         if page_not_in_english:
@@ -328,7 +312,6 @@ while True:
         else:
             utils.info_print(f"Scraped {url}, total time taken: {str(time.time()-url_scraping_timer)}")
 
-        start=time.time()
         url = ""  # done with it; nothing to requeue on exit
 
     except Exception as e:
