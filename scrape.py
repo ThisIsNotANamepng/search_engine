@@ -281,18 +281,9 @@ while True:
         else:
             utils.info_print(f"No text found, keeping links only {url}")
 
-        total_links = 0
+        # Clean first: stored and queued urls are in cleaned form (no ?query, #fragment or trailing /), so raw links wouldn't match them
+        cleaned = utils.clean_links(page_data[1])
 
-        links_to_add_to_queue = []
-        # Clean, deduplicate and filter links in bulk for performance
-
-        seen = set()
-        cleaned = []
-
-        # Raw_links should be cleaned by the cleaning function in utils.py, so I'm taking the cleaning stuff out here
-        ## TODO: Move the cleaning of the links to a function call here
-        cleaned = page_data[1]
-    
         # Batch add url references after cleaning
         if cleaned and not args.nodb:
             current_domain = utils.get_base_domain(url)
@@ -318,8 +309,6 @@ while True:
         if not args.nodb:
             # filter_new_urls checks both the queue and stored urls in one go
             links_to_add_to_queue = utils.filter_new_urls(cleaned)
-
-            links_to_add_to_queue = utils.clean_links(links_to_add_to_queue)
             utils.enqueue_urls(links_to_add_to_queue)
 
             # Add url to the cooldown redis db
