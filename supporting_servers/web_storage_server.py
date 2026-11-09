@@ -32,6 +32,8 @@ SHARD_BYTES = 6
 CHUNK_SIZE = 64 * 1024  # 64 KiB, size of each streamed read/write
 # Reject bodies larger than this, this is the size in communication, so a gzipped body can expand to considerably more text than this once decompressed
 MAX_CONTENT_LENGTH = 64 * 1024 * 1024  # 64 MiB
+# Reject bodies bigger than this once decompressed (a 1 MiB gzip of zeros expands to 1 GiB). Scrapers never fetch pages over 5 MiB
+MAX_TEXT_BYTES = 16 * 1024 * 1024  # 16 MiB
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -93,7 +95,10 @@ def _iter_body():
             chunk = stream.read(CHUNK_SIZE)
             if not chunk:
                 break
-            yield decompressor.decompress(chunk)
+            # Decompress at most CHUNK_SIZE at a time: one 64 KiB gzip chunk can expand to ~64 MiB
+            while chunk:
+                yield decompressor.decompress(chunk, CHUNK_SIZE)
+                chunk = decompressor.unconsumed_tail
         yield decompressor.flush()
     else:
         while True:
@@ -131,8 +136,10 @@ def store_page():
                 for chunk in _iter_body():
                     if not chunk:
                         continue
-                    hasher.update(chunk)
                     byte_size += len(chunk)
+                    if byte_size > MAX_TEXT_BYTES:
+                        abort(413, description=f"body larger than {MAX_TEXT_BYTES} bytes once decompressed")
+                    hasher.update(chunk)
                     tmp.write(chunk)
             except zlib.error:
                 abort(400, description="malformed gzip body")
