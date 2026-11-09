@@ -919,8 +919,11 @@ def store(content, url):
     if row:
         url_id = row[0]
     else:
-        cur.execute("SELECT id FROM urls WHERE url = %s;", (url,))
+        # Already stored (re-crawl or two scrapers on the same url): lock the row so concurrent stores of this url run one at a time, and replace its old postings instead of doubling them
+        cur.execute("SELECT id FROM urls WHERE url = %s FOR UPDATE;", (url,))
         url_id = cur.fetchone()[0]
+        for table in ("word_urls", "bigram_urls", "trigram_urls", "prefix_urls"):
+            cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = %s;").format(sql.Identifier(table)), (url_id,))
 
 
     cur.execute("""
