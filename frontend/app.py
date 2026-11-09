@@ -17,11 +17,12 @@ import os, sys, time
 # search.py lives in the directory above this one
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 import search
 import psycopg2
 import psycopg2.extras
 import json
+import hmac
 
 app = Flask(__name__)
 
@@ -29,6 +30,21 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
+
+# The dashboard and the crawler control endpoints need HTTP basic auth with this password (any username).
+# Node agents send it from their own ADMIN_PASSWORD. Unset = those routes are refused for everyone.
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_PATHS = ("/dashboard", "/nodes/", "/agent/")
+MAX_DESIRED = 64  # crawlers per node; a typo shouldn't spawn thousands of containers
+
+@app.before_request
+def require_admin_password():
+    if not request.path.startswith(ADMIN_PATHS):
+        return None
+    auth = request.authorization
+    if ADMIN_PASSWORD and auth and auth.password is not None and hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
+        return None
+    return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Stultus admin"'})
 
 def get_db():
     return psycopg2.connect(
@@ -125,8 +141,8 @@ def scale_node(node_id):
         desired = int(data.get("desired"))
     except (TypeError, ValueError):
         return jsonify({"error": "desired must be an integer"}), 400
-    if desired < 0:
-        return jsonify({"error": "desired must be >= 0"}), 400
+    if not 0 <= desired <= MAX_DESIRED:
+        return jsonify({"error": f"desired must be between 0 and {MAX_DESIRED}"}), 400
 
     conn = get_db()
     try:
@@ -287,4 +303,5 @@ def perform_search():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # No debug=True: the Werkzeug debugger lets anyone who reaches it run code
+    app.run(host="0.0.0.0", port=5000)
