@@ -251,20 +251,51 @@ def _compute_dashboard_stats():
     }
 
 # The stats queries scan millions of `logs`/`urls` rows (full COUNT(DISTINCT ...) over urls,
-# per-ip grouping over every 'Scraped' log, ...), so cache them briefly instead of
-# recomputing on every dashboard refresh. Node heartbeats are cheap and stay live.
-DASHBOARD_CACHE_SECONDS = int(os.getenv("DASHBOARD_CACHE_SECONDS", "30"))
-_dashboard_cache = {"at": 0.0, "stats": None}
+# per-ip grouping over every 'Scraped' log, ...) and take minutes on the production
+# database, so they are cached and refreshed in the background (stale-while-revalidate):
+# only the very first dashboard load waits; later loads return the last result instantly
+# and trigger at most one background refresh once it is older than DASHBOARD_CACHE_SECONDS.
+# Node heartbeats are cheap and stay live.
+DASHBOARD_CACHE_SECONDS = int(os.getenv("DASHBOARD_CACHE_SECONDS", "60"))
+_dashboard_cache = {"at": 0.0, "stats": None, "refreshing": False}
 _dashboard_lock = threading.Lock()
+
+
+def _refresh_dashboard_stats():
+    try:
+        stats = _compute_dashboard_stats()
+        with _dashboard_lock:
+            _dashboard_cache["stats"] = stats
+            _dashboard_cache["at"] = time.time()
+    finally:
+        with _dashboard_lock:
+            _dashboard_cache["refreshing"] = False
 
 
 def get_dashboard_stats():
     with _dashboard_lock:
-        if (_dashboard_cache["stats"] is None
-                or time.time() - _dashboard_cache["at"] > DASHBOARD_CACHE_SECONDS):
-            _dashboard_cache["stats"] = _compute_dashboard_stats()
-            _dashboard_cache["at"] = time.time()
+        stats = _dashboard_cache["stats"]
+        stale = time.time() - _dashboard_cache["at"] > DASHBOARD_CACHE_SECONDS
+        start_refresh = stats is not None and stale and not _dashboard_cache["refreshing"]
+        if start_refresh:
+            _dashboard_cache["refreshing"] = True
+    if stats is None:
+        # Nothing cached yet: compute synchronously (first load only)
+        _refresh_dashboard_stats_blocking()
         return _dashboard_cache["stats"]
+    if start_refresh:
+        threading.Thread(target=_refresh_dashboard_stats, daemon=True).start()
+    return stats
+
+
+def _refresh_dashboard_stats_blocking():
+    with _dashboard_lock:
+        if _dashboard_cache["stats"] is not None:
+            return
+    stats = _compute_dashboard_stats()
+    with _dashboard_lock:
+        _dashboard_cache["stats"] = stats
+        _dashboard_cache["at"] = time.time()
 
 
 @app.route("/dashboard")
