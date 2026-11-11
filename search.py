@@ -197,6 +197,72 @@ _SQL_TEMPLATE = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Fast (approximate) ranking -- the default; set SEARCH_MODE=exact for the
+# original full-score query.
+#
+# The exact score adds +1 for every matching bigram/trigram. Common letter pairs
+# ("th", "in", "ing", ...) match tens of millions of posting rows per query, so
+# summing them for every page costs ~a minute but moves the ranking very little
+# next to the word (x20) and prefix (x2) terms. Fast mode therefore ranks in two
+# stages:
+#   1. Score every page matching a word/prefix with those two terms only and
+#      keep the best SEARCH_RESCORE_K candidates.
+#   2. Re-score just those candidates with the full original formula (exact
+#      bigram/trigram counts via index probes) and return the top 10.
+# Differences from exact mode: a page that only matches via bigrams/trigrams
+# (no word or prefix hit) is never returned, and a page ranked below the top K
+# by word/prefix score alone cannot be lifted into the top 10 by its n-grams.
+# ---------------------------------------------------------------------------
+
+SEARCH_MODE = os.environ.get("SEARCH_MODE", "fast").lower()
+STAGE1_BRANCHES = tuple(os.environ.get("SEARCH_STAGE1", "word,prefix").split(","))
+RESCORE_K = int(os.environ.get("SEARCH_RESCORE_K", "300"))
+
+_STAGE1_SQL = """
+        WITH core AS (
+            SELECT url_id, SUM(w)::bigint AS s
+            FROM (
+                {branches}
+            ) m
+            GROUP BY url_id
+        )
+        SELECT core.url_id
+        FROM core
+        JOIN url_token_counts utc ON utc.url_id = core.url_id
+        JOIN urls u ON u.id = core.url_id
+        ORDER BY ((core.s + utc.word_count) / utc.word_count)
+                 * (2.0 - (POWER(u.reference_count, 1.0/1.2) / u.reference_count))::double precision DESC
+        LIMIT {k};
+"""
+
+# Same branches, restricted to candidate url_ids, for the exact re-scoring stage.
+_BRANCHES_FOR_CANDIDATES = {
+    name: sql + "\n              AND url_id = ANY(%s)" for name, sql in _BRANCHES.items()
+}
+
+
+def _fast_search(cur, groups):
+    core = [n for n in STAGE1_BRANCHES if n in dict(groups)]
+    if not core:
+        return []
+    g = dict(groups)
+    cur.execute(
+        _STAGE1_SQL.format(
+            branches="\n                UNION ALL".join(_BRANCHES[n] for n in core), k=RESCORE_K),
+        tuple(g[n] for n in core))
+    cand = [r[0] for r in cur.fetchall()]
+    if not cand:
+        return []
+    sql = _SQL_TEMPLATE.format(
+        branches="\n            UNION ALL".join(_BRANCHES_FOR_CANDIDATES[n] for n, _ in groups))
+    params = []
+    for _, vals in groups:
+        params += [vals, cand]
+    cur.execute(sql, tuple(params))
+    return cur.fetchall()
+
+
 def search(query):
     """Run search against the Postgres DB.
 
@@ -214,7 +280,7 @@ def search(query):
     if not groups:
         return []
 
-    key = tuple((name, tuple(vals)) for name, vals in groups)
+    key = (SEARCH_MODE,) + tuple((name, tuple(vals)) for name, vals in groups)
     cached = _cache_get(key)
     if cached is not None:
         debug_print("Cache hit for", query)
@@ -237,8 +303,11 @@ def search(query):
         try:
             start = time.time()
             with conn.cursor() as cur:
-                cur.execute(sql_query, params)
-                results = cur.fetchall()
+                if SEARCH_MODE == "exact":
+                    cur.execute(sql_query, params)
+                    results = cur.fetchall()
+                else:
+                    results = _fast_search(cur, groups)
             debug_print("Time taken:", time.time() - start)
             break
         except (psycopg2.OperationalError, psycopg2.InterfaceError):

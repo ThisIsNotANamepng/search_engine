@@ -12,7 +12,7 @@ Graphs:
 - 
 """
 
-import os, sys, time
+import os, sys, time, threading
 
 # search.py lives in the directory above this one
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -144,8 +144,7 @@ def scale_node(node_id):
         return jsonify({"error": "unknown node"}), 404
     return jsonify({"node_id": node_id, "desired_count": desired})
 
-@app.route("/dashboard")
-def dashboard():
+def _compute_dashboard_stats():
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -236,6 +235,54 @@ def dashboard():
     url_count = totals["url_count"]
     db_size = totals["db_size"]
 
+    cur.close()
+    conn.close()
+
+    return {
+        "status_counts": status_counts,
+        "unique_domains": unique_domains,
+        "scrapes_per_minute": scrapes_per_minute,
+        "scrapes_over_time": scrapes_over_time,
+        "cumulative_scrapes_per_day": cumulative_scrapes_per_day,
+        "real_last_10_scraped": real_last_10_scraped,
+        "scrapers": scrapers,
+        "url_count": totals["url_count"],
+        "db_size": totals["db_size"],
+    }
+
+# The stats queries scan millions of `logs`/`urls` rows (full COUNT(DISTINCT ...) over urls,
+# per-ip grouping over every 'Scraped' log, ...), so cache them briefly instead of
+# recomputing on every dashboard refresh. Node heartbeats are cheap and stay live.
+DASHBOARD_CACHE_SECONDS = int(os.getenv("DASHBOARD_CACHE_SECONDS", "30"))
+_dashboard_cache = {"at": 0.0, "stats": None}
+_dashboard_lock = threading.Lock()
+
+
+def get_dashboard_stats():
+    with _dashboard_lock:
+        if (_dashboard_cache["stats"] is None
+                or time.time() - _dashboard_cache["at"] > DASHBOARD_CACHE_SECONDS):
+            _dashboard_cache["stats"] = _compute_dashboard_stats()
+            _dashboard_cache["at"] = time.time()
+        return _dashboard_cache["stats"]
+
+
+@app.route("/dashboard")
+def dashboard():
+    stats = get_dashboard_stats()
+    status_counts = stats["status_counts"]
+    unique_domains = stats["unique_domains"]
+    scrapes_per_minute = stats["scrapes_per_minute"]
+    scrapes_over_time = stats["scrapes_over_time"]
+    cumulative_scrapes_per_day = stats["cumulative_scrapes_per_day"]
+    real_last_10_scraped = stats["real_last_10_scraped"]
+    scrapers = stats["scrapers"]
+    url_count = stats["url_count"]
+    db_size = stats["db_size"]
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
     # Crawler nodes (from the node agents' heartbeats). `age_s` lets the
     # template flag a node whose agent has gone silent.
     cur.execute("""
@@ -282,7 +329,7 @@ def index():
 @app.route("/search")
 def perform_search():
     query_string = request.args.get("q")
-    search_results = search.search(query_string)
+    search_results = search.search(query_string or "")  # a missing/empty q used to crash the tokenizer (500)
     return render_template("search.html", search_results=search_results, query_string=query_string)
 
 
