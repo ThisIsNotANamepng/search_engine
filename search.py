@@ -62,6 +62,24 @@ POOL_MAX = int(os.environ.get("SEARCH_POOL_MAX", "10"))
 CACHE_SIZE = int(os.environ.get("SEARCH_CACHE_SIZE", "512"))
 CACHE_TTL = float(os.environ.get("SEARCH_CACHE_TTL", "300"))  # seconds
 
+# Per-session planner hints (these never change server-wide settings). They let
+# Postgres fan the UNION ALL branches and the final aggregation out across
+# parallel workers. Set SEARCH_PG_PARALLEL_WORKERS=0 to disable.
+PG_PARALLEL_WORKERS = int(os.environ.get("SEARCH_PG_PARALLEL_WORKERS", "4"))
+
+
+SEARCH_WORK_MEM = os.environ.get("SEARCH_WORK_MEM", "512MB")
+
+
+def _session_options():
+    if PG_PARALLEL_WORKERS <= 0:
+        return None
+    return (f"-c max_parallel_workers_per_gather={PG_PARALLEL_WORKERS} "
+            "-c parallel_setup_cost=100 -c parallel_tuple_cost=0.01 "
+            "-c enable_parallel_append=on -c enable_parallel_hash=on "
+            f"-c work_mem={SEARCH_WORK_MEM} -c enable_nestloop=off")
+
+
 _pool = None
 _pool_lock = threading.Lock()
 _cache = OrderedDict()
@@ -76,7 +94,9 @@ def _get_pool():
                 url = os.getenv("DATABASE_URL")
                 if not url:
                     return None
-                _pool = pg_pool.ThreadedConnectionPool(POOL_MIN, POOL_MAX, url)
+                opts = _session_options()
+                kwargs = {"options": opts} if opts else {}
+                _pool = pg_pool.ThreadedConnectionPool(POOL_MIN, POOL_MAX, url, **kwargs)
     return _pool
 
 
