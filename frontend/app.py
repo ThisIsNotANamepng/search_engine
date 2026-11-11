@@ -144,32 +144,104 @@ def scale_node(node_id):
         return jsonify({"error": "unknown node"}), 404
     return jsonify({"node_id": node_id, "desired_count": desired})
 
+
+# ---- Heavy dashboard queries ------------------------------------------------
+# `logs` is append-only, so the scraped/blocked/error totals only need the rows added
+# since the last refresh. The running totals are kept in a small JSON file (so a restart
+# doesn't force a multi-minute recount) and are recounted from scratch every
+# DASHBOARD_FULL_RECOUNT_SECONDS to correct any drift (e.g. if logs were ever pruned).
+DASHBOARD_STATE_FILE = os.getenv(
+    "DASHBOARD_STATE_FILE",
+    os.path.join(os.path.expanduser("~"), ".cache", "stultus_dashboard_counts.json"))
+DASHBOARD_FULL_RECOUNT_SECONDS = int(os.getenv("DASHBOARD_FULL_RECOUNT_SECONDS", "86400"))
+DASHBOARD_HEAVY_CACHE_SECONDS = int(os.getenv("DASHBOARD_HEAVY_CACHE_SECONDS", "600"))
+# Rows just below max(id) may belong to transactions that haven't committed yet; stay
+# this far behind so they are counted on the next refresh instead of being skipped.
+_LOG_ID_SAFETY_MARGIN = 1000
+
+_STATUS_COUNT_SQL = """
+    SELECT
+        CASE
+            WHEN message LIKE 'Sc%%' THEN 'scraped'
+            WHEN message LIKE 'Bl%%' THEN 'blocked'
+            WHEN message LIKE 'Er%%' THEN 'error'
+        END AS status,
+        COUNT(*) AS count
+    FROM logs
+    WHERE id > %s AND id <= %s
+      AND (message LIKE 'Sc%%' OR message LIKE 'Bl%%' OR message LIKE 'Er%%')
+    GROUP BY status;
+"""
+
+
+def _load_counts_state():
+    try:
+        with open(DASHBOARD_STATE_FILE) as f:
+            state = json.load(f)
+        if {"last_id", "counts", "full_at"} <= state.keys():
+            return state
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _save_counts_state(state):
+    try:
+        os.makedirs(os.path.dirname(DASHBOARD_STATE_FILE), exist_ok=True)
+        tmp = DASHBOARD_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, DASHBOARD_STATE_FILE)
+    except OSError:
+        pass  # caching only; the dashboard still works without the file
+
+
+def _status_counts(cur):
+    """Same result as the old single GROUP BY over all of `logs`, computed incrementally."""
+    state = _load_counts_state()
+    now = time.time()
+    if state is None or now - state["full_at"] > DASHBOARD_FULL_RECOUNT_SECONDS:
+        state = {"last_id": 0, "counts": {}, "full_at": now}
+
+    cur.execute("SELECT COALESCE(MAX(id), 0) AS m FROM logs;")
+    upto = max(cur.fetchone()["m"] - _LOG_ID_SAFETY_MARGIN, state["last_id"])
+    if upto > state["last_id"]:
+        cur.execute(_STATUS_COUNT_SQL, (state["last_id"], upto))
+        for row in cur.fetchall():
+            state["counts"][row["status"]] = state["counts"].get(row["status"], 0) + row["count"]
+        state["last_id"] = upto
+        _save_counts_state(state)
+
+    return [{"status": k, "count": v} for k, v in sorted(state["counts"].items()) if v]
+
+
+_unique_domains_cache = {"at": 0.0, "value": None}
+
+
+def _unique_domains(cur):
+    if (_unique_domains_cache["value"] is None
+            or time.time() - _unique_domains_cache["at"] > DASHBOARD_HEAVY_CACHE_SECONDS):
+        cur.execute("""
+            SELECT COUNT(DISTINCT SUBSTRING(url FROM '^(?:https?://)?([^/]+)'))
+                AS unique_domains
+            FROM urls;
+        """)
+        _unique_domains_cache["value"] = cur.fetchone()["unique_domains"]
+        _unique_domains_cache["at"] = time.time()
+    return _unique_domains_cache["value"]
+
+
 def _compute_dashboard_stats():
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # Scraped vs Blocked vs Error counts, uses logs_message_pattern_idx
-    cur.execute("""
-        SELECT
-            CASE
-                WHEN message LIKE 'Sc%' THEN 'scraped'
-                WHEN message LIKE 'Bl%' THEN 'blocked'
-                WHEN message LIKE 'Er%' THEN 'error'
-            END AS status,
-            COUNT(*) AS count
-        FROM logs
-        WHERE message LIKE 'Sc%' OR message LIKE 'Bl%' OR message LIKE 'Er%'
-        GROUP BY status;
-    """)
-    status_counts = cur.fetchall()
+    # Scraped vs Blocked vs Error counts. Counting ~80M log rows takes minutes, so this is
+    # maintained incrementally (see _status_counts).
+    status_counts = _status_counts(cur)
 
-    # Total unique domains
-    cur.execute("""
-        SELECT COUNT(DISTINCT SUBSTRING(url FROM '^(?:https?://)?([^/]+)'))
-            AS unique_domains
-        FROM urls;
-    """)
-    unique_domains = cur.fetchone()['unique_domains']
+    # Total unique domains (a ~30s scan of `urls`, so refreshed at most every
+    # DASHBOARD_HEAVY_CACHE_SECONDS and reused in between)
+    unique_domains = _unique_domains(cur)
 
     # Scrapes in the last minute (uses logs_scraped_ts_idx partial index)
     cur.execute("""
@@ -250,14 +322,17 @@ def _compute_dashboard_stats():
         "db_size": totals["db_size"],
     }
 
-# The stats queries scan millions of `logs`/`urls` rows (full COUNT(DISTINCT ...) over urls,
-# per-ip grouping over every 'Scraped' log, ...) and take minutes on the production
-# database, so they are cached and refreshed in the background (stale-while-revalidate):
-# only the very first dashboard load waits; later loads return the last result instantly
-# and trigger at most one background refresh once it is older than DASHBOARD_CACHE_SECONDS.
-# Node heartbeats are cheap and stay live.
+# The stats queries scan millions of `logs`/`urls` rows and are slow on the production
+# database (minutes cold), so they never run inside a page request:
+#   * /dashboard returns the page shell immediately;
+#   * the page's JavaScript calls /dashboard/data, which returns the cached stats (or
+#     {"ready": false} while the first computation is still running in the background);
+#   * stale stats are served instantly while one background thread refreshes them
+#     (stale-while-revalidate, DASHBOARD_CACHE_SECONDS).
+# Node heartbeats are cheap and stay live (rendered with the page).
 DASHBOARD_CACHE_SECONDS = int(os.getenv("DASHBOARD_CACHE_SECONDS", "60"))
-_dashboard_cache = {"at": 0.0, "stats": None, "refreshing": False}
+DASHBOARD_RETRY_AFTER_ERROR_SECONDS = 30
+_dashboard_cache = {"at": 0.0, "stats": None, "refreshing": False, "error": None, "error_at": 0.0}
 _dashboard_lock = threading.Lock()
 
 
@@ -265,52 +340,37 @@ def _refresh_dashboard_stats():
     try:
         stats = _compute_dashboard_stats()
         with _dashboard_lock:
-            _dashboard_cache["stats"] = stats
-            _dashboard_cache["at"] = time.time()
+            _dashboard_cache.update(stats=stats, at=time.time(), error=None)
+    except Exception as e:  # keep serving stale data; retry later
+        with _dashboard_lock:
+            _dashboard_cache.update(error=str(e), error_at=time.time())
     finally:
         with _dashboard_lock:
             _dashboard_cache["refreshing"] = False
 
 
-def get_dashboard_stats():
+def get_dashboard_stats_nowait():
+    """Return the cached stats (None if never computed) and start a background refresh if needed."""
     with _dashboard_lock:
         stats = _dashboard_cache["stats"]
-        stale = time.time() - _dashboard_cache["at"] > DASHBOARD_CACHE_SECONDS
-        start_refresh = stats is not None and stale and not _dashboard_cache["refreshing"]
-        if start_refresh:
+        stale = stats is None or time.time() - _dashboard_cache["at"] > DASHBOARD_CACHE_SECONDS
+        recently_failed = time.time() - _dashboard_cache["error_at"] < DASHBOARD_RETRY_AFTER_ERROR_SECONDS
+        start = stale and not _dashboard_cache["refreshing"] and not recently_failed
+        if start:
             _dashboard_cache["refreshing"] = True
-    if stats is None:
-        # Nothing cached yet: compute synchronously (first load only)
-        _refresh_dashboard_stats_blocking()
-        return _dashboard_cache["stats"]
-    if start_refresh:
+    if start:
         threading.Thread(target=_refresh_dashboard_stats, daemon=True).start()
     return stats
 
 
-def _refresh_dashboard_stats_blocking():
-    with _dashboard_lock:
-        if _dashboard_cache["stats"] is not None:
-            return
-    stats = _compute_dashboard_stats()
-    with _dashboard_lock:
-        _dashboard_cache["stats"] = stats
-        _dashboard_cache["at"] = time.time()
+# Compute the stats at startup so the first dashboard visit finds them ready.
+if os.getenv("DASHBOARD_PREWARM", "1") != "0":
+    get_dashboard_stats_nowait()
 
 
 @app.route("/dashboard")
 def dashboard():
-    stats = get_dashboard_stats()
-    status_counts = stats["status_counts"]
-    unique_domains = stats["unique_domains"]
-    scrapes_per_minute = stats["scrapes_per_minute"]
-    scrapes_over_time = stats["scrapes_over_time"]
-    cumulative_scrapes_per_day = stats["cumulative_scrapes_per_day"]
-    real_last_10_scraped = stats["real_last_10_scraped"]
-    scrapers = stats["scrapers"]
-    url_count = stats["url_count"]
-    db_size = stats["db_size"]
-
+    """Page shell only: no slow queries, so it renders immediately. Stats arrive via /dashboard/data."""
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -336,18 +396,33 @@ def dashboard():
 
     return render_template(
         "dashboard.html",
-        status_counts=json.dumps(status_counts, default=str),
-        scrapes_over_time=json.dumps(scrapes_over_time, default=str),
-        scrapers=scrapers,
-        url_count=url_count,
-        db_size=db_size,
-        unique_domains=unique_domains,
-        scrapes_per_minute=scrapes_per_minute,
-        last_10_scraped=real_last_10_scraped,
-        cumulative_scrapes_per_day=json.dumps(cumulative_scrapes_per_day, default=str),
         nodes=nodes,
         node_stale_seconds=NODE_STALE_SECONDS,
     )
+
+
+@app.route("/dashboard/data")
+def dashboard_data():
+    """Slow dashboard stats as JSON (cached). {"ready": false} until the first computation finishes."""
+    stats = get_dashboard_stats_nowait()
+    if stats is None:
+        with _dashboard_lock:
+            error = _dashboard_cache["error"]
+        return jsonify({"ready": False, "error": error}), 202
+    payload = {
+        "ready": True,
+        "db_size": stats["db_size"],
+        "url_count": stats["url_count"],
+        "unique_domains": stats["unique_domains"],
+        "scrapes_per_minute": stats["scrapes_per_minute"],
+        "status_counts": stats["status_counts"],
+        "scrapes_over_time": stats["scrapes_over_time"],
+        "cumulative_scrapes_per_day": stats["cumulative_scrapes_per_day"],
+        "last_10_scraped": stats["real_last_10_scraped"],
+        "scrapers": stats["scrapers"],
+    }
+    # default=str keeps timestamps/decimals rendering exactly as the old server-side template did
+    return app.response_class(json.dumps(payload, default=str), mimetype="application/json")
 
 @app.route("/creators")
 def creators():

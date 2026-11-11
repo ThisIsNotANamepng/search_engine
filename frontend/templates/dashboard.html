@@ -183,22 +183,22 @@ th {
         <!-- Metrics -->
         <div class="card metric accent col-3 row-1">
             <div class="metric-label">Database Size</div>
-            <div class="metric-value">{{ db_size }}</div>
+            <div class="metric-value" id="m-db-size">…</div>
         </div>
 
         <div class="card metric col-3 row-1">
             <div class="metric-label">Total URLs</div>
-            <div class="metric-value">{{ url_count }}</div>
+            <div class="metric-value" id="m-url-count">…</div>
         </div>
 
         <div class="card metric col-3 row-1">
             <div class="metric-label">Unique Domains</div>
-            <div class="metric-value">{{ unique_domains }}</div>
+            <div class="metric-value" id="m-unique-domains">…</div>
         </div>
 
         <div class="card metric col-3 row-1">
             <div class="metric-label">URLS/Minute</div>
-            <div class="metric-value">{{ scrapes_per_minute }}</div>
+            <div class="metric-value" id="m-scrapes-per-minute">…</div>
         </div>
 
 
@@ -225,12 +225,7 @@ th {
                     <th>URL</th>
                     <th>Time Scraped (UTC)</th>
                 </tr>
-                {% for s in last_10_scraped %}
-                <tr>
-                    <td>{{ s[0] }}</td>
-                    <td>{{ s[1] }}</td>
-                </tr>
-                {% endfor %}
+                <tbody id="last-scraped-body"><tr><td colspan="2" style="color:#64748b">Loading…</td></tr></tbody>
             </table>
         </div>
 
@@ -252,14 +247,8 @@ th {
                 <th>Alive Since</th>
                 </tr>
             </thead>
-            <tbody>
-                {% for s in scrapers %}
-                <tr>
-                <td>{{ s.ip }}</td>
-                <td>{{ s.urls_scraped }}</td>
-                <td>{{ s.started_at }}</td>
-                </tr>
-                {% endfor %}
+            <tbody id="scrapers-body">
+                <tr><td colspan="3" style="color:#64748b">Loading…</td></tr>
             </tbody>
             </table>
         </div>
@@ -349,46 +338,91 @@ th {
 </div>
 
 <script>
-    const statusCounts = {{ status_counts | safe }};
-    const scrapesOverTime = {{ scrapes_over_time | safe }};
-    const cumScrapesOverTime = {{ cumulative_scrapes_per_day | safe }};
+    // The page shell renders immediately; the slow stats are fetched here.
+    const charts = [];
 
-    const labels = statusCounts.map(s => s.status);
-    const values = statusCounts.map(s => s.count);
+    function setText(id, value) { document.getElementById(id).textContent = value; }
 
-    new Chart(document.getElementById("pie_scraped_vs_blocked"), {
-        type: "pie",
-        data: { labels, datasets: [{ data: values }] }
-    });
-
-    new Chart(document.getElementById("bar_scraped_vs_blocked"), {
-        type: "bar",
-        data: { labels, datasets: [{ label: "Count", data: values }] }
-    });
-
-    new Chart(document.getElementById("scrapes_per_minute"), {
-        type: "line",
-        data: {
-            labels: scrapesOverTime.map(d => d.minute),
-            datasets: [{
-                label: "Scrapes / Day",
-                data: scrapesOverTime.map(d => d.count),
-                tension: 0.3
-            }]
+    function fillRows(tbodyId, rows, cols) {
+        const tbody = document.getElementById(tbodyId);
+        tbody.replaceChildren();
+        for (const row of rows) {
+            const tr = document.createElement("tr");
+            for (const c of cols) {
+                const td = document.createElement("td");
+                td.textContent = row[c];   // textContent: URLs from the web are never parsed as HTML
+                tr.appendChild(td);
+            }
+            tbody.appendChild(tr);
         }
-    });
+    }
 
-    new Chart(document.getElementById("cumulative_scrapes_per_day"), {
-        type: "line",
-        data: {
-            labels: cumScrapesOverTime.map(w => w.day),
-            datasets: [{
-                label: "Scrapes / Day",
-                data: cumScrapesOverTime.map(w => w.cumulative_scrapes),
-                tension: 0.0
-            }]
-        }
-    });
+    function renderDashboard(d) {
+        setText("m-db-size", d.db_size);
+        setText("m-url-count", d.url_count);
+        setText("m-unique-domains", d.unique_domains);
+        setText("m-scrapes-per-minute", d.scrapes_per_minute);
+
+        fillRows("last-scraped-body", d.last_10_scraped, [0, 1]);
+        fillRows("scrapers-body", d.scrapers, ["ip", "urls_scraped", "started_at"]);
+
+        const statusCounts = d.status_counts;
+        const scrapesOverTime = d.scrapes_over_time;
+        const cumScrapesOverTime = d.cumulative_scrapes_per_day;
+
+        const labels = statusCounts.map(s => s.status);
+        const values = statusCounts.map(s => s.count);
+
+        charts.forEach(c => c.destroy());
+        charts.length = 0;
+
+        charts.push(new Chart(document.getElementById("pie_scraped_vs_blocked"), {
+            type: "pie",
+            data: { labels, datasets: [{ data: values }] }
+        }));
+
+        charts.push(new Chart(document.getElementById("bar_scraped_vs_blocked"), {
+            type: "bar",
+            data: { labels, datasets: [{ label: "Count", data: values }] }
+        }));
+
+        charts.push(new Chart(document.getElementById("scrapes_per_minute"), {
+            type: "line",
+            data: {
+                labels: scrapesOverTime.map(d => d.minute),
+                datasets: [{
+                    label: "Scrapes / Day",
+                    data: scrapesOverTime.map(d => d.count),
+                    tension: 0.3
+                }]
+            }
+        }));
+
+        charts.push(new Chart(document.getElementById("cumulative_scrapes_per_day"), {
+            type: "line",
+            data: {
+                labels: cumScrapesOverTime.map(w => w.day),
+                datasets: [{
+                    label: "Scrapes / Day",
+                    data: cumScrapesOverTime.map(w => w.cumulative_scrapes),
+                    tension: 0.0
+                }]
+            }
+        }));
+    }
+
+    // Poll until the server has the stats ready (the first computation can take a few minutes
+    // after a cold start; later loads are served from its cache immediately).
+    function loadDashboardData() {
+        fetch("/dashboard/data")
+            .then(r => r.json())
+            .then(d => {
+                if (d.ready) { renderDashboard(d); }
+                else { setTimeout(loadDashboardData, 3000); }
+            })
+            .catch(() => setTimeout(loadDashboardData, 5000));
+    }
+    loadDashboardData();
 
 
     // +/− only edit the input locally — nothing is sent to the worker until Set.
