@@ -12,6 +12,9 @@ from nltk.corpus import stopwords
 #nltk.download('stopwords', quiet=True)
 
 STOP_WORDS = list(stopwords.words('english'))
+# O(1) membership for clean(); STOP_WORDS stays a list for anything importing it
+_STOP_WORDS_SET = frozenset(STOP_WORDS)
+_PUNCTUATION_TABLE = str.maketrans('', '', string.punctuation)
 
 def tokenize_bigrams(text):
     """
@@ -24,21 +27,12 @@ def tokenize_bigrams(text):
     list: A list of bigram tuples
     """
 
-    grams=[]
-
-    for i in text:
-
-        #grams.append(list(bigrams(i)))
-        grams.append(list(bigrams(i)))
-        ## TODO UPNEXT Where I left off, I want to make this for all tokenizers return a list of strings instead of tuples and bullcrap for easier use in main.py
-
-    #print(grams[1:])
-
-    flat_list = []
-    for i in grams:
-        for j in i:
-            flat_list.append(''.join(j))
-    output_list = set(flat_list)
+    # Slicing unique words gives exactly the set nltk's bigrams() would, without a
+    # Python-level tuple/join per character pair.
+    output_list = set()
+    for word in set(text):
+        for i in range(len(word) - 1):
+            output_list.add(word[i:i + 2])
 
     return output_list
 
@@ -53,16 +47,10 @@ def tokenize_trigrams(text):
     list: A list of trigram tuples
     """
 
-    grams=[]
-
-    for i in text:
-        grams.append(list(trigrams(i)))
-
-    flat_list = []
-    for i in grams:
-        for j in i:
-            flat_list.append(''.join(j))
-    output_list = set(flat_list)
+    output_list = set()
+    for word in set(text):
+        for i in range(len(word) - 2):
+            output_list.add(word[i:i + 3])
 
     return output_list
 
@@ -107,16 +95,12 @@ def clean(text):
     cleaned text (list): The cleaned text split into words
     """
 
-    text = text.lower()
-    cleaned_text = []
-
-    punctuation_table = str.maketrans('', '', string.punctuation)
-    for i in text.split():
-        cleaned_word = i.translate(punctuation_table)
-        if cleaned_word and is_all_lowercase(cleaned_word):
-            cleaned_text.append(cleaned_word)
-
-    return [item for item in cleaned_text if item not in STOP_WORDS]
+    # Punctuation removal only deletes characters (none are whitespace), so
+    # translating the whole text and then splitting is identical to splitting first.
+    # After lower(), an ASCII-only alphabetic word is exactly [a-z]+.
+    stop = _STOP_WORDS_SET
+    return [w for w in text.lower().translate(_PUNCTUATION_TABLE).split()
+            if w.isascii() and w.isalpha() and w not in stop]
 
 def tokenize_all(text):
     """
@@ -134,12 +118,7 @@ def tokenize_all(text):
     wordgrams = cleaned_text
     bigrams = tokenize_bigrams(cleaned_text)
     trigrams = tokenize_trigrams(cleaned_text)
-    prefixes = []
-    for word in cleaned_text:
-        n = math.ceil(len(word) / 3)
-        if n > 0:
-            prefixes.append(word[:n])
-    prefixes = list(set(prefixes))
+    prefixes = list({word[:math.ceil(len(word) / 3)] for word in set(cleaned_text)})
 
     return [wordgrams, bigrams, trigrams, prefixes]
 

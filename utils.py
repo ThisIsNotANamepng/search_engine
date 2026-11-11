@@ -23,6 +23,7 @@ from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
 import csv
 import signal
+import threading
 from typing import Optional
 import sqlite3
 import zlib
@@ -238,15 +239,103 @@ def failure_print(text):
     else:
         print(text)
 
-def get_conn():
-    """Return a new psycopg2 connection using `DATABASE_URL` or PG_* env vars."""
-    database_url = os.getenv("DATABASE_URL")
-    if database_url:
-        return psycopg2.connect(database_url)
-    else:
-        failure_print("No DATABASE_URL set, not connecting to server")
+# --- Connection reuse -------------------------------------------------------
+# Almost every helper below opens a connection, runs one statement and closes it,
+# and the crawler calls several of them per page (log(), is_domain_blocked(),
+# filter_new_urls(), enqueue_urls(), ...). Against a remote database each fresh
+# connection costs several round trips (TCP + auth) -- far more than the query.
+# get_conn() therefore hands out a thin wrapper around a reusable connection:
+# callers still use cursor()/commit()/close() exactly as before, but close()
+# rolls back any open transaction and parks the connection for the next call.
+# Set DB_POOL=0 to get plain, unshared psycopg2 connections again.
+DB_POOL = os.environ.get("DB_POOL", "1") != "0"
+_DB_POOL_MAX_IDLE = 4
+_DB_PING_AFTER = 20.0  # seconds idle before we verify a parked connection is alive
+_idle_conns = []  # [(connection, last_used_monotonic)]
+_idle_lock = threading.Lock()
 
-    #return psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
+
+class _PooledConnection:
+    """Proxy for a psycopg2 connection whose close() returns it to the pool."""
+
+    def __init__(self, conn):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_released", False)
+
+    def close(self):
+        if self._released:
+            return
+        object.__setattr__(self, "_released", True)
+        conn = self._conn
+        try:
+            if conn.closed == 0:
+                conn.rollback()  # discard any uncommitted/aborted transaction
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        if conn.closed != 0:
+            return
+        with _idle_lock:
+            if len(_idle_conns) < _DB_POOL_MAX_IDLE:
+                _idle_conns.append((conn, time.monotonic()))
+                return
+        conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._conn, name, value)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+
+
+def _new_connection(database_url):
+    return psycopg2.connect(database_url, keepalives=1, keepalives_idle=30,
+                            keepalives_interval=10, keepalives_count=6)
+
+
+def _take_idle_connection():
+    while True:
+        with _idle_lock:
+            if not _idle_conns:
+                return None
+            conn, last_used = _idle_conns.pop()
+        try:
+            if conn.closed != 0:
+                continue
+            if time.monotonic() - last_used > _DB_PING_AFTER:
+                with conn.cursor() as c:
+                    c.execute("SELECT 1")
+                conn.rollback()
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_conn():
+    """Return a psycopg2-style connection using `DATABASE_URL` (reused across calls, see above)."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        failure_print("No DATABASE_URL set, not connecting to server")
+        return None
+    if not DB_POOL:
+        return psycopg2.connect(database_url)
+    conn = _take_idle_connection() or _new_connection(database_url)
+    return _PooledConnection(conn)
+
+    #return psycopg2.connect(host=host, port=port, user=user, password=*** dbname=dbname)
 
 def create_database():
     conn = get_conn()
@@ -536,6 +625,36 @@ def determine_language(text):
     except LangDetectException:
         return 'unknown'
 
+# robots.txt rarely changes, but the crawler used to re-download it for every single page.
+# Cache the parsed result per origin for an hour (None = "no usable robots.txt, allow all").
+_ROBOTS_TTL = 3600.0
+_ROBOTS_CACHE_MAX = 10000
+_robots_cache = {}  # origin -> (fetched_at_monotonic, RobotFileParser | None)
+
+
+def _fetch_robots(robots_url, user_agent):
+    """Download and parse robots.txt. Returns a parser, or None when there is nothing to enforce."""
+    rp = RobotFileParser()
+    try:
+        rp.set_url(robots_url)
+        if SCRAPER_PROXY:
+            resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
+        else:
+            resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
+        if resp.status_code != 200:
+            # If robots.txt not found or inaccessible, assume allowed
+            return None
+        # rp.parse expects an iterable of lines
+        rp.parse(resp.text.splitlines())
+    except requests.exceptions.RequestException:
+        # Network errors/timeouts -> be permissive so we don't block scraping
+        return None
+    except Exception:
+        # Any unexpected parsing error, be permissive
+        return None
+    return rp
+
+
 def allowed_by_robots(url, user_agent):
     """
     Uses the robots.txt of the site and the user agent of the scraper to determine whether the scraper is allowed to scrape the page
@@ -549,32 +668,25 @@ def allowed_by_robots(url, user_agent):
     Returns:
         boolean
             Allowed to scrape if True, not allowed if False
+
+    Notes:
+        robots.txt is cached per origin for an hour (see _ROBOTS_TTL).
     """
 
     parsed = urlparse(url)
-    robots_url = urljoin(f"{parsed.scheme}://{parsed.netloc}", "robots.txt")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    key = (origin, user_agent)
 
-    rp = RobotFileParser()
+    entry = _robots_cache.get(key)
+    if entry is None or time.monotonic() - entry[0] > _ROBOTS_TTL:
+        rp = _fetch_robots(urljoin(origin, "robots.txt"), user_agent)
+        if len(_robots_cache) >= _ROBOTS_CACHE_MAX:
+            _robots_cache.clear()
+        _robots_cache[key] = (time.monotonic(), rp)
+    else:
+        rp = entry[1]
 
-    try:
-        rp.set_url(robots_url)
-        if SCRAPER_PROXY:
-            resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
-        else:
-            resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
-        if resp.status_code != 200:
-            # If robots.txt not found or inaccessible, assume allowed
-            return True
-        # rp.parse expects an iterable of lines
-        rp.parse(resp.text.splitlines())
-    except requests.exceptions.RequestException:
-        # Network errors/timeouts -> be permissive so we don't block scraping
-        return True
-    except Exception:
-        # Any unexpected parsing error, be permissive
-        return True
-
-    return rp.can_fetch(user_agent, url)
+    return True if rp is None else rp.can_fetch(user_agent, url)
 
 def get_page_html(url, timeout=None):
     """
@@ -806,6 +918,7 @@ def clean_links(raw_links):
     # Clean links, this is copied from scrape.py, should probably have a shred function but it's 10:55pm and I'm tired
     # This above comment caused issues. The cleaning here is for cleaning links to add to the scraping, while cleaning in scrape.py is for references so it just need to be the base domains
     cleaned = []
+    seen = set()  # O(1) duplicate check (was a linear scan of `cleaned` per link)
 
     for link in raw_links:
         clean_link = link.split('?', 1)[0] #gets rid of anything after a ?
@@ -816,9 +929,10 @@ def clean_links(raw_links):
         if slash_index == clean_link_length:
             clean_link = clean_link[:-1] #gets rid of the "/" if a link ends with it
             
-        if clean_link not in cleaned:
+        if clean_link not in seen:
             # Gets rid of links that aren't http(s) and are longer than the max url length (as dictated by the postgres length limits)
             if clean_link[0:4] == "http" and len(clean_link) <= MAX_URL_LENGTH:
+                seen.add(clean_link)
                 cleaned.append(clean_link)
 
     return cleaned
@@ -1067,32 +1181,31 @@ def queue_size():
     return count
 
 def get_next_urls(num_urls):
-    #print("HT=================")
     # Returns a list of the next urls in the queue, deletes them from the db queue
 
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, url FROM url_queue ORDER BY id LIMIT %s;", (num_urls,))
-    rows = cur.fetchall()
-
-    ids = [row[0] for row in rows]
-    urls = [row[1] for row in rows]
-
-    # Nothing in the queue
-    if not rows:
-        cur.close()
-        conn.close()
-        return None
-
-    cur.execute("DELETE FROM url_queue WHERE id = ANY(%s);", (ids,))
+    # One atomic statement. FOR UPDATE SKIP LOCKED means concurrent crawlers never
+    # receive the same URLs (the old SELECT-then-DELETE could hand one URL to several
+    # crawlers), and it needs one round trip instead of two.
+    cur.execute("""
+        DELETE FROM url_queue
+        WHERE id IN (
+            SELECT id FROM url_queue ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, url;
+    """, (num_urls,))
+    rows = sorted(cur.fetchall())  # RETURNING order is unspecified; keep queue (id) order
     conn.commit()
     cur.close()
     conn.close()
 
-    #print("URLS", urls)
+    # Nothing in the queue
+    if not rows:
+        return None
 
-    return urls
+    return [row[1] for row in rows]
 
 def pop_next_url():
     """
