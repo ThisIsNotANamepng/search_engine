@@ -1,16 +1,24 @@
-        <link rel="stylesheet" href="{{ asset('css/settings.css') }}">
-        {# Applies saved settings before first paint (no flash of the wrong state). #}
+        {# Applies saved settings before first paint (no flash of the wrong state), and mirrors the
+           results-per-page setting into a cookie so the server renders the right page size on the
+           very first request (no second, redirected search). The redirect below is only the fallback
+           for a browser whose cookie is missing or out of date. #}
         <script>
         (function () {
             try {
                 var s = JSON.parse(localStorage.getItem('stultus.settings') || '{}');
                 if (s.debug) document.documentElement.classList.add('debug');
-                // Direct visits to /search without ?limit= use the saved results-per-page.
-                if (location.pathname === '/search' && (s.limit === 20 || s.limit === 30)) {
-                    var u = new URL(location.href);
-                    if (!u.searchParams.has('limit')) {
-                        u.searchParams.set('limit', s.limit);
-                        location.replace(u.href);
+                var want = (s.limit === 20 || s.limit === 30) ? s.limit : 10;
+                var m = document.cookie.match(/(?:^|; )stultus_limit=(\d+)/);
+                var have = m ? parseInt(m[1], 10) : 10;
+                if (have !== want) {
+                    document.cookie = 'stultus_limit=' + want + '; Path=/; Max-Age=31536000; SameSite=Lax';
+                    // Direct visits to /search without ?limit= use the saved results-per-page.
+                    if (location.pathname === '/search') {
+                        var u = new URL(location.href);
+                        if (!u.searchParams.has('limit') && want !== 10) {
+                            u.searchParams.set('limit', want);
+                            location.replace(u.href);
+                        }
                     }
                 }
             } catch (e) {}

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ query_string }} | Stultus</title>
+    <link rel="preload" href="/static/fonts/forum-latin.woff2" as="font" type="font/woff2" crossorigin>
+    <style>{{ inline_css('css/fonts.css', 'css/index.css', 'css/search-results.css', 'css/settings.css') }}</style>
+{% include '_settings_head.html' %}
+</head>
+    <body>
+        <div id="search-header">
+            <h1 id="main-title"><a href="/" style="color:var(--text);text-decoration:none;">Stultus</a></h1>
+            <form action="/search" method="get">
+                <input id="search-input" name="q" type="search" placeholder=" Search..." value="{{ query_string }}" maxlength="200">
+                <input id="submit-btn" type="submit" value="🔍">
+            </form>
+        </div>

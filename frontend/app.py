@@ -12,15 +12,18 @@ Graphs:
 - 
 """
 
-import os, sys, time, threading, socket, collections, gzip, logging
+import os, re, sys, time, threading, socket, collections, gzip, logging, zlib
 import urllib.request, urllib.error
+from concurrent.futures import Future, wait as wait_futures
 from urllib.parse import urlsplit, urlencode
 from concurrent.futures import ThreadPoolExecutor
 
 # search.py lives in the directory above this one
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, render_template, request, jsonify, redirect
+from flask import Flask, render_template, request, jsonify, redirect, stream_with_context, g
+from markupsafe import Markup
+from werkzeug.wsgi import ClosingIterator
 import search
 import psycopg2
 import psycopg2.extras
@@ -416,9 +419,36 @@ def get_dashboard_stats_nowait():
     return stats
 
 
-# Compute the stats at startup so the first dashboard visit finds them ready.
-if os.getenv("DASHBOARD_PREWARM", "1") != "0":
-    get_dashboard_stats_nowait()
+# Compute the stats at startup so the first dashboard visit finds them ready. Under gunicorn
+# (gunicorn.conf.py sets STULTUS_DEFER_BACKGROUND) this is started in each worker after the fork
+# instead (start_background_tasks), because a thread started before a preload-fork does not exist
+# in the workers.
+def start_background_tasks():
+    """Dashboard stats prewarm + search warm-up. Idempotent per process; never raises."""
+    if getattr(sys.modules[__name__], "_background_started", False):
+        return
+    globals()["_background_started"] = True
+    if os.getenv("DASHBOARD_PREWARM", "1") != "0":
+        get_dashboard_stats_nowait()
+    if os.getenv("STULTUS_WARMUP", "1") != "0":
+        threading.Thread(target=_warm_search, name="search-warmup", daemon=True).start()
+
+
+def _warm_search():
+    """Pay the first-query costs (DB pool, corpus statistics, word-list caches) before a visitor
+    does. Uses search.warm_up() when the search module has one; otherwise runs one throwaway query.
+    Calls search directly, not _run_search, so it doesn't show up in the dashboard's search timings."""
+    try:
+        if hasattr(search, "warm_up"):
+            search.warm_up()
+        else:
+            list(search.search_debug("the web", 10, 0))
+    except Exception as e:
+        log.warning("search warm-up failed: %s", e)
+
+
+if os.getenv("STULTUS_DEFER_BACKGROUND") != "1":
+    start_background_tasks()
 
 
 @app.route("/dashboard")
@@ -668,17 +698,66 @@ def queue_push():
     return jsonify({"results": results})
 
 
+# The queue count can take over a second on the real database (it falls back to an estimate
+# after statement_timeout) and every open dashboard polls this endpoint, so the node list and
+# queue status are served stale-while-revalidate: a poll never waits on them once they have been
+# loaded once, and N open dashboards cost one refresh per interval instead of N.
+LIVE_NODES_TTL_SECONDS = float(os.getenv("DASHBOARD_NODES_TTL_SECONDS", "2"))
+LIVE_QUEUE_TTL_SECONDS = float(os.getenv("DASHBOARD_QUEUE_TTL_SECONDS", "3"))
+_live_cache = {}
+_live_cache_lock = threading.Lock()
+
+
+def _swr(name, ttl, fn):
+    """fn() -> value (it must catch its own errors). Returns the cached value while it is younger
+    than ttl; a stale value is returned at once while one background thread refreshes it; with
+    nothing cached yet it is computed inline."""
+    with _live_cache_lock:
+        entry = _live_cache.setdefault(name, {"has": False, "at": 0.0, "value": None, "refreshing": False})
+        if entry["has"] and time.time() - entry["at"] < ttl:
+            return entry["value"]
+        if entry["has"]:
+            if not entry["refreshing"]:
+                entry["refreshing"] = True
+                threading.Thread(target=_swr_refresh, args=(entry, fn), daemon=True).start()
+            return entry["value"]
+    value = fn()
+    with _live_cache_lock:
+        entry.update(has=True, at=time.time(), value=value)
+    return value
+
+
+def _swr_refresh(entry, fn):
+    try:
+        value = fn()
+        with _live_cache_lock:
+            entry.update(at=time.time(), value=value)
+    except Exception:
+        log.exception("dashboard refresh failed")
+    finally:
+        with _live_cache_lock:
+            entry["refreshing"] = False
+
+
+def _nodes_state():
+    try:
+        return _crawler_nodes(), None
+    except psycopg2.Error as e:
+        return [], str(e)
+
+
+def _queue_state():
+    try:
+        return _queue_status(), None
+    except psycopg2.Error as e:
+        return None, str(e)
+
+
 @app.route("/dashboard/live")
 def dashboard_live():
     """Cheap, frequently polled dashboard state."""
-    try:
-        nodes, nodes_error = _crawler_nodes(), None
-    except psycopg2.Error as e:
-        nodes, nodes_error = [], str(e)
-    try:
-        queue, queue_error = _queue_status(), None
-    except psycopg2.Error as e:
-        queue, queue_error = None, str(e)
+    nodes, nodes_error = _swr("nodes", LIVE_NODES_TTL_SECONDS, _nodes_state)
+    queue, queue_error = _swr("queue", LIVE_QUEUE_TTL_SECONDS, _queue_state)
     payload = {
         "nodes": nodes,
         "nodes_error": nodes_error,
@@ -715,13 +794,22 @@ def dashboard_data():
     # default=str keeps timestamps/decimals rendering exactly as the old server-side template did
     return app.response_class(json.dumps(payload, default=str), mimetype="application/json")
 
+def _static_page(template):
+    """A page that only changes on deploy: short browser cache plus an ETag, so a reload or
+    revisit is answered with a 304 (or nothing at all while it is fresh)."""
+    resp = app.make_response(render_template(template))
+    resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=600"
+    resp.add_etag()
+    return resp.make_conditional(request)
+
+
 @app.route("/creators")
 def creators():
-    return render_template("creators.html")
+    return _static_page("creators.html")
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return _static_page("index.html")
 
 
 # ---- Search pages + JSON API ------------------------------------------------
@@ -744,17 +832,108 @@ def _int_arg(name, default, lo, hi):
     return max(lo, min(hi, value))
 
 
-def _run_search(query, limit, offset):
-    """Returns (rows, has_more, seconds). Asks for one extra row to learn whether a next page exists."""
-    started = time.perf_counter()
-    details = list(search.search_debug(query, limit + 1, offset))
-    elapsed = time.perf_counter() - started
+# ---- Search execution: result cache, de-duplication, concurrency limit ------------
+# search.py has its own cache, pool and statistics; this layer sits in front of it and adds
+#  * a short-lived cache of finished result pages (a hit costs no search call and no thread);
+#  * coalescing: identical searches that arrive while one is running wait for that one instead of
+#    each hitting Postgres (a popular query that just expired is otherwise run N times at once);
+#  * a cap on searches running at once (default: the size of search.py's connection pool), so a
+#    burst queues here instead of opening extra Postgres connections ("too many clients") --
+#    waiting longer than SEARCH_QUEUE_TIMEOUT_SECONDS fails fast as a 503;
+#  * stale-if-error: if Postgres is down or the search fails, a result page from up to
+#    SEARCH_STALE_SECONDS ago is served instead of an error page.
+RESULT_CACHE_SECONDS = float(os.getenv("SEARCH_RESULT_CACHE_SECONDS", "60"))
+RESULT_STALE_SECONDS = float(os.getenv("SEARCH_STALE_SECONDS", "3600"))
+RESULT_CACHE_SIZE = int(os.getenv("SEARCH_RESULT_CACHE_SIZE", "256"))
+SEARCH_MAX_CONCURRENT = int(os.getenv("SEARCH_MAX_CONCURRENT", str(getattr(search, "POOL_MAX", 10))))
+SEARCH_QUEUE_TIMEOUT_SECONDS = float(os.getenv("SEARCH_QUEUE_TIMEOUT_SECONDS", "10"))
+
+_result_cache = collections.OrderedDict()   # (query, limit, offset) -> (time, (page, has_more, details))
+_result_cache_lock = threading.Lock()
+_inflight = {}                              # key -> Future of a running search
+_inflight_lock = threading.Lock()
+_search_slots = threading.BoundedSemaphore(max(1, SEARCH_MAX_CONCURRENT))
+
+
+class SearchBusy(Exception):
+    """Too many searches running and the queue wait ran out."""
+
+
+def _result_cache_get(key, max_age):
+    with _result_cache_lock:
+        item = _result_cache.get(key)
+        if item is None or time.time() - item[0] > max_age:
+            return None
+        _result_cache.move_to_end(key)
+        return item[1]
+
+
+def _result_cache_put(key, value):
+    if RESULT_CACHE_SIZE <= 0:
+        return
+    with _result_cache_lock:
+        _result_cache[key] = (time.time(), value)
+        _result_cache.move_to_end(key)
+        while len(_result_cache) > RESULT_CACHE_SIZE:
+            _result_cache.popitem(last=False)
+
+
+def _search_uncached(query, limit, offset):
+    """Asks search.py for one extra row to learn whether a next page exists."""
+    if not _search_slots.acquire(timeout=SEARCH_QUEUE_TIMEOUT_SECONDS):
+        raise SearchBusy("too many searches in progress")
+    try:
+        details = list(search.search_debug(query, limit + 1, offset))
+    finally:
+        _search_slots.release()
     details = details[:limit + 1]
     page = [(d["url"], d["title"], d["score"], d["bm25"], d["pop_boost"], d["reference_count"])
             for d in details[:limit]]
+    return page, len(details) > limit, details[:limit]
+
+
+def _search_coalesced(key):
+    with _inflight_lock:
+        fut = _inflight.get(key)
+        leader = fut is None
+        if leader:
+            fut = _inflight[key] = Future()
+    if not leader:
+        return fut.result()
+    try:
+        value = _search_uncached(*key)
+        _result_cache_put(key, value)
+        fut.set_result(value)
+        return value
+    except BaseException as e:
+        stale = _result_cache_get(key, RESULT_STALE_SECONDS)
+        if stale is not None and isinstance(e, Exception):
+            log.warning("search failed (%s: %s); serving a cached result page", type(e).__name__, e)
+            fut.set_result(stale)
+            return stale
+        fut.set_exception(e)
+        raise
+    finally:
+        with _inflight_lock:
+            _inflight.pop(key, None)
+
+
+def _is_cached(query, limit, offset):
+    return _result_cache_get((query, limit, offset), RESULT_CACHE_SECONDS) is not None
+
+
+def _run_search(query, limit, offset):
+    """Returns (rows, has_more, seconds, details). `seconds` is what this request waited."""
+    started = time.perf_counter()
+    key = (query, limit, offset)
+    value = _result_cache_get(key, RESULT_CACHE_SECONDS)
+    if value is None:
+        value = _search_coalesced(key)
+    page, has_more, details = value
+    elapsed = time.perf_counter() - started
     with _search_timings_lock:
         _search_timings.append((time.time(), elapsed, len(page)))
-    return page, len(details) > limit, elapsed, details[:limit]
+    return page, has_more, elapsed, details
 
 
 @app.template_filter("safe_href")
@@ -770,14 +949,39 @@ def safe_href(url):
     return "#"
 
 
-@app.route("/search")
-def perform_search():
-    query = _clean_query(request.args.get("q"))
-    if not query:
-        return redirect("/", 302)
-    limit = _int_arg("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
-    offset = _int_arg("offset", 0, 0, MAX_OFFSET)
+def _spawn(fn, *args):
+    """Run fn(*args) on its own thread; returns a Future."""
+    fut = Future()
 
+    def run():
+        try:
+            fut.set_result(fn(*args))
+        except BaseException as e:  # delivered to whoever calls fut.result()
+            fut.set_exception(e)
+
+    threading.Thread(target=run, name="search-req", daemon=True).start()
+    return fut
+
+
+# If the search has not finished after this long, /search sends the page header (and starts the
+# font download) while it keeps running, instead of sending nothing. Searches that finish sooner
+# (every cached query) are answered in one piece, with a proper 503 on failure.
+STREAM_AFTER_SECONDS = float(os.getenv("SEARCH_STREAM_AFTER_SECONDS", "0.04"))
+# Short browser cache for result pages: back/forward, reload and the prefetched "Next" page.
+SEARCH_PAGE_CACHE_CONTROL = "private, max-age=30"
+API_CACHE_CONTROL = "public, max-age=60, stale-while-revalidate=300"
+
+
+def _default_limit():
+    """Page size for a /search URL without ?limit=. The settings menu keeps the saved value in a
+    cookie, so the first request is already the right one (the old fix was a client-side redirect,
+    which ran every such search twice)."""
+    return int(request.cookies["stultus_limit"]) if request.cookies.get("stultus_limit") in ("20", "30") \
+        else DEFAULT_LIMIT
+
+
+def _results_context(query, limit, offset, fut):
+    """Template variables for the results half of the page; waits for the search if needed."""
     def page_url(off):
         args = {"q": query, "limit": limit}
         if off:
@@ -786,18 +990,68 @@ def perform_search():
 
     error = None
     try:
-        results, has_more, elapsed, details = _run_search(query, limit, offset)
+        results, has_more, elapsed, details = fut.result()
     except Exception:
         log.exception("search failed")
         results, has_more, elapsed, details, error = [], False, 0.0, [], "Search is temporarily unavailable."
     prev_url = page_url(max(0, offset - limit)) if offset > 0 else None
     next_url = page_url(offset + limit) if has_more and offset + limit <= MAX_OFFSET else None
-    resp = app.make_response(render_template(
-        "search.html", search_results=results, search_details=details, query_string=query, error=error,
-        elapsed_ms=round(elapsed * 1000, 1), offset=offset, limit=limit,
-        prev_url=prev_url, next_url=next_url))
-    if error:
-        resp.status_code = 503
+    return dict(search_results=results, search_details=details, query_string=query, error=error,
+                elapsed_ms=round(elapsed * 1000, 1), offset=offset, limit=limit,
+                prev_url=prev_url, next_url=next_url)
+
+
+@app.route("/search")
+def perform_search():
+    query = _clean_query(request.args.get("q"))
+    if not query:
+        return redirect("/", 302)
+    limit = _int_arg("limit", _default_limit(), 1, MAX_LIMIT)
+    offset = _int_arg("offset", 0, 0, MAX_OFFSET)
+
+    started = time.perf_counter()
+    if _is_cached(query, limit, offset):
+        # a hit costs microseconds: no thread, answered in one piece
+        fut = Future()
+        try:
+            fut.set_result(_run_search(query, limit, offset))
+        except Exception as e:
+            fut.set_exception(e)
+    else:
+        fut = _spawn(_run_search, query, limit, offset)
+        # A browser prefetch (the "Next" link hover) has nobody looking at the header, so wait for
+        # the whole page: it can then carry a real status code and be cached.
+        purpose = request.headers.get("Sec-Purpose", "") + request.headers.get("Purpose", "")
+        wait_futures([fut], timeout=None if "prefetch" in purpose else STREAM_AFTER_SECONDS)
+
+    if fut.done():
+        ctx = _results_context(query, limit, offset, fut)
+        resp = app.make_response(render_template("search.html", **ctx))
+        if ctx["error"]:
+            resp.status_code = 503
+        else:
+            resp.headers["Cache-Control"] = SEARCH_PAGE_CACHE_CONTROL
+            resp.headers["Server-Timing"] = f"app;dur={1000 * (time.perf_counter() - started):.1f}"
+    else:
+        # Slow search: flush the <head> + search box now. The browser parses the inline CSS and
+        # starts the font while the database works, then the results arrive as the second chunk.
+        # (A failure here can only be reported in the page text, not as a 503: the 200 is sent.)
+        head = render_template("_search_head.html", query_string=query)
+
+        def page():
+            yield head.encode("utf-8")
+            ctx = _results_context(query, limit, offset, fut)
+            yield render_template("_search_results.html", **ctx).encode("utf-8")
+
+        resp = app.response_class(stream_with_context(page()), mimetype="text/html")
+        g.stream_gzip = True   # compress_response() compresses it chunk by chunk
+        # The 200 is already on its way, so if the search then fails the page says so without a
+        # 503: that page must not be reused by the browser cache (a retry would show the error
+        # again). no-cache still lets back/forward show it; the result cache above makes repeats instant.
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"   # nginx: don't hold the first chunk back
+    # the page size can come from the stultus_limit cookie
+    resp.headers.add("Vary", "Cookie")
     return resp
 
 
@@ -830,10 +1084,12 @@ def api_search():
         payload["debug"] = [
             {k: v for k, v in d.items() if k not in ("query_words",)} for d in details
         ]
-    return jsonify(payload)
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = API_CACHE_CONTROL
+    return resp
 
 
-# ---- Static assets: cache-busting links + gzip --------------------------------
+# ---- Static assets: cache-busting links, inlined CSS + gzip --------------------
 
 @app.template_global("asset")
 def asset(path):
@@ -845,6 +1101,35 @@ def asset(path):
     return f"/static/{path}?v={version}"
 
 
+_inline_css_cache = {}   # path -> (mtime, minified text)
+
+
+def _minify_css(text):
+    """Drop comments and indentation only (no value or selector is touched)."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+@app.template_global("inline_css")
+def inline_css(*paths):
+    """The given static CSS files, concatenated for a <style> block. Inlining the (few KB) of CSS
+    removes the render-blocking stylesheet requests from the critical path; the text is re-read
+    only when a file's mtime changes."""
+    parts = []
+    for path in paths:
+        full = os.path.join(app.static_folder, path)
+        try:
+            mtime = os.path.getmtime(full)
+            hit = _inline_css_cache.get(full)
+            if hit is None or hit[0] != mtime:
+                with open(full, encoding="utf-8") as f:
+                    hit = _inline_css_cache[full] = (mtime, _minify_css(f.read()))
+            parts.append(hit[1])
+        except OSError:
+            log.warning("inline_css: cannot read %s", full)
+    return Markup("\n".join(parts))
+
+
 _GZIP_TYPES = ("text/", "application/json", "application/javascript", "image/svg+xml")
 _GZIP_MIN_BYTES = 500
 _gzip_static_cache = {}   # (path, etag) -> compressed bytes; static files are small and few
@@ -853,15 +1138,41 @@ _gzip_static_cache = {}   # (path, etag) -> compressed bytes; static files are s
 @app.after_request
 def compress_response(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    path = request.path
+    # Cache headers. Versioned static URLs (?v=<mtime>) and the font files never change under
+    # the same URL, so the browser need not even revalidate them.
+    if path.startswith("/static/") and resp.status_code == 200 and ("v" in request.args or path.startswith("/static/fonts/")):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif resp.status_code >= 500:
+        resp.headers["Cache-Control"] = "no-store"
     try:
+        compressible = resp.mimetype.startswith(_GZIP_TYPES)
+        if compressible:
+            resp.headers.add("Vary", "Accept-Encoding")
         if (resp.status_code != 200 or "Content-Encoding" in resp.headers
                 or "gzip" not in request.headers.get("Accept-Encoding", "")
-                or not resp.mimetype.startswith(_GZIP_TYPES)):
+                or not compressible):
             return resp
-        resp.headers.add("Vary", "Accept-Encoding")
-        is_static = request.path.startswith("/static/")
+        if g.get("stream_gzip"):
+            # The streamed search page: compress each chunk and sync-flush, so the first chunk
+            # (the page header) leaves the server immediately instead of waiting for the results.
+            co = zlib.compressobj(5, zlib.DEFLATED, 31)
+            inner = resp.response
+
+            def gz_chunks():
+                for chunk in inner:
+                    out = co.compress(chunk) + co.flush(zlib.Z_SYNC_FLUSH)
+                    if out:
+                        yield out
+                yield co.flush()
+
+            resp.response = ClosingIterator(gz_chunks(), [inner.close] if hasattr(inner, "close") else [])
+            resp.headers["Content-Encoding"] = "gzip"
+            resp.headers.pop("Content-Length", None)
+            return resp
+        is_static = path.startswith("/static/")
         etag = resp.headers.get("ETag")
-        cache_key = (request.path, etag) if is_static and etag else None
+        cache_key = (path, etag) if is_static and etag else None
         if cache_key and cache_key in _gzip_static_cache:
             data = _gzip_static_cache[cache_key]
             resp.direct_passthrough = False
@@ -870,7 +1181,7 @@ def compress_response(resp):
             raw = resp.get_data()
             if len(raw) < _GZIP_MIN_BYTES:
                 return resp
-            data = gzip.compress(raw, compresslevel=5)
+            data = gzip.compress(raw, compresslevel=9 if cache_key else 5)
             if cache_key:
                 if len(_gzip_static_cache) > 64:
                     _gzip_static_cache.clear()

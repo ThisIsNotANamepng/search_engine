@@ -26,10 +26,19 @@ import utils
 import time
 import os
 import threading
+import heapq
 from collections import OrderedDict
 
 import psycopg2
 from psycopg2 import pool as pg_pool
+
+import search_memindex as memindex
+from types import SimpleNamespace
+
+try:
+    import numpy as np
+except ImportError:  # the in-memory fast path is optional; SQL path is used without numpy
+    np = None
 
 DEBUG = "DEBUG" in os.environ
 
@@ -370,12 +379,30 @@ def _host_and_depth(url):
     return host, depth
 
 
+_SIMPLE_WORD = re.compile(r"[0-9a-z]+")
+
+
+def _title_hits(words, title_l):
+    """How many query words occur as whole words in the lower-cased title (same result as
+    _word_in_text per word, but tokenises the title once for plain [0-9a-z] words)."""
+    toks = None
+    hits = 0
+    for w in words:
+        if w.isascii() and _SIMPLE_WORD.fullmatch(w):
+            if toks is None:
+                toks = set(_SIMPLE_WORD.findall(title_l))
+            hits += w in toks
+        elif _word_in_text(w, title_l):
+            hits += 1
+    return hits
+
+
 def title_boost(title, url, words):
     """Returns (multiplier, title_fraction, host_fraction). Words found in the title or hostname."""
     if not words:
         return 1.0, 0.0, 0.0
     title_l = (title or "").lower()
-    t_hits = sum(1 for w in words if _word_in_text(w, title_l))
+    t_hits = _title_hits(words, title_l)
     host, depth = _host_and_depth(url)
     host_tokens = set(re.split(r"[^0-9a-z\u0080-\uffff]+", host)) - {""}
     h_hits = sum(1 for w in words if w in host_tokens)
@@ -753,6 +780,548 @@ def _fuzzy_search(cur, missing_words, all_words, weights, k):
     return [score_fuzzy(r, all_words, len(trigrams), weights) for r in rows]
 
 
+# ---- in-memory fast path ------------------------------------------------------
+# One round trip per *uncached* word (a single statement that resolves the word and returns its whole
+# posting list as two packed int32 byte strings); everything else -- df (= posting count), BM25,
+# coverage, popularity, title/host boosts, nav candidates, top-K selection -- runs in-process on
+# numpy arrays from search_memindex. Posting lists are cached (LRU, byte budget, TTL), so a repeated
+# word costs no round trip at all. The formula is the same as the SQL path above.
+
+FAST = os.environ.get("SEARCH_FAST", "1") != "0"
+POSTING_CACHE_MB = float(os.environ.get("SEARCH_POSTING_CACHE_MB", "48"))
+POSTING_TTL = float(os.environ.get("SEARCH_POSTING_TTL", "300"))            # fresh for this long
+POSTING_HARD_TTL = float(os.environ.get("SEARCH_POSTING_HARD_TTL", "3600"))  # then stale-while-revalidate
+PREWARM_WORDS = int(os.environ.get("SEARCH_PREWARM_WORDS", "48"))           # 0 = no start-up pre-warm
+FETCH_THREADS = int(os.environ.get("SEARCH_FETCH_THREADS", "2"))            # concurrent cold fetches (1 = one statement)
+
+_POSTINGS_SQL = """
+SELECT w.word, w.id, a.urls, a.tfs
+FROM words w
+CROSS JOIN LATERAL (
+    SELECT string_agg(int4send(wu.url_id), ''::bytea) AS urls, string_agg(int4send(wu.count), ''::bytea) AS tfs
+    FROM word_urls wu WHERE wu.word_id = w.id
+) a
+WHERE w.word = ANY(%(words)s) AND a.urls IS NOT NULL
+"""
+_VARIANT_SQL = """SELECT w.word FROM words w WHERE w.word = ANY(%(cands)s)
+                  AND EXISTS (SELECT 1 FROM word_urls wu WHERE wu.word_id = w.id)"""
+
+
+class _PostingCache:
+    """word -> (word_id, url_ids int32[], tfs int32[], slot) or None (unknown word). LRU with a byte
+    budget. Entries older than `ttl` are 'stale': still usable (callers refresh them in the
+    background) until `hard_ttl`, after which they are misses."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.d = OrderedDict()
+        self.bytes = 0
+
+    def get(self, word, now, ttl, hard_ttl=None):
+        """-> (state, value) with state 'fresh' | 'stale' | 'miss'."""
+        hard_ttl = ttl if hard_ttl is None else hard_ttl
+        with self.lock:
+            hit = self.d.get(word)
+            if hit is None:
+                return "miss", None
+            age = now - hit[0]
+            if age > hard_ttl:
+                self._drop(word)
+                return "miss", None
+            self.d.move_to_end(word)
+            return ("fresh" if age <= ttl else "stale"), hit[1]
+
+    @staticmethod
+    def _size(value):
+        return 0 if value is None else value[1].nbytes + value[2].nbytes + value[1].size * 8 + 200
+
+    def _drop(self, word):
+        old = self.d.pop(word, None)
+        if old is not None:
+            self.bytes -= self._size(old[1])
+
+    def put(self, word, value, now):
+        size = self._size(value)
+        budget = POSTING_CACHE_MB * 1024 * 1024
+        if size > budget:
+            return
+        with self.lock:
+            self._drop(word)
+            self.d[word] = (now, value)
+            self.bytes += size
+            while self.bytes > budget or len(self.d) > 200000:
+                self._drop(next(iter(self.d)))
+
+    def clear(self):
+        with self.lock:
+            self.d.clear()
+            self.bytes = 0
+
+    def __len__(self):
+        return len(self.d)
+
+
+_posting_cache = _PostingCache()
+_corr_lock = threading.Lock()
+
+
+class _DfCache(dict):
+    """The SQL path's df cache; clearing it also clears the in-memory path's posting cache
+    (that cache is what replaces df lookups), so 'df-cache cold' benchmarks stay honest."""
+
+    def clear(self):
+        super().clear()
+        _posting_cache.clear()
+
+
+_df_cache = _DfCache()
+
+
+def clear_caches():
+    """Empty every in-process result/df/posting/correction cache (not the memory index)."""
+    _cache.clear()
+    _df_cache.clear()
+    _posting_cache.clear()
+    with _corr_lock:
+        _corr_cache.clear()
+
+
+class _Stages:
+    """Per-query timing breakdown in ms: mark(name) charges the time since the previous mark."""
+    __slots__ = ("d", "t", "t0")
+
+    def __init__(self):
+        self.d = {"round_trips": 0, "db_ms": 0.0}
+        self.t = self.t0 = time.perf_counter()
+
+    def mark(self, name):
+        now = time.perf_counter()
+        self.d[name] = self.d.get(name, 0.0) + (now - self.t) * 1000.0
+        self.t = now
+
+    def finish(self):
+        self.d["total_ms"] = (time.perf_counter() - self.t0) * 1000.0
+        return self.d
+
+
+last_timings = {}        # breakdown of the most recent search_debug call in this process
+_tl = threading.local()  # ... and per thread (use get_timings() under a threaded server)
+
+
+def get_timings():
+    return dict(getattr(_tl, "timings", None) or last_timings)
+
+
+def _db(st, fn):
+    """_run_with_conn with round-trip accounting."""
+    t = time.perf_counter()
+    try:
+        return _run_with_conn(fn)
+    finally:
+        st.d["round_trips"] += 1
+        st.d["db_ms"] += (time.perf_counter() - t) * 1000.0
+
+
+def _fast_ready():
+    return FAST and not FUZZY and np is not None and memindex.get() is not None
+
+
+_started_pid = None
+
+
+def warmup():
+    """Start loading the memory index in a background thread (idempotent, per process).
+    Called at import when DATABASE_URL is set and lazily from the first search."""
+    global _started_pid
+    if not FAST or FUZZY or np is None or not os.getenv("DATABASE_URL"):
+        return False
+    if _started_pid != os.getpid():
+        _started_pid = os.getpid()
+        memindex.start(_run_with_conn, on_ready=_prewarm)
+    return True
+
+
+def _prewarm():
+    """Background: fetch the posting lists of the most common title words so the first searches
+    for popular topics do not wait for the database. Bounded (SEARCH_PREWARM_WORDS words, 4 per
+    round trip, paused between batches); failures are ignored."""
+    idx = memindex.get()
+    if PREWARM_WORDS <= 0 or idx is None:
+        return
+    words = []
+    for tok in idx.top_title_tokens(PREWARM_WORDS * 2):
+        for w in dict(_query_groups(tok)).get("word", []):
+            if w not in words:
+                words.append(w)
+    words = words[:PREWARM_WORDS]
+    for i in range(0, len(words), 4):
+        batch = [w for w in words[i:i + 4] if _posting_cache.get(w, time.time(), POSTING_TTL)[0] == "miss"]
+        if not batch:
+            continue
+        try:
+            found = _run_with_conn(lambda cur: _fetch_postings(cur, batch))
+        except Exception:
+            return
+        now = time.time()
+        for w in batch:
+            _posting_cache.put(w, found.get(w), now)
+        time.sleep(0.05)
+
+
+def _decode_postings(raw_urls, raw_tfs):
+    """Packed big-endian int32 pairs -> (url_ids, tfs) sorted by url id, one row per page."""
+    u = np.frombuffer(raw_urls, dtype=">i4").astype(np.int32)
+    t = np.frombuffer(raw_tfs, dtype=">i4").astype(np.int32)
+    if u.size > 1 and not (u[1:] > u[:-1]).all():
+        order = np.argsort(u, kind="stable")
+        u, t = u[order], t[order]
+        keep = np.concatenate(([True], u[1:] != u[:-1]))
+        u, t = u[keep], t[keep]
+    return u, t
+
+
+def _fetch_postings(cur, words):
+    cur.execute(_POSTINGS_SQL, {"words": words})
+    found = {}
+    for word, wid, ub, tb in cur.fetchall():
+        u, t = _decode_postings(ub, tb)
+        found[word] = (wid, u, t, [None])    # [None]: slot for the per-snapshot BM25 contribution
+    return found
+
+
+_fetch_pool = None
+_fetch_pool_lock = threading.Lock()
+
+
+def _fetch_many(st, words):
+    """Posting lists for `words` that are not cached. One statement for a single word; several words are
+    fetched concurrently (one statement each, SEARCH_FETCH_THREADS at a time) because a cold fetch is
+    dominated by database I/O latency, which overlaps across connections."""
+    global _fetch_pool
+    if len(words) < 2 or FETCH_THREADS < 2:
+        return _db(st, lambda cur: _fetch_postings(cur, words))
+    from concurrent.futures import ThreadPoolExecutor
+    with _fetch_pool_lock:
+        if _fetch_pool is None:
+            _fetch_pool = ThreadPoolExecutor(max_workers=FETCH_THREADS, thread_name_prefix="search-fetch")
+    t = time.perf_counter()
+    futures = [_fetch_pool.submit(_run_with_conn, lambda cur, w=w: _fetch_postings(cur, [w])) for w in words]
+    found, err = {}, None
+    for f in futures:
+        try:
+            found.update(f.result())
+        except Exception as e:           # let every statement finish first, then fail like a single one would
+            err = err or e
+    st.d["round_trips"] += len(words)
+    st.d["db_ms"] += (time.perf_counter() - t) * 1000.0
+    if err is not None:
+        raise err
+    return found
+
+
+_inflight = set()
+_inflight_lock = threading.Lock()
+
+
+def _spawn(fn):
+    th = threading.Thread(target=fn, name="search-refresh", daemon=True)
+    th.start()
+    return th
+
+
+def _refresh_async(words):
+    """Refresh stale posting lists in the background (stale-while-revalidate): the query that
+    noticed them is answered from the old lists, so nobody waits for the round trip."""
+    with _inflight_lock:
+        words = [w for w in words if w not in _inflight]
+        _inflight.update(words)
+    if not words:
+        return
+
+    def work():
+        try:
+            found = _run_with_conn(lambda cur: _fetch_postings(cur, words))
+            now = time.time()
+            for w in words:
+                _posting_cache.put(w, found.get(w), now)
+        except Exception:
+            pass                      # keep serving the stale copy; the next query retries
+        finally:
+            with _inflight_lock:
+                _inflight.difference_update(words)
+    _spawn(work)
+
+
+def _get_postings(words, st):
+    """{word: (word_id, url_ids, tfs, slot)} for words that have postings. Cached; one round trip
+    for the misses; stale entries are served and refreshed in the background."""
+    now = time.time()
+    out, todo, stale = {}, [], []
+    for w in words:
+        state, val = _posting_cache.get(w, now, POSTING_TTL, POSTING_HARD_TTL)
+        if state == "miss":
+            todo.append(w)
+            continue
+        if state == "stale":
+            stale.append(w)
+        if val is not None:
+            out[w] = val
+    if stale:
+        _refresh_async(stale)
+    st.mark("postings_cache")
+    if todo:
+        found = _fetch_many(st, todo)
+        for w in todo:
+            _posting_cache.put(w, found.get(w), now)
+        out.update(found)
+        st.mark("postings_db")
+    return out
+
+
+def _np_candidates(snap, posts, n_words, k, n_docs, avgdl):
+    """BM25 x coverage x popularity over the posting lists in `posts` ({word: (id, urls, tfs)}; urls
+    sorted and unique). Work is O(postings), not O(index size). Returns None or a namespace with the
+    top-k pages (best first, ties by id): ids, pre (= the old SQL ordering expression; the final score
+    also multiplies by the title/host boost), text (BM25), pop, cov, tf (k x words), names, dfs."""
+    M = snap.M
+    names = sorted(posts)
+    score = np.zeros(M, dtype=np.float64)
+    seen = np.zeros(M, dtype=np.int8)
+    terms = []
+    # longest list first: it initialises the accumulators with plain assignment (no gather)
+    for n, w in enumerate(sorted(names, key=lambda w: -posts[w][1].size)):
+        p = posts[w]
+        df = int(p[1].size)
+        slot = p[3] if len(p) > 3 else [None]
+        hit = slot[0]
+        if hit is None or hit[0] is not snap:
+            # per-posting BM25 contribution depends only on (word, memindex snapshot): cache it with the list
+            urls, tfs = p[1], p[2]
+            cut = int(np.searchsorted(urls, M)) if df and urls[-1] >= M else df   # pages newer than the memindex
+            u, t = urls[:cut], tfs[:cut]
+            tf = t.astype(np.float64)
+            dl = np.maximum(snap.tt[u], 1)
+            x = (tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl))) * idf(n_docs, df)
+            hit = (snap, u, t, x)
+            slot[0] = hit
+        _, u, t, x = hit
+        if n == 0:
+            score[u] = x
+            seen[u] = 1
+        else:
+            score[u] += x
+            seen[u] += 1
+        terms.append((w, u, t, df))
+    terms.sort()
+    cand = np.flatnonzero(seen)
+    cand = cand[snap.valid[cand]]
+    if not cand.size:
+        return None
+    covtab = (np.arange(len(names) + 1) / float(n_words)).clip(max=1.0) ** COVERAGE_POW
+    cov = covtab[seen[cand]]
+    pop = _pop_vector(snap)[cand]
+    text = score[cand]
+    pre = text * cov * pop
+    if cand.size > k:
+        thr = np.partition(pre, cand.size - k)[cand.size - k]
+        keep = pre >= thr
+        cand, pre, text, pop, cov = cand[keep], pre[keep], text[keep], pop[keep], cov[keep]
+    order = np.lexsort((cand, -pre))[:k]                # best first, ties by id
+    cand, pre, text, pop, cov = cand[order], pre[order], text[order], pop[order], cov[order]
+    tf_cols = []
+    for _, u, t, _ in terms:
+        if u.size:
+            pos = np.minimum(np.searchsorted(u, cand), u.size - 1)
+            tf_cols.append(np.where(u[pos] == cand, t[pos], 0))
+        else:
+            tf_cols.append(np.zeros(cand.size, np.int32))
+    return SimpleNamespace(ids=cand, pre=pre, text=text, pop=pop, cov=cov, tf=np.stack(tf_cols, axis=1),
+                           names=names, dfs=[df for _, _, _, df in terms])
+
+
+def _pop_vector(snap):
+    """popularity_boost() for every page id, computed once per memindex snapshot."""
+    cached = getattr(snap, "pop_cache", None)
+    if cached is None or cached[0] != POP_ALPHA:
+        cached = (POP_ALPHA, 1.0 + POP_ALPHA * np.log1p(snap.ref.astype(np.float64)))
+        snap.pop_cache = cached
+    return cached[1]
+
+
+def _edits1(word):
+    """All strings one insert/delete/substitute/adjacent-transposition away (a-z0-9)."""
+    letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+    splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
+    out = {a + b[1:] for a, b in splits if b}
+    out |= {a + b[1] + b[0] + b[2:] for a, b in splits if len(b) > 1}
+    out |= {a + c + b[1:] for a, b in splits if b for c in letters}
+    out |= {a + c + b for a, b in splits for c in letters}
+    out.discard(word)
+    return out
+
+
+def _corrections_fast(missing, st):
+    """Typo fixes for words with no postings. Distance-1 fixes come from one indexed probe of the
+    ~500 candidate spellings against words.pk (no scan); longer words with no distance-1 fix fall
+    back to the old range scan for distance 2."""
+    out = {}
+    for w in missing:
+        lim = max_typo_distance(w)
+        if not lim:
+            continue
+        with _corr_lock:
+            hit = _corr_cache.get(w)
+        if hit and time.time() - hit[0] < STATS_TTL:
+            fix = hit[1]
+        else:
+            def probe(cur, w=w):
+                cur.execute(_VARIANT_SQL, {"cands": sorted(_edits1(w))})
+                return [r[0] for r in cur.fetchall()]
+            found = _db(st, probe)
+            fix = min(found, key=lambda v: (edit_distance(w, v), v)) if found else None
+            if fix is None and lim > 1:
+                fix = _db(st, lambda cur, w=w: _corrections(cur, [w]).get(w))
+            with _corr_lock:
+                _corr_cache[w] = (time.time(), fix)
+                while len(_corr_cache) > 2048:
+                    _corr_cache.popitem(last=False)
+        if fix:
+            out[w] = fix
+    return out
+
+
+def _boost(idx, snap, words, ids):
+    """Vectorised title_boost(): (multiplier, title_frac, host_frac) arrays for page ids."""
+    t_hits, h_hits = idx.hits(words, ids)
+    n = float(len(words))
+    t_frac, h_frac = t_hits / n, h_hits / n
+    home = (h_hits > 0) & (snap.depth[ids] <= 1)
+    mult = 1.0 + TITLE_BOOST * t_frac + HOST_BOOST * h_frac + HOME_BOOST * home
+    return mult, t_frac, h_frac
+
+
+def _word_dict(idx, snap, src, j, kind):
+    i = int(src.ids[j])
+    url, title = idx.row(i)
+    row = src.tf[j]
+    hit = [x for x in range(len(src.names)) if row[x] > 0]
+    m_words = [src.names[x] for x in hit]
+    d = {
+        "url": url, "title": title, "score": float(src.score[j]),
+        "bm25": float(src.text[j]), "coverage": float(src.cov[j]), "title_boost": float(src.mult[j]),
+        "title_frac": float(src.t_frac[j]), "host_frac": float(src.h_frac[j]),
+        "pop_boost": float(src.pop[j]), "reference_count": int(snap.ref[i]),
+        "matched_words": m_words, "query_words": list(src.qwords),
+        "total_tokens": int(snap.tt[i]), "avgdl": snap.avgdl, "n_docs": snap.n_docs,
+        "term_freq": {m_words[a]: int(row[x]) for a, x in enumerate(hit)},
+        "doc_freq": {m_words[a]: src.dfs[x] for a, x in enumerate(hit)},
+        "kind": kind,
+    }
+    if src.fixes is not None:
+        d["corrections"] = dict(src.fixes)
+    return d
+
+
+def _nav_dict(idx, snap, src, j):
+    i = int(src.ids[j])
+    url, title = idx.row(i)
+    return {
+        "url": url, "title": title, "score": float(src.score[j]),
+        "bm25": float(src.text[j]), "coverage": float(src.cov[j]), "title_boost": float(src.mult[j]),
+        "title_frac": float(src.t_frac[j]), "host_frac": float(src.h_frac[j]),
+        "pop_boost": float(src.pop[j]), "reference_count": int(snap.ref[i]),
+        "matched_words": [], "query_words": list(src.qwords),
+        "total_tokens": int(snap.tt[i]), "avgdl": None, "n_docs": None,
+        "term_freq": {}, "doc_freq": {}, "kind": "title",
+    }
+
+
+def _word_source(idx, snap, c, qwords, kind, penalty=1.0, fixes=None):
+    mult, t_frac, h_frac = _boost(idx, snap, qwords, c.ids)
+    return SimpleNamespace(kind=kind, ids=c.ids, score=c.pre * mult * penalty, text=c.text, cov=c.cov,
+                           pop=c.pop, mult=mult, t_frac=t_frac, h_frac=h_frac, tf=c.tf, names=c.names,
+                           dfs=c.dfs, qwords=qwords, fixes=fixes, make=_word_dict)
+
+
+def _nav_source(idx, snap, words, ids, t_hits, h_hits):
+    n = float(len(words))
+    t_frac, h_frac = t_hits / n, h_hits / n
+    home = (h_hits > 0) & (snap.depth[ids] <= 1)
+    mult = 1.0 + TITLE_BOOST * t_frac + HOST_BOOST * h_frac + HOME_BOOST * home
+    hits = np.maximum(t_frac, h_frac)
+    text = NAV_BASE * hits
+    pop = 1.0 + POP_ALPHA * np.log1p(snap.ref[ids].astype(np.float64))
+    return SimpleNamespace(kind="title", ids=ids, score=text * mult * pop, text=text, cov=hits, pop=pop,
+                           mult=mult, t_frac=t_frac, h_frac=h_frac, qwords=words, make=_nav_make)
+
+
+def _nav_make(idx, snap, src, j, kind):
+    return _nav_dict(idx, snap, src, j)
+
+
+def _mem_search(words, limit, offset, st):
+    """Ranked debug dicts for one page; same pipeline as _bm25_search without per-query SQL scans.
+    Every source (word matches, title/host matches, typo-corrected matches) is scored as numpy
+    vectors; only the pages that make the requested page are turned into result dicts."""
+    idx = memindex.get()
+    snap = idx.snap
+    n_docs, avgdl = snap.n_docs, snap.avgdl
+    want = limit + offset
+    k = max(RESCORE_K, want)
+    sources = []
+
+    posts = _get_postings(words, st)
+    unknown = [w for w in words if w not in posts]
+    c = _np_candidates(snap, posts, len(words), k, n_docs, avgdl) if posts else None
+    if c is not None:
+        sources.append(_word_source(idx, snap, c, words, "word"))
+    st.mark("score")
+
+    if NAV_MAX_DOCS != 0:
+        nav_ids, t_hits, h_hits = idx.nav(words, c.ids if c is not None else (), 100)
+        if nav_ids.size:
+            src = _nav_source(idx, snap, words, nav_ids, t_hits, h_hits)
+            keep = src.cov * len(words) >= max(1, len(words) / 2.0)     # score_nav's acceptance test
+            if keep.any():
+                for f in ("ids", "score", "text", "cov", "pop", "mult", "t_frac", "h_frac"):
+                    setattr(src, f, getattr(src, f)[keep])
+                sources.append(src)
+    st.mark("nav")
+
+    if unknown and CORRECTIONS:
+        fixes = _corrections_fast(unknown, st)
+        if fixes:
+            fixed = sorted({fixes.get(w, w) for w in words})
+            posts2 = _get_postings(fixed, st)
+            c2 = _np_candidates(snap, posts2, len(fixed), k, n_docs, avgdl) if posts2 else None
+            if c2 is not None:
+                sources.append(_word_source(idx, snap, c2, fixed, "corrected", CORRECTION_PENALTY, fixes))
+    st.mark("corrections")
+
+    if not sources:
+        st.mark("finalize")
+        return []
+    ids = np.concatenate([s.ids for s in sources])
+    scores = np.concatenate([s.score for s in sources])
+    src_no = np.concatenate([np.full(s.ids.size, n, dtype=np.int32) for n, s in enumerate(sources)])
+    row_no = np.concatenate([np.arange(s.ids.size) for s in sources])
+    order = np.argsort(-scores, kind="stable")                  # best first; earlier source wins ties
+    _, first = np.unique(ids[order], return_index=True)         # one entry per page: its best score
+    best = order[first]
+    if best.size > want:
+        thr = np.partition(scores[best], best.size - want)[best.size - want]
+        best = best[scores[best] >= thr]
+    out = []
+    for e in best.tolist():
+        s = sources[src_no[e]]
+        if idx.row(int(ids[e])) is None:
+            continue
+        out.append(s.make(idx, snap, s, int(row_no[e]), s.kind))
+    ranked = rank(out)
+    st.mark("finalize")
+    return ranked[offset:offset + limit]
+
+
 def _query_groups(query):
     tokenized = tokenizer.tokenize_all(query)
     parts = [list(tokenized[i]) if tokenized and len(tokenized) > i and tokenized[i] else [] for i in range(4)]
@@ -804,34 +1373,61 @@ def _resolve_mode(mode):
     return "bm25" if mode not in ("legacy", "exact", "fast") else ("fast" if mode == "legacy" else mode)
 
 
-def search_debug(query, limit=10, offset=0, mode=None):
+def search_debug(query, limit=10, offset=0, mode=None, timings=None):
     """Like search() but returns one dict per result with the score components:
     score, bm25, coverage, title_boost, pop_boost, reference_count, matched_words,
-    total_tokens, doc_freq, term_freq, kind ("word" | "fuzzy" | "legacy")."""
+    total_tokens, doc_freq, term_freq, kind ("word" | "fuzzy" | "legacy").
+
+    Per-stage timings (ms: tokenize, result_cache, postings_cache, postings_db, score, nav,
+    corrections, finalize, db_ms, round_trips, total_ms) land in the module dict `last_timings`
+    (and get_timings()); pass a dict as `timings=` to receive them directly."""
+    global last_timings
+    st = _Stages()
     limit = max(1, int(limit))
     offset = max(0, int(offset))
     mode = _resolve_mode(mode)
+    warmup()
     groups = _query_groups(query)
+    st.mark("tokenize")
+
+    def done(res, **extra):
+        global last_timings
+        d = st.finish()
+        d["path"] = "empty"
+        d.update(extra)
+        last_timings = _tl.timings = d
+        if timings is not None:
+            timings.update(d)
+        return res
+
     if not groups:
-        return []
+        return done([])
 
     key = (mode, limit, offset) + tuple((name, tuple(vals)) for name, vals in groups)
     cached = _cache_get(key)
+    st.mark("result_cache")
     if cached is not None:
         debug_print("Cache hit for", query)
-        return cached
+        return done(cached, path="cache")
 
     start = time.time()
+    path = mode
     if mode == "bm25":
         words = dict(groups).get("word")
         if not words:
-            return []
-        results = _run_with_conn(lambda cur: _bm25_search(cur, words, limit, offset))
+            return done([])
+        if _fast_ready():
+            path = "memory"
+            results = _mem_search(words, limit, offset, st)
+        else:
+            path = "sql"
+            results = _run_with_conn(lambda cur: _bm25_search(cur, words, limit, offset))
+            st.mark("sql_path")
     else:
         results = _legacy_rows_to_dicts(_legacy_search(groups, limit, offset, mode))
     debug_print("Time taken:", time.time() - start)
     _cache_put(key, results)
-    return results
+    return done(results, path=path)
 
 
 def search(query, limit=10, offset=0, mode=None):
@@ -843,3 +1439,10 @@ def search(query, limit=10, offset=0, mode=None):
     """
     return [(d["url"], d["title"], d["score"], d["bm25"], d["pop_boost"], d["reference_count"])
             for d in search_debug(query, limit, offset, mode)]
+
+
+# Pre-warm the memory index in the background so the first user is not slow (no-op without DATABASE_URL).
+try:
+    warmup()
+except Exception:  # never let a warm-up problem break an import
+    pass

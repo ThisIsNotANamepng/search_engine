@@ -4,10 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Creators</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Forum&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="{{ asset('css/creators.css') }}">
+    <link rel="preload" href="/static/fonts/forum-latin.woff2" as="font" type="font/woff2" crossorigin>
+    <style>{{ inline_css('css/fonts.css', 'css/creators.css') }}</style>
     <script src="{{ asset('js/creators.js') }}" async defer></script>
 </head>
 <body>

@@ -20,6 +20,9 @@
 
   function save(s) {
     try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) {}
+    // The server reads this cookie to pick the page size when a /search URL has no ?limit=
+    // (so it renders the right page on the first request instead of redirecting).
+    try { document.cookie = 'stultus_limit=' + s.limit + '; Path=/; Max-Age=31536000; SameSite=Lax'; } catch (e) {}
   }
 
   var settings = load();
@@ -172,10 +175,31 @@
     }
   }
 
+  // Warm the next results page when the pointer/finger/focus reaches the "Next" link, so the
+  // click is usually served from the browser cache. Not done on page load: most visitors never
+  // open page 2 and every prefetch is a real search on the server.
+  function prefetchNext() {
+    var next = document.getElementById('page-next');
+    if (!next) return;
+    var done = false;
+    function go() {
+      if (done) return;
+      done = true;
+      var l = document.createElement('link');
+      l.rel = 'prefetch';
+      l.href = next.href;
+      document.head.appendChild(l);
+    }
+    ['mouseenter', 'touchstart', 'focus'].forEach(function (ev) {
+      next.addEventListener(ev, go, { passive: true, once: true });
+    });
+  }
+
   function init() {
     // Only the search pages get the gear (creators and dashboard have their own layouts).
     if (document.getElementById('search-header')) build();
     apply();
+    prefetchNext();
     if (devOpen && panel) open();
   }
 

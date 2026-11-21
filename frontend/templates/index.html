@@ -6,11 +6,8 @@
         <title>Stultus</title>
         <meta name="description" content="">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Forum&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="{{ asset('css/index.css') }}">
-        <link rel="stylesheet" href="{{ asset('css/search.css') }}">
+        <link rel="preload" href="/static/fonts/forum-latin.woff2" as="font" type="font/woff2" crossorigin>
+        <style>{{ inline_css('css/fonts.css', 'css/index.css', 'css/search.css', 'css/settings.css') }}</style>
 {% include '_settings_head.html' %}
     </head>
     <body>
