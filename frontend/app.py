@@ -631,12 +631,14 @@ def _int_arg(name, default, lo, hi):
 def _run_search(query, limit, offset):
     """Returns (rows, has_more, seconds). Asks for one extra row to learn whether a next page exists."""
     started = time.perf_counter()
-    rows = list(search.search(query, limit + 1, offset))
+    details = list(search.search_debug(query, limit + 1, offset))
     elapsed = time.perf_counter() - started
-    page = rows[:limit]
+    details = details[:limit + 1]
+    page = [(d["url"], d["title"], d["score"], d["bm25"], d["pop_boost"], d["reference_count"])
+            for d in details[:limit]]
     with _search_timings_lock:
         _search_timings.append((time.time(), elapsed, len(page)))
-    return page, len(rows) > limit, elapsed
+    return page, len(details) > limit, elapsed, details[:limit]
 
 
 @app.template_filter("safe_href")
@@ -668,14 +670,14 @@ def perform_search():
 
     error = None
     try:
-        results, has_more, elapsed = _run_search(query, limit, offset)
+        results, has_more, elapsed, details = _run_search(query, limit, offset)
     except Exception:
         log.exception("search failed")
-        results, has_more, elapsed, error = [], False, 0.0, "Search is temporarily unavailable."
+        results, has_more, elapsed, details, error = [], False, 0.0, [], "Search is temporarily unavailable."
     prev_url = page_url(max(0, offset - limit)) if offset > 0 else None
     next_url = page_url(offset + limit) if has_more and offset + limit <= MAX_OFFSET else None
     resp = app.make_response(render_template(
-        "search.html", search_results=results, query_string=query, error=error,
+        "search.html", search_results=results, search_details=details, query_string=query, error=error,
         elapsed_ms=round(elapsed * 1000, 1), offset=offset, limit=limit,
         prev_url=prev_url, next_url=next_url))
     if error:
@@ -691,11 +693,11 @@ def api_search():
     limit = _int_arg("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
     offset = _int_arg("offset", 0, 0, MAX_OFFSET)
     try:
-        results, has_more, elapsed = _run_search(query, limit, offset)
+        results, has_more, elapsed, details = _run_search(query, limit, offset)
     except Exception:
         log.exception("api search failed")
         return jsonify({"error": "search unavailable"}), 503
-    return jsonify({
+    payload = {
         "query": query,
         "limit": limit,
         "offset": offset,
@@ -707,7 +709,12 @@ def api_search():
              "ref_score": rs, "reference_count": rc}
             for u, t, s, r, rs, rc in results
         ],
-    })
+    }
+    if request.args.get("debug", "").lower() in ("1", "true", "yes"):
+        payload["debug"] = [
+            {k: v for k, v in d.items() if k not in ("query_words",)} for d in details
+        ]
+    return jsonify(payload)
 
 
 # ---- Static assets: cache-busting links + gzip --------------------------------

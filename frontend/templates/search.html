@@ -35,10 +35,14 @@
                         <div class="debug-only">
                             <p>Search Score: {{ '%0.2f'|format(score or 0) }}</p>
                             <p>Relevance: {{ '%0.2f'|format(relevance or 0) }}</p>
+                            {% set d = search_details[loop.index0] if search_details and loop.index0 < search_details|length else none %}
+                            {% if d %}<p>Matched: {{ d.matched_words|join(', ') or d.kind }}</p>
+                            <p>Title Boost: {{ '%0.2f'|format(d.title_boost or 0) }}</p>{% endif %}
                         </div>
                         <div class="debug-only">
                             <p>Ref Score: {{ '%0.2f'|format(ref_score or 0) }}</p>
                             <p>Reference Ct: {{ '%0.2f'|format(reference_count or 0) }}</p>
+                            {% if d %}<p>Tokens: {{ d.total_tokens }} &middot; DF: {{ d.doc_freq.values()|join('/') or '-' }}</p>{% endif %}
                         </div>
                         </div>
                 </div>
