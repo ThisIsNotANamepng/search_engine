@@ -6,23 +6,18 @@
 prefix_score = ceil(len(prefix_matches)/3)
 trigram_score = trigram_matches {on the page}
 bigram_score = bigram_matches {on the page}
-where word_score = len(word)/2
-'''
+word_score = word_matches {on the page}
 
-#Aaron's Search:
-'''search_output = ((prefix_score + bigram_score + trigram_score + word_score + word_count) / word_count) * reference_count'''
-
-# relevance = sum_of_tokens_of_all_attributes + word_count / word_count
-# popularity = reference_count
-# search_output = relevance * popularity
-
-# Current formula (token counts from the `count` column of each *_urls table):
-# search_output = ((prefix_score + bigram_score + trigram_score + word_score + total_tokens) / total_tokens) * reference_count
+# Aaron's Search:
+# relevance     = (word_score + bigram_score + trigram_score + prefix_score) / total_tokens
+# ref_score     = 1 / reference_count^0.166667
+# search_output = relevance / ref_score
 #   word_score    = sum of word_urls.count    for the query's words    on that page
 #   prefix_score  = sum of prefix_urls.count  for the query's prefixes on that page
 #   bigram_score  = sum of bigram_urls.count  for the query's bigrams  on that page
 #   trigram_score = sum of trigram_urls.count for the query's trigrams on that page
 #   total_tokens  = urls.total_tokens
+#   reference_count = urls.reference_count
 
 """
 
@@ -185,8 +180,8 @@ _SQL_TEMPLATE = """
             SELECT
                 u.url,
                 u.title,
-                (m.token_score + {total_tokens}) / {total_tokens} AS relevance,
-                u.reference_count::double precision AS ref_score,
+                m.token_score / {total_tokens} AS relevance,
+                {ref_score} AS ref_score,
                 u.reference_count
             FROM matched m
             JOIN urls u ON u.id = m.url_id
@@ -194,7 +189,7 @@ _SQL_TEMPLATE = """
         SELECT
             url,
             title,
-            relevance * ref_score AS search_output,
+            relevance / ref_score AS search_output,
             relevance,
             ref_score,
             reference_count
@@ -226,6 +221,10 @@ _SQL_TEMPLATE = """
 # score, and NULLS LAST keeps it below every scored page.
 _TOTAL_TOKENS = "GREATEST(u.total_tokens, 1)::double precision"
 
+# ref_score = 1 / reference_count^0.166667. reference_count is never below 1 (column default),
+# so this is never 0 and search_output = relevance / ref_score is always defined.
+_REF_SCORE = "(1.0 / POWER(u.reference_count, 0.166667))::double precision"
+
 SEARCH_MODE = os.environ.get("SEARCH_MODE", "bm25").lower()
 STAGE1_BRANCHES = tuple(os.environ.get("SEARCH_STAGE1", "word,prefix").split(","))
 RESCORE_K = int(os.environ.get("SEARCH_RESCORE_K", "300"))
@@ -241,7 +240,7 @@ _STAGE1_SQL = """
         SELECT core.url_id
         FROM core
         JOIN urls u ON u.id = core.url_id
-        ORDER BY ((core.s + {total_tokens}) / {total_tokens}) * u.reference_count DESC NULLS LAST
+        ORDER BY (core.s / {total_tokens}) / {ref_score} DESC NULLS LAST
         LIMIT {k};
 """
 
@@ -260,14 +259,14 @@ def _fast_search(cur, groups, limit=10, offset=0):
         _STAGE1_SQL.format(
             branches="\n                UNION ALL".join(_BRANCHES[n] for n in core),
             k=max(RESCORE_K, offset + limit),
-            total_tokens=_TOTAL_TOKENS),
+            total_tokens=_TOTAL_TOKENS, ref_score=_REF_SCORE),
         tuple(g[n] for n in core))
     cand = [r[0] for r in cur.fetchall()]
     if not cand:
         return []
     sql = _SQL_TEMPLATE.format(
         branches="\n            UNION ALL".join(_BRANCHES_FOR_CANDIDATES[n] for n, _ in groups),
-        total_tokens=_TOTAL_TOKENS, limit=limit, offset=offset)
+        total_tokens=_TOTAL_TOKENS, ref_score=_REF_SCORE, limit=limit, offset=offset)
     params = []
     for _, vals in groups:
         params += [vals, cand]
@@ -789,7 +788,7 @@ def _legacy_rows_to_dicts(rows):
 def _legacy_search(groups, limit, offset, mode):
     sql_query = _SQL_TEMPLATE.format(
         branches="\n            UNION ALL".join(_BRANCHES[name] for name, _ in groups),
-        total_tokens=_TOTAL_TOKENS, limit=limit, offset=offset)
+        total_tokens=_TOTAL_TOKENS, ref_score=_REF_SCORE, limit=limit, offset=offset)
     params = tuple(vals for _, vals in groups)
 
     def run(cur):

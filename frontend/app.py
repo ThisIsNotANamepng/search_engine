@@ -24,6 +24,7 @@ from flask import Flask, render_template, request, jsonify, redirect
 import search
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 import json
 
 log = logging.getLogger("stultus.frontend")
@@ -489,7 +490,7 @@ def _check_http(port, path, method="GET"):
 
 
 def _check_postgres():
-    conn = psycopg2.connect(DATABASE_URL, sslmode="disable", connect_timeout=HEALTH_TIMEOUT_SECONDS)
+    conn = psycopg2.connect(DATABASE_URL, sslmode="disable", connect_timeout=max(1, int(HEALTH_TIMEOUT_SECONDS)))  # libpq wants a whole number
     try:
         conn.cursor().execute("SELECT 1;")
     finally:
@@ -558,6 +559,115 @@ def _crawler_nodes():
         conn.close()
 
 
+# ---- URL queue: status for the dashboard, and "scrape this now" ---------------
+# Crawlers claim the queue's lowest ids first (utils.get_next_urls: ORDER BY id), so a URL
+# is pushed to the front by giving it an id below every other queued one. No crawler
+# change needed; ids are BIGSERIAL so negative ids are fine.
+QUEUE_PREVIEW = 8
+MAX_URLS_PER_REQUEST = 50
+MAX_URL_LENGTH = 2048  # url_queue.url is VARCHAR(2048)
+
+
+def _queue_status():
+    conn = get_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Exact counts are cheap while the queue is small; past a second, fall back to the planner's estimate.
+        cur.execute("SET statement_timeout = 1000;")
+        try:
+            cur.execute("""
+                SELECT count(*) FILTER (WHERE claimed_at IS NULL)     AS waiting,
+                       count(*) FILTER (WHERE claimed_at IS NOT NULL) AS claimed
+                FROM url_queue;
+            """)
+            counts = dict(cur.fetchone(), estimated=False)
+        except psycopg2.errors.QueryCanceled:
+            conn.rollback()
+            cur.execute("SELECT reltuples::bigint AS waiting FROM pg_class WHERE relname = 'url_queue';")
+            counts = {"waiting": cur.fetchone()["waiting"], "claimed": None, "estimated": True}
+        cur.execute("""
+            SELECT url, enqueued_at, id < 0 AS pushed
+            FROM url_queue WHERE claimed_at IS NULL ORDER BY id LIMIT %s;
+        """, (QUEUE_PREVIEW,))
+        return dict(counts, next=cur.fetchall())
+    finally:
+        conn.close()
+
+
+def _normalize_url(raw):
+    """Return (url, None) or (None, reason). Adds https:// when no scheme is given."""
+    url = raw.strip()
+    if not url:
+        return None, "empty"
+    if "://" not in url:
+        url = "https://" + url
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname or " " in url:
+        return None, "not an http(s) URL"
+    if len(url) > MAX_URL_LENGTH:
+        return None, f"longer than {MAX_URL_LENGTH} characters"
+    if not parts.path:
+        url += "/"  # https://example.com -> https://example.com/
+    return url, None
+
+
+def _push_to_front(cur, url):
+    """Queue url ahead of everything else. Returns a short status string."""
+    cur.execute("SELECT claimed_at IS NOT NULL FROM url_queue WHERE url = %s;", (url,))
+    row = cur.fetchone()
+    if row and row[0]:
+        return "already being scraped"
+    cur.execute("SELECT LEAST(COALESCE(MIN(id), 0), 0) - 1 FROM url_queue;")
+    front_id = cur.fetchone()[0]
+    if row:
+        cur.execute("UPDATE url_queue SET id = %s, enqueued_at = now() WHERE url = %s AND claimed_at IS NULL;",
+                    (front_id, url))
+        return "moved to the front" if cur.rowcount else "already being scraped"
+    cur.execute("INSERT INTO url_queue (id, url) VALUES (%s, %s);", (front_id, url))
+    return "queued at the front"
+
+
+@app.route("/queue/push", methods=["POST"])
+def queue_push():
+    """Put URLs at the front of the crawl queue. Body: {"urls": "one per line"} or {"urls": [...]}."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get("urls", "")
+    items = raw.splitlines() if isinstance(raw, str) else [str(u) for u in raw]
+    items = [i for i in (x.strip() for x in items) if i]
+    if not items:
+        return jsonify({"error": "no URLs given"}), 400
+    if len(items) > MAX_URLS_PER_REQUEST:
+        return jsonify({"error": f"at most {MAX_URLS_PER_REQUEST} URLs at a time"}), 400
+
+    results = []
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        # Push in reverse so the first URL typed ends up first in the queue.
+        for raw_url in reversed(items):
+            url, problem = _normalize_url(raw_url)
+            if problem:
+                results.append({"input": raw_url, "status": problem, "ok": False})
+                continue
+            for attempt in range(3):  # two people pushing at once can pick the same front id
+                try:
+                    status = _push_to_front(cur, url)
+                    conn.commit()
+                    break
+                except psycopg2.errors.UniqueViolation:
+                    conn.rollback()
+            else:
+                status = "busy, try again"
+            cur.execute("SELECT 1 FROM urls WHERE url = %s;", (url,))
+            indexed = cur.fetchone() is not None
+            results.append({"input": raw_url, "url": url, "status": status, "ok": status != "busy, try again",
+                            "already_indexed": indexed})
+    finally:
+        conn.close()
+    results.reverse()
+    return jsonify({"results": results})
+
+
 @app.route("/dashboard/live")
 def dashboard_live():
     """Cheap, frequently polled dashboard state."""
@@ -565,10 +675,16 @@ def dashboard_live():
         nodes, nodes_error = _crawler_nodes(), None
     except psycopg2.Error as e:
         nodes, nodes_error = [], str(e)
+    try:
+        queue, queue_error = _queue_status(), None
+    except psycopg2.Error as e:
+        queue, queue_error = None, str(e)
     payload = {
         "nodes": nodes,
         "nodes_error": nodes_error,
         "node_stale_seconds": NODE_STALE_SECONDS,
+        "queue": queue,
+        "queue_error": queue_error,
         "health": _service_health(),
         "search": _search_stats(),
         "server_time": time.time(),

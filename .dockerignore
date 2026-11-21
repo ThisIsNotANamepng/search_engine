@@ -1,0 +1,17 @@
+# Keep the crawler image's build context to the code: no venvs, secrets, git
+# history, local databases or test corpora.
+.git
+.env
+.env.*
+venv/
+env/
+.venv/
+**/__pycache__
+*.db
+*.log
+nltk_data/
+supporting_servers/data/
+tests/
+docs/
+deploy/
+frontend/

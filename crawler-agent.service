@@ -28,6 +28,7 @@
 #   SCRAPER_PROXY_PASSWORD=...
 #   WEB_TEXT_STORAGE_SERVER_ADDRESS=http://db01:8003
 #   INITIAL_DESIRED=4
+#   RUN_BATCHER=1           # optional; batch this box's postgres writes (supporting_servers/batcher.py)
 #   NODE_ID=db03            # optional; defaults to the hostname
 #   CRAWLER_RUN_ARGS=--memory-limit 1073741824   # optional per-container limits (bytes)
 #
@@ -55,9 +56,10 @@ EnvironmentFile=/etc/stultus/crawler.env
 Restart=always
 RestartSec=3
 
-# On stop, the agent SIGTERMs its crawlers; give it room to do so.
+# On stop, the agent SIGTERMs its crawlers one by one, then the batcher (up to 20 s
+# to flush); give it room to do so.
 KillMode=mixed
-TimeoutStopSec=30
+TimeoutStopSec=90
 
 # Optional resource caps for the whole crawler slice on this box.
 # CPUQuota=400%
