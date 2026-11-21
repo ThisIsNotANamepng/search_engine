@@ -12,6 +12,8 @@ import itertools
 import ipaddress
 import weakref
 import functools
+import http.cookiejar
+import requests.adapters
 import queue
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
@@ -19,6 +21,7 @@ from urllib.robotparser import RobotFileParser
 import tldextract
 import tokenizer
 import psycopg2
+import psycopg2.errors
 from psycopg2 import sql
 import psycopg2.extras as extras
 from psycopg2.extras import execute_values
@@ -39,6 +42,21 @@ NOT_SCRAPABLE = "not_scrapable"
 SCRAPER_PROXY = os.environ.get("SCRAPER_PROXY", "").rstrip("/")
 SCRAPER_PROXY_PASSWORD = os.environ.get("SCRAPER_PROXY_PASSWORD", "")
 _PROXY_HEADERS = {"X-Proxy-Auth": SCRAPER_PROXY_PASSWORD} if SCRAPER_PROXY_PASSWORD else {}
+
+class _NoCookies(http.cookiejar.CookiePolicy):
+    """The crawler never stores or sends cookies (a Session would otherwise keep them per site)"""
+    netscape = True
+    rfc2965 = hon = False
+    def set_ok(self, cookie, request): return False
+    def return_ok(self, cookie, request): return False
+    def domain_return_ok(self, domain, request): return False
+    def path_return_ok(self, path, request): return False
+
+# One Session so the robots.txt request and the page request to the same site share a connection (one TLS handshake instead of two)
+_SESSION = requests.Session()
+_SESSION.cookies.set_policy(_NoCookies())
+_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=8))
+_SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=8))
 
 _BIGRAM_ID_MAP = None
 _TRIGRAM_ID_MAP = None
@@ -218,7 +236,40 @@ def close_all_connections():
     for conn in list(_OPEN_CONNS):
         psycopg2.extensions.connection.close(conn)  # the base close, not _ReusableConnection's which would keep it
 
+# Every table create_database() would make. Checked read-only (to_regclass) before any DDL runs
+REQUIRED_TABLES = ("words", "bigrams", "trigrams", "prefixes", "urls", "urls_references", "url_queue", "logs",
+                   "bigram_urls", "trigram_urls", "prefix_urls", "word_urls", "blocked_domains")
+
+def ddl_allowed():
+    """Schema changes (CREATE/ALTER/INDEX) only run when STULTUS_ALLOW_DDL=1 is set explicitly"""
+    return os.environ.get("STULTUS_ALLOW_DDL") == "1"
+
+def missing_tables():
+    """Read-only: the REQUIRED_TABLES the database doesn't have yet (url_queue.claimed_at is optional, see queue_has_claims)"""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT t, to_regclass(t) IS NULL FROM unnest(%s::text[]) AS t;", (list(REQUIRED_TABLES),))
+        missing = [t for t, absent in cur.fetchall() if absent]
+    finally:
+        conn.rollback()
+        cur.close()
+        conn.close()
+    return missing
+
 def create_database():
+    """
+    Make sure the database is ready. Never changes the schema unless STULTUS_ALLOW_DDL=1: without it this only checks
+    (read-only) that the tables exist and raises RuntimeError if they don't.
+    """
+    if not ddl_allowed():
+        missing = missing_tables()
+        if missing:
+            raise RuntimeError(f"Database is missing {', '.join(missing)}, and schema changes are disabled. "
+                               "Set STULTUS_ALLOW_DDL=1 to let utils.create_database() create them.")
+        populate_static_ngrams()  # read-only check here: raises if the bigram/trigram rows are missing
+        return
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -350,6 +401,11 @@ def populate_static_ngrams():
         conn.close()
         return
 
+    if not ddl_allowed():
+        cur.close()
+        conn.close()
+        raise RuntimeError("The bigrams/trigrams tables are missing rows and inserting them is disabled. Set STULTUS_ALLOW_DDL=1 to populate them.")
+
     # bigram crap
     bigram_values = [(''.join(b),) for b in itertools.product(chars, repeat=2)]
 
@@ -405,6 +461,15 @@ def robots_directives(values):
 
 def extract_data_from_html(body, url, x_robots_tag=""):
     """
+    Same contract as always (see _extract_data_from_html_bs4 for the full description), but the page is parsed once with lxml
+    and that tree goes to trafilatura, instead of one BeautifulSoup parse plus trafilatura's own parse (~3x faster).
+    """
+    from crawl_lib.parse import extract_page
+    return extract_page(body, url, x_robots_tag)
+
+def _extract_data_from_html_bs4(body, url, x_robots_tag=""):
+    """
+    The original BeautifulSoup implementation, kept as the reference tests/test_fast_crawl_parse.py compares extract_data_from_html against.
     Takes in the bs4 soup and returns the text, links, title, and favicon link from the page
 
     Args:
@@ -532,9 +597,9 @@ def allowed_by_robots(url, user_agent):
 def _robots_parser(robots_url, user_agent, day):
     """Fetch and parse one site's robots.txt. Returns None if the site has none (cached); raises on network errors (lru_cache doesn't cache exceptions)"""
     if SCRAPER_PROXY:
-        resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
+        resp = _SESSION.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
     else:
-        resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
+        resp = _SESSION.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
     if resp.status_code != 200:
         return None
     rp = RobotFileParser()
@@ -598,8 +663,8 @@ def get_page_html(url):
         # One hop: redirects are followed below so every target is checked first
         # stream=True: only the headers are read here, so status and Content-Type are checked before any body is downloaded
         if SCRAPER_PROXY:
-            return requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": target}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
-        return requests.get(target, headers=headers, timeout=(5, 10), allow_redirects=False, stream=True)
+            return _SESSION.get(f"{SCRAPER_PROXY}/fetch", params={"url": target}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
+        return _SESSION.get(target, headers=headers, timeout=(5, 10), allow_redirects=False, stream=True)
 
     request = None
     try:
@@ -949,6 +1014,38 @@ def mark_url_seen(url):
     conn.close()
 
 # Queue and logging helpers (Postgres-backed)
+_QUEUE_HAS_CLAIMS = None
+
+def queue_has_claims():
+    """
+    True if url_queue has the claimed_at column (the claim protocol below). Older/production schemas don't: they use the claimless
+    protocol (pop = DELETE ... RETURNING, unfinished urls are re-inserted). One information_schema check, cached for the process
+    """
+    global _QUEUE_HAS_CLAIMS
+    if _QUEUE_HAS_CLAIMS is None:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'url_queue' AND column_name = 'claimed_at';")
+        _QUEUE_HAS_CLAIMS = cur.fetchone() is not None
+        conn.rollback()
+        cur.close()
+        conn.close()
+    return _QUEUE_HAS_CLAIMS
+
+def enqueue_explicit_ids(cur, urls):
+    """
+    Insert the urls that aren't queued yet with explicit ids (max(id) + position), never touching url_queue's id sequence:
+    on the production database that sequence hit the INT limit, so any insert relying on the default fails.
+    Raises psycopg2.errors.UniqueViolation if a concurrent writer took the same ids: callers retry (in a savepoint / new transaction)
+    """
+    cur.execute("""
+        INSERT INTO url_queue (id, url)
+        SELECT (SELECT coalesce(max(id), 0) FROM url_queue) + row_number() OVER (ORDER BY t.o), t.u
+        FROM unnest(%s::varchar[]) WITH ORDINALITY AS t(u, o)
+        WHERE NOT EXISTS (SELECT 1 FROM url_queue q WHERE q.url = t.u)
+        ON CONFLICT (url) DO NOTHING;""", (list(urls),))
+    return cur.rowcount
+
 def get_next_urls(num_urls):
     """
     Claims the next urls in the queue ([] if empty) for this scraper
@@ -956,6 +1053,20 @@ def get_next_urls(num_urls):
     Claimed urls stay in url_queue with claimed_at set, so filter_new_urls() and enqueue's ON CONFLICT still see them and no other scraper queues or claims them again.
     finish_claims() deletes or hands them back; a claim never finished (scraper killed) is handed back after CLAIM_TIMEOUT
     """
+
+    if not queue_has_claims():
+        # Claimless protocol: popping removes the rows, so the caller must re-insert (finish_claims release=) whatever it doesn't finish
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM url_queue WHERE id IN (
+                SELECT id FROM url_queue ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
+            ) RETURNING id, url;""", (num_urls,))
+        rows = sorted(cur.fetchall())  # RETURNING order isn't the queue order
+        conn.commit()
+        cur.close()
+        conn.close()
+        return [url for _, url in rows]
 
     conn = get_conn()
     cur = conn.cursor()
@@ -985,6 +1096,12 @@ def finish_claims(done=(), release=()):
     Ends this scraper's claims on urls from get_next_urls(): done urls leave the queue, released ones go back for any scraper to claim
     """
     if not done and not release:
+        return
+
+    if not queue_has_claims():
+        # popped urls are already gone from the queue (done needs nothing); released ones go back
+        if release:
+            enqueue_urls(list(release))
         return
 
     conn = get_conn()
@@ -1025,6 +1142,22 @@ def log_db(message):
 def enqueue_urls(urls):
     if not urls:
         return
+
+    if not queue_has_claims():
+        for attempt in range(8):
+            conn = get_conn()
+            cur = conn.cursor()
+            try:
+                enqueue_explicit_ids(cur, urls)
+                conn.commit()
+                return
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()  # another scraper took the same ids: look at max(id) again
+                time.sleep(0.05 * (attempt + 1))
+            finally:
+                cur.close()
+                conn.close()
+        raise RuntimeError("could not enqueue urls: kept colliding with concurrent writers")
 
     conn = get_conn()
     cur = conn.cursor()

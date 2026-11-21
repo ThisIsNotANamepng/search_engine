@@ -92,6 +92,8 @@ def finish_claims(release):
     global claimed, retry_later
     if args.nodb or args.url or args.file:
         return  # these urls didn't come from the db queue, so there are no claims (and the rows may be another scraper's)
+    if not utils.queue_has_claims():
+        release = list(release) + list(retry_later)  # claimless queue: popped urls are gone, so even rate-limited ones must be put back
     utils.finish_claims(done=set(claimed) - set(release) - set(retry_later), release=release)
     claimed, retry_later = [], []
 
