@@ -406,6 +406,18 @@ class NodeAgent:
                     "uptime_s": round(now - slot["started_at"]),
                     "restarts": slot["restarts"],
                 })
+        if RUN_BATCHER:
+            # Reported first, alive or not: a box whose batcher is down keeps crawling but stores nothing
+            b = self.slots.get(BATCHER_SLOT)
+            running = b is not None and b["proc"] is not None and b["proc"].poll() is None
+            procs.insert(0, {
+                "slot": BATCHER_SLOT,
+                "container": container_name(BATCHER_SLOT),
+                "pid": b["proc"].pid if running else None,
+                "uptime_s": round(now - b["started_at"]) if running else None,
+                "restarts": b["restarts"] if b else 0,
+                "running": running,
+            })
         return {
             "node_id": NODE_ID,
             "hostname": socket.gethostname(),
