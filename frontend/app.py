@@ -17,12 +17,11 @@ import os, sys, time, threading
 # search.py lives in the directory above this one
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify
 import search
 import psycopg2
 import psycopg2.extras
 import json
-import hmac
 
 app = Flask(__name__)
 
@@ -31,20 +30,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-# The dashboard and the crawler control endpoints need HTTP basic auth with this password (any username).
-# Node agents send it from their own ADMIN_PASSWORD. Unset = those routes are refused for everyone.
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-ADMIN_PATHS = ("/dashboard", "/nodes/", "/agent/")
 MAX_DESIRED = 64  # crawlers per node; a typo shouldn't spawn thousands of containers
-
-@app.before_request
-def require_admin_password():
-    if not request.path.startswith(ADMIN_PATHS):
-        return None
-    auth = request.authorization
-    if ADMIN_PASSWORD and auth and auth.password is not None and hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
-        return None
-    return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Stultus admin"'})
 
 def get_db():
     return psycopg2.connect(

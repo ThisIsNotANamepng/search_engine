@@ -31,7 +31,7 @@ Everything except Postgres, Redis and the registry is installed from `deploy/db0
 
 ```bash
 sudo mkdir -p /etc/stultus
-sudo cp deploy/db01/head.env.example  /etc/stultus/head.env    # DATABASE_URL, ADMIN_PASSWORD
+sudo cp deploy/db01/head.env.example  /etc/stultus/head.env    # DATABASE_URL
 sudo cp deploy/db01/proxy.env.example /etc/stultus/proxy.env   # PROXY_UPSTREAM, PROXY_PASSWORD
 sudo nano /etc/stultus/head.env /etc/stultus/proxy.env
 sudo ./deploy/db01/install.sh /home/matt/search_engine matt
@@ -76,7 +76,6 @@ sudo ss -ltnp | grep -E ':(5000|8000|8002|8003|8888)\b'
 
 ```bash
 HEAD_URL=http://db01:8000
-ADMIN_PASSWORD=<same as the head's ADMIN_PASSWORD>
 CRAWLER_IMAGE=db01:5000/stultus:<version>
 CTR_PLAIN_HTTP=1
 CTR_NAMESPACE=stultus

@@ -21,7 +21,6 @@
 #
 # /etc/stultus/crawler.env should contain (one KEY=VALUE per line, no quotes):
 #   HEAD_URL=http://db01:8000
-#   ADMIN_PASSWORD=...                      # same as the head's ADMIN_PASSWORD (not forwarded to crawlers)
 #   CRAWLER_IMAGE=db01:5000/stultus:1.0.5   # from the db01 registry
 #   CTR_PLAIN_HTTP=1                        # if the registry is plain HTTP
 #   DATABASE_URL=postgresql://user:pass@db01:5432/stultus
