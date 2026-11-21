@@ -9,10 +9,17 @@ scan), without fetching every matching row from the table.
 
 Run add_count_columns.py first: these indexes need the count column.
 
-Older databases have the earlier (token_id, url_id) indexes without count. Once
-the new index for a table has finished building, the old one is dropped, since
-the new one does everything it did. Both exist while the new one builds, so
-make sure there's enough free disk space for one extra index at a time.
+Older databases have the earlier (token_id, url_id) indexes without count, and
+the single-column idx_<table>_<token>_id indexes create_database() used to make.
+Once the new index for a table has finished building, those are dropped, since
+the new one does everything they did (and search's re-score step picks the
+single-column one over it and gets much slower). Both exist while the new one
+builds, so make sure there's enough free disk space for one extra index at a time.
+
+Deploy a scraper image whose create_database() no longer makes the single-column
+indexes BEFORE running this on an older database: a crawler still on the old
+image would rebuild a dropped one on startup without CONCURRENTLY, which blocks
+every insert into that table for hours.
 
 Built with CREATE INDEX CONCURRENTLY, so crawlers keep writing while it runs.
 Safe to re-run: existing valid indexes are skipped and leftover INVALID ones
@@ -28,12 +35,12 @@ import time
 
 import psycopg2
 
-# table: (new index name, token column, old index name it replaces)
+# table: (new index name, token column, old index names it replaces)
 INDEXES = {
-    "word_urls":    ("word_urls_word_id_url_id_count_idx",       "word_id",    "word_urls_word_id_url_id_idx"),
-    "prefix_urls":  ("prefix_urls_prefix_id_url_id_count_idx",   "prefix_id",  "prefix_urls_prefix_id_url_id_idx"),
-    "bigram_urls":  ("bigram_urls_bigram_id_url_id_count_idx",   "bigram_id",  "bigram_urls_bigram_id_url_id_idx"),
-    "trigram_urls": ("trigram_urls_trigram_id_url_id_count_idx", "trigram_id", "trigram_urls_trigram_id_url_id_idx"),
+    "word_urls":    ("word_urls_word_id_url_id_count_idx",       "word_id",    ("word_urls_word_id_url_id_idx", "idx_word_urls_word_id")),
+    "prefix_urls":  ("prefix_urls_prefix_id_url_id_count_idx",   "prefix_id",  ("prefix_urls_prefix_id_url_id_idx", "idx_prefix_urls_prefix_id")),
+    "bigram_urls":  ("bigram_urls_bigram_id_url_id_count_idx",   "bigram_id",  ("bigram_urls_bigram_id_url_id_idx", "idx_bigram_urls_bigram_id")),
+    "trigram_urls": ("trigram_urls_trigram_id_url_id_count_idx", "trigram_id", ("trigram_urls_trigram_id_url_id_idx", "idx_trigram_urls_trigram_id")),
 }
 
 
@@ -47,7 +54,7 @@ def index_state(cur, name):
 
 
 def build(table):
-    name, col, old_name = INDEXES[table]
+    name, col, old_names = INDEXES[table]
     # TCP keepalives: builds run for hours with the connection otherwise idle,
     # and NAT/firewalls drop silent connections ("Connection timed out").
     conn = psycopg2.connect(os.environ["DATABASE_URL"], keepalives=1,
@@ -75,10 +82,11 @@ def build(table):
         print(f"{name}: done in {time.time() - start:.0f}s", flush=True)
         cur.execute(f"ANALYZE {table}")
 
-    # The new index covers everything the old (token_id, url_id) one did
-    if index_state(cur, name) and index_state(cur, old_name) is not None:
-        print(f"{old_name}: replaced by {name}, dropping", flush=True)
-        cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {old_name}")
+    # The new index covers everything the old ones did
+    for old_name in old_names:
+        if index_state(cur, name) and index_state(cur, old_name) is not None:
+            print(f"{old_name}: replaced by {name}, dropping", flush=True)
+            cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {old_name}")
     conn.close()
 
 
