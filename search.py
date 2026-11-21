@@ -191,7 +191,6 @@ _SQL_TEMPLATE = """
                 u.reference_count::double precision AS ref_score,
                 u.reference_count
             FROM matched m
-            JOIN url_token_counts utc ON utc.url_id = m.url_id
             JOIN urls u ON u.id = m.url_id
         )
         SELECT
@@ -202,7 +201,7 @@ _SQL_TEMPLATE = """
             ref_score,
             reference_count
         FROM scored
-        ORDER BY search_output DESC, url  -- url breaks ties so results are stable
+        ORDER BY search_output DESC NULLS LAST, url  -- url breaks ties so results are stable
         LIMIT 10;
 """
 
@@ -225,10 +224,9 @@ _SQL_TEMPLATE = """
 # ---------------------------------------------------------------------------
 
 # total_tokens as a float, so the division isn't rounded down to a whole number.
-# Pages stored before urls.total_tokens existed have it NULL: fall back to the token
-# totals in url_token_counts so they still get a score. GREATEST(..., 1) avoids dividing by 0.
-_TOTAL_TOKENS = ("GREATEST(COALESCE(u.total_tokens, utc.word_count + utc.bigram_count"
-                 " + utc.trigram_count + utc.prefix_count), 1)::double precision")
+# GREATEST(..., 1) avoids dividing by 0. A page with no total_tokens (NULL) gets a NULL
+# score, and NULLS LAST keeps it below every scored page.
+_TOTAL_TOKENS = "GREATEST(u.total_tokens, 1)::double precision"
 
 SEARCH_MODE = os.environ.get("SEARCH_MODE", "fast").lower()
 STAGE1_BRANCHES = tuple(os.environ.get("SEARCH_STAGE1", "word,prefix").split(","))
@@ -244,9 +242,8 @@ _STAGE1_SQL = """
         )
         SELECT core.url_id
         FROM core
-        JOIN url_token_counts utc ON utc.url_id = core.url_id
         JOIN urls u ON u.id = core.url_id
-        ORDER BY ((core.s + {total_tokens}) / {total_tokens}) * u.reference_count DESC
+        ORDER BY ((core.s + {total_tokens}) / {total_tokens}) * u.reference_count DESC NULLS LAST
         LIMIT {k};
 """
 
