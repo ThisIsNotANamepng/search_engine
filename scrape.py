@@ -26,7 +26,7 @@ Environment variables:
 
 import utils
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 import os
 import redis
 import psycopg2
@@ -64,19 +64,14 @@ if not args.nodb: utils.create_database()
 utils.log("Started scraping")
 
 if not args.nodb:
-    redis_address = os.getenv("DATABASE_URL")
-    redis_address = redis_address[redis_address.index("@")+1:] # Get the IP of the DB server, the redis server will be on the same machine
-    redis_address = redis_address[0:redis_address.index(":")]
-
-    redis_password = os.getenv("DATABASE_URL")[::-1]
-    redis_password = redis_password[redis_password.index("@")+1:]
-    redis_password = redis_password[0:redis_password.index(":")][::-1]
+    # Redis runs on the DB server with the same password
+    database_url = urlparse(os.getenv("DATABASE_URL"))
 
     redis_client = redis.Redis(
-        host=redis_address,
+        host=database_url.hostname,
         port=6379,
         db=0,
-        password=redis_password,
+        password=unquote(database_url.password or ""),
         decode_responses=True  # makes strings instead of bytes
     )
 
