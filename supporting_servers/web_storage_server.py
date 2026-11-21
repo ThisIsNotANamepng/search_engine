@@ -44,24 +44,33 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 def init_db():
     """Create the data directories and the metadata table if they don't exist."""
     os.makedirs(FILES_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # isolation_level=None: transactions are explicit below. Long timeout: gunicorn workers run this at the same time and wait for each other's migration
+    conn = sqlite3.connect(DB_PATH, timeout=600, isolation_level=None)
     try:
         # WAL lets concurrent readers proceed while a write is in flight, which matters once several scrapers are posting at once
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute(
-            """
+        conn.execute("BEGIN IMMEDIATE;")
+        # (id, url): the same text can live at several urls (mirrors, shared error pages), each one gets a row
+        pages_table = """
             CREATE TABLE IF NOT EXISTS pages (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 url TEXT NOT NULL,
                 title TEXT,
                 byte_size INTEGER NOT NULL,
-                stored_at TEXT NOT NULL
+                stored_at TEXT NOT NULL,
+                PRIMARY KEY (id, url)
             );
-            """
-        )
+        """
+        conn.execute(pages_table)
+        # Older databases keyed pages by id alone, which silently dropped every url after the first with the same text
+        if [row[1] for row in conn.execute("PRAGMA table_info(pages);") if row[5]] == ["id"]:
+            conn.execute("ALTER TABLE pages RENAME TO pages_old;")
+            conn.execute(pages_table)
+            conn.execute("INSERT INTO pages SELECT id, url, title, byte_size, stored_at FROM pages_old;")
+            conn.execute("DROP TABLE pages_old;")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_url ON pages(url);")
-        conn.commit()
+        conn.execute("COMMIT;")
     finally:
         conn.close()
 
