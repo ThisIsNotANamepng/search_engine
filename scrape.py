@@ -29,6 +29,8 @@ import time
 from urllib.parse import urlparse
 import os
 import redis
+import psycopg2
+import requests
 import argparse
 import atexit
 import signal
@@ -84,7 +86,7 @@ if not args.nodb:
 local_queue = []
 queue_return_to_db = []
 claimed = []  # urls this scraper claimed with get_next_urls, still marked claimed in the db queue
-rate_limited = []  # claimed urls left claimed on purpose: the claim timing out is their retry delay
+retry_later = []  # claimed urls left claimed on purpose (rate limited, or one of our own servers was down): the claim timing out is their retry delay
 url = ""
 prev_base_domain = ""
 page_not_in_english = False
@@ -92,11 +94,11 @@ first_run = True
 
 def finish_claims(release):
     # End our claims: urls in release go back to the db queue, the rest of what we claimed is done and leaves it
-    global claimed, rate_limited
+    global claimed, retry_later
     if args.nodb or args.url or args.file:
         return  # these urls didn't come from the db queue, so there are no claims (and the rows may be another scraper's)
-    utils.finish_claims(done=set(claimed) - set(release) - set(rate_limited), release=release)
-    claimed, rate_limited = [], []
+    utils.finish_claims(done=set(claimed) - set(release) - set(retry_later), release=release)
+    claimed, retry_later = [], []
 
 def send_page_text(url, page_data):
     # The text archive is a copy for research; if it's down, keep crawling
@@ -241,7 +243,7 @@ while True:
 
         if raw_html == utils.RATE_LIMITED:
             if not args.nodb:
-                rate_limited.append(url)  # stays claimed, so it's retried once the claim times out
+                retry_later.append(url)  # stays claimed, so it's retried once the claim times out
                 redis_client.set(f"domain:{base_domain}", 1, ex=600)  # 10 minute cooldown
             utils.info_print(f"Rate limited, retrying after {utils.CLAIM_TIMEOUT} with 10 minute domain cooldown {url}")
             continue
@@ -343,6 +345,9 @@ while True:
         # One bad page must not kill the scraper (and lose its local queue); log it, skip that url (not requeued, so a page that always fails can't loop forever), keep going
         utils.failure_print(f"Error scraping {url}: {e!r}")
         utils.log(f"Error Unhandled exception {e!r} {url}")
+        # Page errors are caught inside utils, so these mean our own postgres, blocklist server or proxy is down: not the page's fault, retry it later
+        if url and isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError, requests.RequestException)):
+            retry_later.append(url)
         time.sleep(1)  # don't spin if a dependency (db, redis) is down
 
 utils.log("Finished scraping")
