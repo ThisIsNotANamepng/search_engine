@@ -326,7 +326,10 @@ def create_database():
         icon_link VARCHAR(2048),
         title VARCHAR(128),
         id INT NOT NULL DEFAULT nextval('urls_id_seq') PRIMARY KEY,
-        reference_count INT NOT NULL DEFAULT 1
+        reference_count INT NOT NULL DEFAULT 1,
+        -- Sum of the counts of every word, bigram, trigram and prefix stored for this page.
+        -- NULL for pages stored before this column existed.
+        total_tokens INT
     );
     CREATE TABLE IF NOT EXISTS urls_references (
         url VARCHAR(2048) NOT NULL,
@@ -368,10 +371,12 @@ def create_database():
 
 
 
-    CREATE TABLE IF NOT EXISTS bigram_urls (bigram_id INT NOT NULL, url_id INT NOT NULL);
-    CREATE TABLE IF NOT EXISTS trigram_urls (trigram_id INT NOT NULL, url_id INT NOT NULL);
-    CREATE TABLE IF NOT EXISTS prefix_urls (prefix_id INT NOT NULL, url_id INT NOT NULL);
-    CREATE TABLE IF NOT EXISTS word_urls (word_id INT NOT NULL, url_id INT NOT NULL);
+    -- count = how many times the token appears on the page (rows from before this column existed default to 1).
+    -- Existing databases get these columns from add_count_columns.py, not from here.
+    CREATE TABLE IF NOT EXISTS bigram_urls (bigram_id INT NOT NULL, url_id INT NOT NULL, count INT NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS trigram_urls (trigram_id INT NOT NULL, url_id INT NOT NULL, count INT NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS prefix_urls (prefix_id INT NOT NULL, url_id INT NOT NULL, count INT NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS word_urls (word_id INT NOT NULL, url_id INT NOT NULL, count INT NOT NULL DEFAULT 1);
 
     CREATE TABLE IF NOT EXISTS blocked_domains (
         domain VARCHAR(512) PRIMARY KEY,
@@ -871,24 +876,38 @@ def store(content, url):
     if text != None and len(text) < 4:
         return [links, False]
     
-    # Tokenize the text of the page
-    tokens = tokenizer.tokenize_all(text)
+    """
+    # MOVED THIS TO SCRAPE.PY  
+    # Check for english language
+    if detect(text) != 'en':
+        # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
+        log(f"Language Not in English {url}")
+        info_print("Language not in English, skipping")
+
+        return [links, False]
+
+    debug_print("Detected language")
+    """
+
+    # Tokenize the text of the page, counting how many times each token appears
+    tokens = tokenizer.tokenize_all_counts(text)
     debug_print("Tokenized")
 
     # A clean list of the links in the scraped page
     links = clean_links(links)
 
-    # tokens: [word_list, bigram_list, trigram_list, prefix_list, words, bigrams, trigrams, prefixes]
-    word_list = tokens[0] if tokens and len(tokens) > 0 else []
-    bigram_list = tokens[1] if tokens and len(tokens) > 1 else []
-    trigram_list = tokens[2] if tokens and len(tokens) > 2 else []
-    prefix_list = tokens[3] if tokens and len(tokens) > 3 else []
-    word_list = [w for w in word_list if 0 < len(w) <= MAX_TOKEN_LENGTH]
-    prefix_list = [p for p in prefix_list if 0 < len(p) <= MAX_TOKEN_LENGTH]
-    words = set(word_list)
-    bigrams = set(bigram_list)
-    trigrams = set(trigram_list)
-    prefixes = set(prefix_list)
+    # tokens: [word_counts, bigram_counts, trigram_counts, prefix_counts], each a Counter of token -> times it appears on the page
+    word_counts = {w: n for w, n in tokens[0].items() if 0 < len(w) <= MAX_TOKEN_LENGTH}
+    bigram_counts = tokens[1]
+    trigram_counts = tokens[2]
+    prefix_counts = {p: n for p, n in tokens[3].items() if 0 < len(p) <= MAX_TOKEN_LENGTH}
+
+    # word_list keeps repeats so url_token_counts.word_count is the same as before
+    word_list = [w for w, n in word_counts.items() for _ in range(n)]
+    words = set(word_counts)
+    bigrams = set(bigram_counts)
+    trigrams = set(trigram_counts)
+    prefixes = set(prefix_counts)
     debug_print("Cleaned links and split tokens into words, bigrams, trigrams, prefixes")
 
 
@@ -903,14 +922,21 @@ def store(content, url):
     if icon_link and len(icon_link) > MAX_URL_LENGTH:
         icon_link = None
 
+    # Every word, bigram, trigram and prefix occurrence stored for this page (only tokens that get a row below are counted)
+    total_tokens = (sum(word_counts.values())
+                    + sum(n for b, n in bigram_counts.items() if b in _BIGRAM_ID_MAP)
+                    + sum(n for t, n in trigram_counts.items() if t in _TRIGRAM_ID_MAP)
+                    + sum(prefix_counts.values()))
+
     # Upsert the URL and get its id. Use RETURNING id when inserting; else SELECT.
-    cur.execute("INSERT INTO urls (url, title, icon_link) VALUES (%s, %s, %s) ON CONFLICT (url) DO NOTHING RETURNING id;", (url, title, icon_link))
+    cur.execute("INSERT INTO urls (url, title, icon_link, total_tokens) VALUES (%s, %s, %s, %s) ON CONFLICT (url) DO NOTHING RETURNING id;", (url, title, icon_link, total_tokens))
     row = cur.fetchone()
     if row:
         url_id = row[0]
     else:
-        # Already stored (re-crawl or two scrapers on the same url): lock the row so concurrent stores of this url run one at a time, and replace its old postings instead of doubling them
-        cur.execute("SELECT id FROM urls WHERE url = %s FOR UPDATE;", (url,))
+        # Already stored (re-crawl or two scrapers on the same url): the UPDATE locks the row so
+        # concurrent stores of this url run one at a time, and refreshes total_tokens for the new scrape
+        cur.execute("UPDATE urls SET total_tokens = %s WHERE url = %s RETURNING id;", (total_tokens, url))
         url_id = cur.fetchone()[0]
         for table in ("word_urls", "bigram_urls", "trigram_urls", "prefix_urls"):
             cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = %s;").format(sql.Identifier(table)), (url_id,))
@@ -928,9 +954,9 @@ def store(content, url):
     """, (
         url_id,
         len(word_list),
-        len(bigram_list),
-        len(trigram_list),
-        len(prefix_list)
+        len(bigrams),
+        len(trigrams),
+        len(prefixes)
     ))
     
     # Bulk insert new words/prefixes (bigrams/trigrams are pre-populated).
@@ -970,32 +996,32 @@ def store(content, url):
 
     debug_print("Made token maps")
 
-    # Prepare mapping inserts and bulk insert them
-    word_url_pairs = [(word_map[w], url_id) for w in words if w in word_map]
-    bigram_url_pairs = [(bigram_map[b], url_id) for b in bigrams if b in bigram_map]
-    trigram_url_pairs = [(trigram_map[t], url_id) for t in trigrams if t in trigram_map]
-    prefix_url_pairs = [(prefix_map[p], url_id) for p in prefixes if p in prefix_map]
+    # Prepare mapping inserts (token id, url id, times the token appears on the page) and bulk insert them
+    word_url_pairs = [(word_map[w], url_id, n) for w, n in word_counts.items() if w in word_map]
+    bigram_url_pairs = [(bigram_map[b], url_id, n) for b, n in bigram_counts.items() if b in bigram_map]
+    trigram_url_pairs = [(trigram_map[t], url_id, n) for t, n in trigram_counts.items() if t in trigram_map]
+    prefix_url_pairs = [(prefix_map[p], url_id, n) for p, n in prefix_counts.items() if p in prefix_map]
 
     debug_print("Made insert stementes for <token>_url tables")
 
     if word_url_pairs:
         extras.execute_values(cur,
-            "INSERT INTO word_urls (word_id, url_id) VALUES %s;",
+            "INSERT INTO word_urls (word_id, url_id, count) VALUES %s;",
             word_url_pairs)
 
     if bigram_url_pairs:
         extras.execute_values(cur,
-            "INSERT INTO bigram_urls (bigram_id, url_id) VALUES %s;",
+            "INSERT INTO bigram_urls (bigram_id, url_id, count) VALUES %s;",
             bigram_url_pairs)
 
     if trigram_url_pairs:
         extras.execute_values(cur,
-            "INSERT INTO trigram_urls (trigram_id, url_id) VALUES %s;",
+            "INSERT INTO trigram_urls (trigram_id, url_id, count) VALUES %s;",
             trigram_url_pairs)
 
     if prefix_url_pairs:
         extras.execute_values(cur,
-            "INSERT INTO prefix_urls (prefix_id, url_id) VALUES %s;",
+            "INSERT INTO prefix_urls (prefix_id, url_id, count) VALUES %s;",
             prefix_url_pairs)
 
     debug_print("Executed insert statements, stored url.id_token.id pairs")

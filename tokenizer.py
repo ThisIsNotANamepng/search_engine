@@ -2,6 +2,7 @@ import math
 
 import nltk
 import string
+from collections import Counter
 
 from nltk.util import bigrams
 from nltk.util import trigrams
@@ -121,6 +122,38 @@ def tokenize_all(text):
     prefixes = list({word[:math.ceil(len(word) / 3)] for word in set(cleaned_text)})
 
     return [wordgrams, bigrams, trigrams, prefixes]
+
+def tokenize_all_counts(text):
+    """
+    Same tokens as tokenize_all(), but counts how many times each one appears on the page
+
+    A bigram/trigram is counted once per place it appears inside a word, and a prefix is
+    counted once per word that starts with it, so "the theme" gives th: 2, the: 2, he: 2.
+    The keys of each Counter are exactly the tokens tokenize_all() returns.
+
+    Parameters:
+    text (str): The input text to be tokenized
+
+    Returns:
+    list[Counter, Counter, Counter, Counter]: token -> count for words, bigrams, trigrams, prefixes
+    """
+
+    cleaned_text = clean(text)
+    word_counts = Counter(cleaned_text)
+
+    bigram_counts = Counter()
+    trigram_counts = Counter()
+    prefix_counts = Counter()
+
+    # Work per unique word and multiply by how often the word appears, instead of re-slicing repeated words
+    for word, n in word_counts.items():
+        for i in range(len(word) - 1):
+            bigram_counts[word[i:i + 2]] += n
+        for i in range(len(word) - 2):
+            trigram_counts[word[i:i + 3]] += n
+        prefix_counts[word[:math.ceil(len(word) / 3)]] += n
+
+    return [word_counts, bigram_counts, trigram_counts, prefix_counts]
 
           #print(tokenize_bigrams(clean("How do I hack a website")))
 #print(tokenize_bigrams(clean("I love programming in python")))
