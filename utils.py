@@ -25,7 +25,6 @@ from psycopg2.extras import execute_values
 from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
 import csv
-from typing import Optional
 import sqlite3
 import zlib
 import trafilatura
@@ -64,94 +63,20 @@ MAX_TOKEN_LENGTH = 64  # words.word, prefixes.prefix
 
 MAX_PAGE_BYTES = 5 * 1024 * 1024  # pages bigger than this (after decompression) are skipped
 
-class CSVTracker:
-    def __init__(self, filename: str = "timing.csv"):
-        self.filename = filename
-        self.columns = [
-            "url",
-            "downloaded_text",
-            "detected_language",
-            "tokenized",
-            "cleaned_and_split",
-            "added_new_tokens",
-            "made_token_maps",
-            "made_insert_statements",
-            "execute_insert_statements",
-            "committed_and_closed",
-            "total"
-        ]
-        self._ensure_file_exists()
+# DEBUG=3 timing data, one row per stored url, read by tests/utils/browse_debug_timing_data.ipynb
+TIMING_FILE = "timing.csv"
+TIMING_COLUMNS = ["url", "downloaded_text", "detected_language", "tokenized", "cleaned_and_split", "added_new_tokens",
+                  "made_token_maps", "made_insert_statements", "execute_insert_statements", "committed_and_closed", "total"]
+_timing_row = {}  # timed steps of the url store() is working on, appended to TIMING_FILE when it commits
 
-    def _ensure_file_exists(self):
-        """Create CSV with headers if it doesn't exist."""
-        if not os.path.exists(self.filename):
-            with open(self.filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.columns)
-                writer.writeheader()
-
-    def _read_all(self) -> list[dict]:
-        """Read all rows from CSV."""
-        with open(self.filename, 'r', newline='', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            return list(reader)
-
-    def _write_all(self, rows: list[dict]):
-        """Write all rows to CSV."""
-        with open(self.filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=self.columns)
+def _write_timing_row():
+    new_file = not os.path.exists(TIMING_FILE)
+    with open(TIMING_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TIMING_COLUMNS)
+        if new_file:
             writer.writeheader()
-            writer.writerows(rows)
-
-    def update(self, url: str, column: str, value) -> bool:
-        """
-        Update a specific column for a given URL.
-        Creates new row if URL doesn't exist.
-
-        Args:
-            url: The URL to update (primary key)
-            column: Column name to update
-            value: Value to set
-
-        Returns:
-            True if successful, False if column invalid
-        """
-        if column not in self.columns:
-            print(f"Error: Invalid column '{column}'. Valid columns: {self.columns}")
-            return False
-
-        rows = self._read_all()
-
-        # Find existing row or create new one
-        row_found = False
-        for row in rows:
-            if row.get("url") == url:
-                row[column] = value
-                row_found = True
-                break
-
-        if not row_found:
-            # Create new row with URL and empty values
-            new_row = {col: "" for col in self.columns}
-            new_row["url"] = url
-            new_row[column] = value
-            rows.append(new_row)
-
-        self._write_all(rows)
-        return True
-
-    def get(self, url: str) -> Optional[dict]:
-        """Get a row by URL."""
-        rows = self._read_all()
-        for row in rows:
-            if row.get("url") == url:
-                return row
-        return None
-
-    def get_all(self) -> list[dict]:
-        """Get all rows."""
-        return self._read_all()
-
-TIMING_TRACKER = CSVTracker("timing.csv") if LEVEL == "3" else ""
+        writer.writerow({"url": URL, **_timing_row})
+    _timing_row.clear()
 
 def debug_print(text):
     """
@@ -189,9 +114,6 @@ def debug_print(text):
             DEBUG_BREAKPOINT_TIMER = time.time()
 
         elif LEVEL == "3":
-            global TIMING_TRACKER
-            global URL
-
             print(format_time(time.time()-DEBUG_BREAKPOINT_TIMER), text)
             timing = format_time(time.time()-DEBUG_BREAKPOINT_TIMER)
 
@@ -228,7 +150,9 @@ def debug_print(text):
                 code = None
 
             if code:
-                TIMING_TRACKER.update(URL, code, timing)
+                _timing_row[code] = timing
+                if code == "committed_and_closed":  # store()'s last step
+                    _write_timing_row()
 
             DEBUG_BREAKPOINT_TIMER = time.time()
 
@@ -861,6 +785,7 @@ def store(content, url):
     """
     global URL
     URL = url
+    _timing_row.clear()  # DEBUG=3: steps timed before this url (e.g. a non-English page) aren't this url's
 
     # No database available (e.g. --nodb debugging run): nothing below this point can run
     # without a connection, so bail out before any DB access.
