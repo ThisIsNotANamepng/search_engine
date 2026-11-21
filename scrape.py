@@ -221,6 +221,7 @@ while True:
         if not args.nodb:
             if utils.check_url_in_blocklist(url):
                 utils.log(f"Misc URL found in domain blocklist, skipping {url}")
+                utils.mark_url_seen(url)  # so other pages linking here don't queue it again
                 continue
 
 
@@ -248,8 +249,13 @@ while True:
             utils.info_print(f"Rate limited, retrying after {utils.CLAIM_TIMEOUT} with 10 minute domain cooldown {url}")
             continue
 
+        if raw_html == utils.NOT_SCRAPABLE:
+            utils.mark_url_seen(url)  # the answer won't change, so other pages linking here don't queue it again
+            utils.info_print(f"Not scrapable (robots.txt/non-HTML/too large), skipping {url}")
+            continue
+
         if raw_html is False:
-            utils.info_print(f"Fetch failed (blocked/timeout/non-HTML), skipping {url}")
+            utils.info_print(f"Fetch failed (error status/timeout), skipping {url}")
             continue
 
         # A same-host redirect was followed: index the page under where it actually lives, cleaned like every stored url
@@ -296,6 +302,7 @@ while True:
 
         else:
             utils.info_print(f"No text found, keeping links only {url}")
+            utils.mark_url_seen(url)  # so other pages linking here don't queue it again
 
         # Clean first: stored and queued urls are in cleaned form (no ?query, #fragment or trailing /), so raw links wouldn't match them
         cleaned = utils.clean_links(page_data[1])
