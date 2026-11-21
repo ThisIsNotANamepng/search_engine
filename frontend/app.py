@@ -290,20 +290,6 @@ def _compute_dashboard_stats():
         for i in last_10_scraped
     ]
 
-    # Active scrapers (last three minutes)
-    cur.execute("""
-        SELECT
-            ip,
-            COUNT(*) AS urls_scraped,
-            MIN(ts) AS started_at,
-            MAX(ts) AS last_seen
-        FROM logs
-        WHERE message LIKE 'Scraped%'
-        GROUP BY ip
-        HAVING MAX(ts) >= NOW() - INTERVAL '3 minutes';
-    """)
-    scrapers = cur.fetchall()
-
     # URL count and DB size
     cur.execute("""
         SELECT
@@ -324,7 +310,6 @@ def _compute_dashboard_stats():
         "scrapes_over_time": scrapes_over_time,
         "cumulative_scrapes_per_day": cumulative_scrapes_per_day,
         "real_last_10_scraped": real_last_10_scraped,
-        "scrapers": scrapers,
         "url_count": totals["url_count"],
         "db_size": totals["db_size"],
     }
@@ -665,6 +650,76 @@ def queue_push():
     return jsonify({"results": results})
 
 
+# ---- Who is actually scraping -------------------------------------------------
+# Scrapers log each stored page as "Scraped <url>" with their host's IP. Matching those IPs
+# to the nodes' hostnames (db01 resolves in01..in12) gives each node its own pages/minute,
+# so a node whose crawlers run but store nothing stands out. Hosts that aren't nodes
+# (laptops, a Pi, "unknown") are listed separately.
+SCRAPE_WINDOW_MINUTES = 10
+NOT_SCRAPING_AFTER_SECONDS = 300   # a node with crawlers up but no stored page for this long is flagged
+SCRAPE_RATES_CACHE_SECONDS = 15
+_scrape_rates_cache = {"at": 0.0, "rows": None}
+_host_ip_cache = {}                # hostname -> (resolved_at, set of IPs)
+HOST_IP_CACHE_SECONDS = 600
+_rates_lock = threading.Lock()
+
+
+def _host_ips(hostname):
+    now = time.time()
+    cached = _host_ip_cache.get(hostname)
+    if cached and now - cached[0] < HOST_IP_CACHE_SECONDS:
+        return cached[1]
+    try:
+        ips = set(socket.gethostbyname_ex(hostname)[2])
+    except OSError:
+        ips = set()
+    _host_ip_cache[hostname] = (now, ips)
+    return ips
+
+
+def _scrape_rates():
+    """Per-IP counts of pages stored in the last SCRAPE_WINDOW_MINUTES (logs_scraped_ip_ts_idx / _ts_idx)."""
+    with _rates_lock:
+        if _scrape_rates_cache["rows"] is not None and time.time() - _scrape_rates_cache["at"] < SCRAPE_RATES_CACHE_SECONDS:
+            return _scrape_rates_cache["rows"]
+        conn = get_db()
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT COALESCE(NULLIF(ip, ''), 'unknown') AS ip,
+                       count(*) FILTER (WHERE ts >= now() - INTERVAL '1 minute') AS last_1m,
+                       count(*) AS last_window,
+                       EXTRACT(EPOCH FROM (now() - max(ts)))::float AS last_age_s
+                FROM logs
+                WHERE message LIKE 'Scraped%%' AND ts >= now() - make_interval(mins => %s)
+                GROUP BY 1;
+            """, (SCRAPE_WINDOW_MINUTES,))
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        _scrape_rates_cache.update(at=time.time(), rows=rows)
+        return rows
+
+
+def _attach_scrape_rates(nodes):
+    """Adds pages_per_min / last_page_age_s / scraping to each node; returns the non-node hosts."""
+    rows = {r["ip"]: r for r in _scrape_rates()}
+    claimed = set()
+    for n in nodes:
+        ips = _host_ips(n.get("hostname") or n["node_id"]) | _host_ips(n["node_id"])
+        mine = [rows[ip] for ip in ips if ip in rows]
+        claimed.update(ip for ip in ips if ip in rows)
+        n["ips"] = sorted(ips)
+        n["pages_last_1m"] = sum(r["last_1m"] for r in mine)
+        n["pages_per_min"] = round(sum(r["last_window"] for r in mine) / SCRAPE_WINDOW_MINUTES, 1)
+        ages = [r["last_age_s"] for r in mine]
+        n["last_page_age_s"] = min(ages) if ages else None
+    others = [dict(r, pages_per_min=round(r["last_window"] / SCRAPE_WINDOW_MINUTES, 1))
+              for ip, r in rows.items() if ip not in claimed]
+    others.sort(key=lambda r: -r["last_window"])
+    return others
+
+
 @app.route("/dashboard/live")
 def dashboard_live():
     """Cheap, frequently polled dashboard state."""
@@ -673,6 +728,10 @@ def dashboard_live():
     except psycopg2.Error as e:
         nodes, nodes_error = [], str(e)
     try:
+        other_scrapers = _attach_scrape_rates(nodes)
+    except psycopg2.Error as e:
+        other_scrapers, nodes_error = [], nodes_error or str(e)
+    try:
         queue, queue_error = _queue_status(), None
     except psycopg2.Error as e:
         queue, queue_error = None, str(e)
@@ -680,6 +739,9 @@ def dashboard_live():
         "nodes": nodes,
         "nodes_error": nodes_error,
         "node_stale_seconds": NODE_STALE_SECONDS,
+        "not_scraping_after_seconds": NOT_SCRAPING_AFTER_SECONDS,
+        "scrape_window_minutes": SCRAPE_WINDOW_MINUTES,
+        "other_scrapers": other_scrapers,
         "queue": queue,
         "queue_error": queue_error,
         "health": _service_health(),
@@ -707,7 +769,6 @@ def dashboard_data():
         "scrapes_over_time": stats["scrapes_over_time"],
         "cumulative_scrapes_per_day": stats["cumulative_scrapes_per_day"],
         "last_10_scraped": stats["real_last_10_scraped"],
-        "scrapers": stats["scrapers"],
     }
     # default=str keeps timestamps/decimals rendering exactly as the old server-side template did
     return app.response_class(json.dumps(payload, default=str), mimetype="application/json")

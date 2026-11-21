@@ -109,6 +109,7 @@ h1 span { display: block; font-size: 15px; font-weight: 500; letter-spacing: .32
 .auto-row { grid-row: auto; }
 /* In cards that size to their content, tables take their natural height (scrolling past 480px). */
 .auto-row .table-box { flex: none; max-height: 480px; }
+.auto-row .table-box.nodes-box { max-height: none; }  /* the node table is the main thing: show every node */
 
 /* =====================
    Card
@@ -259,6 +260,10 @@ tr.crawler-row td:first-child { padding-left: 36px; }
 .bar { display: inline-block; width: 72px; height: 10px; border: 2px solid var(--ink); background: var(--card); vertical-align: middle; margin-left: 10px; overflow: hidden; }
 .bar > span { display: block; height: 100%; background: var(--blue); }
 .bar.warn > span { background: var(--yellow); }
+td.rate b { font-size: 16px; font-weight: 800; }
+.rate-bar { width: 56px; }
+.rate-bar > span { background: var(--red); }
+.node-summary .problem b { color: var(--red); }
 
 .scale { white-space: nowrap; }
 .scale input {
@@ -405,24 +410,26 @@ tr.pushed td:first-child::before { content: ""; display: inline-block; width: 8p
 
         <!-- Crawler nodes (from the node agents' heartbeats) -->
         <div class="card c-blue col-12 auto-row">
-            <h2>Crawler Nodes <span class="sub">click a node to see its crawlers</span></h2>
+            <h2>Crawler Nodes <span class="sub">pages stored per minute, from the last 10 minutes · click a node to see its crawlers</span></h2>
             <div class="node-summary" id="node-summary"></div>
-            <div class="table-box">
+            <div class="table-box nodes-box">
                 <table>
                     <thead>
                         <tr>
                             <th>Node</th>
                             <th>Status</th>
-                            <th>Running / Desired</th>
+                            <th class="num">Pages / min</th>
+                            <th class="num">Last page</th>
+                            <th>Crawlers</th>
                             <th class="num hide-sm">Restarts</th>
                             <th class="num hide-sm">CPU</th>
                             <th class="num hide-sm">RAM</th>
-                            <th class="num">Last Seen</th>
+                            <th class="num hide-sm">Heartbeat</th>
                             <th>Scale</th>
                         </tr>
                     </thead>
                     <tbody id="nodes-body">
-                        <tr><td colspan="8" class="muted">Loading…</td></tr>
+                        <tr><td colspan="10" class="muted">Loading…</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -506,11 +513,11 @@ tr.pushed td:first-child::before { content: ""; display: inline-block; width: 8p
         </div>
 
         <div class="card c-red col-4 row-2">
-            <h2>Scraping Hosts <span class="sub">last 3 min</span></h2>
+            <h2>Other Scrapers <span class="sub">not cluster nodes · last 10 min</span></h2>
             <div class="table-box">
                 <table>
-                    <thead><tr><th>Host IP</th><th class="num">Scraped</th><th>Since</th></tr></thead>
-                    <tbody id="scrapers-body"><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
+                    <thead><tr><th>Host</th><th class="num">Pages / min</th><th class="num">Last page</th></tr></thead>
+                    <tbody id="others-body"><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -565,12 +572,14 @@ function renderHealth(checks) {
 const openNodes = new Set();     // node_ids whose crawler rows are expanded
 const pendingScale = new Map();  // node_id -> value typed but not yet Set
 
-function nodeStatus(n, batcher) {
+function nodeStatus(n, batcher, notScrapingAfter) {
     if (n.age_s > NODE_STALE_SECONDS) return ["bad", "offline"];
     if (batcher && !batcher.running) return ["bad", "batcher down"];  // crawls, but stores nothing
     if (n.desired_count === 0) return ["idle", "idle"];
+    if (n.alive_count === 0) return ["bad", "no crawlers"];
+    if (n.last_page_age_s == null || n.last_page_age_s > notScrapingAfter) return ["bad", "not scraping"];
     if (n.alive_count < n.desired_count) return ["warn", "degraded"];
-    return ["ok", "running"];
+    return ["ok", "scraping"];
 }
 
 function scaleControls(n) {
@@ -599,35 +608,44 @@ function renderNodes(nodes) {
     const tbody = document.getElementById("nodes-body");
     // Don't rebuild the table while someone is typing a scale value into it.
     if (tbody.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+    const COLS = "10";
+    const notScrapingAfter = lastLive.not_scraping_after_seconds || 300;
 
     if (!nodes.length) {
-        tbody.replaceChildren(el("tr", {}, el("td", { colspan: "8", class: "muted", text: "No crawler nodes have reported in yet." })));
+        tbody.replaceChildren(el("tr", {}, el("td", { colspan: COLS, class: "muted", text: "No crawler nodes have reported in yet." })));
         setText("node-summary", "");
         return;
     }
 
-    let alive = 0, desired = 0, offline = 0, degraded = 0, batcherDown = 0;
+    const busiest = Math.max(1, ...nodes.map(n => n.pages_per_min || 0));
+    let alive = 0, desired = 0, reporting = 0, scraping = 0, clusterRate = 0;
+    const problems = {};
     const rows = [];
     for (const n of nodes) {
         const allProcs = Array.isArray(n.procs) ? n.procs : [];
         const batcher = allProcs.find(p => p.slot === "batcher");  // only when the node runs one (RUN_BATCHER=1)
         const procs = allProcs.filter(p => p.slot !== "batcher");
-        const [cls, label] = nodeStatus(n, batcher);
-        if (label === "offline") offline++; else { alive += n.alive_count; desired += n.desired_count; }
-        if (label === "batcher down") batcherDown++;
-        if (cls === "warn") degraded++;
+        const [cls, label] = nodeStatus(n, batcher, notScrapingAfter);
+        if (label !== "offline") { reporting++; alive += n.alive_count; desired += n.desired_count; }
+        if (label === "scraping" || label === "degraded") scraping++;
+        if (cls !== "ok" && label !== "idle") problems[label] = (problems[label] || 0) + 1;
+        clusterRate += n.pages_per_min || 0;
         const restarts = procs.reduce((sum, p) => sum + (p.restarts || 0), 0);
         const frac = n.desired_count ? Math.min(1, n.alive_count / n.desired_count) : 0;
+        const rate = n.pages_per_min || 0;
 
         const row = el("tr", { class: "node-row" + (openNodes.has(n.node_id) ? " open" : "") },
             el("td", {}, n.node_id, n.hostname && n.hostname !== n.node_id ? el("span", { class: "muted", text: ` (${n.hostname})` }) : null),
             el("td", {}, el("span", { class: `pill ${cls}` }, el("span", { class: "shape" }), label)),
+            el("td", { class: "num rate" }, el("b", { text: fmtNum(rate) }),
+                el("span", { class: "bar rate-bar" }, el("span", { style: `width:${Math.round(100 * rate / busiest)}%` }))),
+            el("td", { class: "num", text: n.last_page_age_s == null ? "none" : `${fmtDuration(n.last_page_age_s)} ago` }),
             el("td", {}, `${n.alive_count} / ${n.desired_count}`,
                 el("span", { class: "bar" + (frac < 1 ? " warn" : "") }, el("span", { style: `width:${Math.round(frac * 100)}%` }))),
             el("td", { class: "num hide-sm", text: fmtNum(restarts) }),
             el("td", { class: "num hide-sm", text: n.cpu_percent == null ? "–" : `${Math.round(n.cpu_percent)}%` }),
             el("td", { class: "num hide-sm", text: n.mem_percent == null ? "–" : `${Math.round(n.mem_percent)}%` }),
-            el("td", { class: "num", text: `${fmtDuration(n.age_s)} ago` }),
+            el("td", { class: "num hide-sm", text: `${fmtDuration(n.age_s)} ago` }),
             el("td", {}, scaleControls(n)),
         );
         row.addEventListener("click", () => {
@@ -637,46 +655,64 @@ function renderNodes(nodes) {
         rows.push(row);
 
         if (openNodes.has(n.node_id)) {
+            const sub = (first, second, third, restartsText, pidText, note) => el("tr", { class: "crawler-row" },
+                el("td", { text: first }), el("td", {}, second), el("td", { colspan: "3", text: third }),
+                el("td", { class: "num hide-sm", text: restartsText }),
+                el("td", { class: "hide-sm", colspan: "2", text: pidText }),
+                el("td", { colspan: "2", class: "muted", text: note || "" }));
+            if (label === "not scraping") {
+                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: COLS,
+                    text: n.last_page_age_s == null
+                        ? `Its crawlers are running but haven't stored a page in the last ${lastLive.scrape_window_minutes || 10} minutes. Usual causes: the proxy chain is down (see Services), the queue is empty, or the crawlers are erroring (journalctl -u crawler-agent on ${n.node_id}).`
+                        : `Last stored page ${fmtDuration(n.last_page_age_s)} ago. Check the proxy (Services) and journalctl -u crawler-agent on ${n.node_id}.` })));
+            }
             if (batcher) {
-                rows.push(el("tr", { class: "crawler-row" },
-                    el("td", { text: "batcher" }),
-                    el("td", {}, el("span", { class: `pill ${batcher.running ? "ok" : "bad"}` }, el("span", { class: "shape" }), batcher.running ? "writing" : "down")),
-                    el("td", { text: batcher.running ? `up ${fmtDuration(batcher.uptime_s)}` : "restarting" }),
-                    el("td", { class: "num hide-sm", text: fmtNum(batcher.restarts) }),
-                    el("td", { class: "hide-sm", colspan: "2", text: batcher.pid ? `pid ${batcher.pid}` : "" }),
-                    el("td", { colspan: "2", class: "muted", text: "batches this node's database writes" }),
-                ));
+                rows.push(sub("batcher",
+                    el("span", { class: `pill ${batcher.running ? "ok" : "bad"}` }, el("span", { class: "shape" }), batcher.running ? "writing" : "down"),
+                    batcher.running ? `up ${fmtDuration(batcher.uptime_s)}` : "restarting",
+                    fmtNum(batcher.restarts), batcher.pid ? `pid ${batcher.pid}` : "", "batches this node's database writes"));
             }
             if (!procs.length) {
-                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: "8", text: "No crawler containers running." })));
+                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: COLS, text: "No crawler containers running." })));
             }
             for (const p of procs) {
-                rows.push(el("tr", { class: "crawler-row" },
-                    el("td", { text: `slot ${p.slot}` }),
-                    el("td", { text: p.container }),
-                    el("td", { text: `up ${fmtDuration(p.uptime_s)}` }),
-                    el("td", { class: "num hide-sm", text: fmtNum(p.restarts) }),
-                    el("td", { class: "hide-sm", colspan: "2", text: `pid ${p.pid}` }),
-                    el("td", { colspan: "2" }),
-                ));
+                rows.push(sub(`slot ${p.slot}`, p.container, `up ${fmtDuration(p.uptime_s)}`, fmtNum(p.restarts), `pid ${p.pid}`));
             }
             const missing = n.desired_count - procs.length;
-            if (missing > 0 && cls !== "bad") {
-                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: "8",
+            if (missing > 0 && label !== "offline") {
+                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: COLS,
                     text: `${missing} slot${missing === 1 ? "" : "s"} not running (crashed or restarting; see journalctl -u crawler-agent on ${n.node_id})` })));
+            }
+            if (n.ips && n.ips.length) {
+                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: COLS, class: "muted",
+                    text: `Pages are counted from the scraper logs for ${n.ips.join(", ")}.` })));
             }
         }
     }
     tbody.replaceChildren(...rows);
 
+    const othersRate = (lastLive.other_scrapers || []).reduce((sum, o) => sum + (o.pages_per_min || 0), 0);
     const summary = document.getElementById("node-summary");
     summary.replaceChildren(...[
-        el("span", {}, el("b", { text: String(nodes.length - offline) }), ` of ${nodes.length} nodes reporting`),
+        el("span", {}, el("b", { text: `${scraping} / ${nodes.length}` }), " nodes scraping"),
+        el("span", {}, el("b", { text: fmtNum(Math.round(clusterRate)) }), " pages/min from the cluster"),
+        othersRate ? el("span", {}, el("b", { text: fmtNum(Math.round(othersRate)) }), " from other machines") : null,
         el("span", {}, el("b", { text: `${alive} / ${desired}` }), " crawlers running"),
-        degraded ? el("span", {}, el("b", { text: String(degraded) }), " degraded") : null,
-        offline ? el("span", {}, el("b", { text: String(offline) }), " offline") : null,
-        batcherDown ? el("span", {}, el("b", { text: String(batcherDown) }), " batcher down (not storing pages)") : null,
+        ...Object.entries(problems).map(([label, count]) => el("span", { class: "problem" }, el("b", { text: String(count) }), ` ${label}`)),
     ].filter(Boolean));  // replaceChildren would render a null as the text "null"
+}
+
+function renderOthers(others) {
+    const tbody = document.getElementById("others-body");
+    if (!others || !others.length) {
+        tbody.replaceChildren(el("tr", {}, el("td", { colspan: "3", class: "muted", text: "Only the cluster is scraping." })));
+        return;
+    }
+    tbody.replaceChildren(...others.map(o => el("tr", {},
+        el("td", { class: "url", text: o.ip === "unknown" ? "unknown (no IP logged)" : o.ip }),
+        el("td", { class: "num", text: fmtNum(o.pages_per_min) }),
+        el("td", { class: "num", text: `${fmtDuration(o.last_age_s)} ago` }),
+    )));
 }
 
 function setScale(nodeId, input, btn) {
@@ -771,6 +807,7 @@ function pollLive() {
             renderNodes(d.nodes);
             renderSearch(d.search);
             renderQueue(d.queue);
+            renderOthers(d.other_scrapers);
             const banner = document.getElementById("banner");
             const dbError = d.nodes_error || d.queue_error;
             banner.textContent = dbError ? `Couldn't read from Postgres: ${dbError}` : "";
@@ -830,7 +867,6 @@ function renderDashboard(d) {
     setText("m-scrapes-per-minute", fmtNum(d.scrapes_per_minute));
 
     fillRows("last-scraped-body", d.last_10_scraped, [0, 1], { 0: "url" });
-    fillRows("scrapers-body", d.scrapers, ["ip", "urls_scraped", "started_at"], { urls_scraped: "num" });
 
     const labels = d.status_counts.map(s => s.status);
     const values = d.status_counts.map(s => s.count);
