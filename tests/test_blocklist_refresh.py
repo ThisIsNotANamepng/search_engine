@@ -43,6 +43,37 @@ def test_server_down_keeps_using_the_old_copy(server_down):
     assert not utils.check_url_in_blocklist("https://fine-site.com/page")
 
 
+def test_failed_refresh_waits_before_trying_again(server_down, monkeypatch):
+    write_blocklist("blocklist.db", [], age=7200)
+    calls = []
+
+    def refuse(*args, **kwargs):
+        calls.append(1)
+        raise requests.ConnectionError("blocklist server down")
+    monkeypatch.setattr(utils.requests, "get", refuse)
+    for _ in range(3):
+        utils.check_url_in_blocklist("https://fine-site.com/page")
+    assert len(calls) == 1
+
+
+def test_stale_updater_doesnt_cause_a_download_per_url(server_down, monkeypatch, tmp_path):
+    # update_local_blocklist.py stopped running: the served copy's own last_updated is 2 hours old
+    write_blocklist(tmp_path / "served.db", [], age=7200)
+    served = (tmp_path / "served.db").read_bytes()
+    calls = []
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *exc): pass
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size): yield served
+
+    monkeypatch.setattr(utils.requests, "get", lambda *a, **k: calls.append(1) or Response())
+    for _ in range(3):
+        utils.check_url_in_blocklist("https://fine-site.com/page")
+    assert len(calls) == 1
+
+
 def test_server_down_without_any_copy_raises(server_down):
     # Scraping without a blocklist isn't allowed: scrape.py must see the error and retry the url later
     with pytest.raises(requests.ConnectionError):

@@ -1193,25 +1193,18 @@ def claim_domain(domain, redis_client):
 
 def _refresh_blocklist_if_stale():
     """
-    If the local blocklist.db is missing or its last_updated row is older
-    than an hour, re-download it from db01 (port 8002/blocklist.db)
+    If the local blocklist.db is missing or was downloaded more than an hour
+    ago, re-download it from db01 (port 8002/blocklist.db)
+
+    The age is the local file's, not its last_updated row: if update_local_blocklist.py
+    stops running, a fresh download would still look stale and be fetched again for every url
     """
 
-    needs_refresh = True
-    if os.path.exists("blocklist.db"):
-        try:
-            conn = sqlite3.connect("blocklist.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT last_updated FROM last_updated LIMIT 1")
-            row = cursor.fetchone()
-            conn.close()
-            if row is not None:
-                needs_refresh = (time.time() - float(row[0])) > 3600
-        except (sqlite3.Error, ValueError, TypeError):
-            needs_refresh = True
-
-    if not needs_refresh:
-        return
+    try:
+        if time.time() - os.path.getmtime("blocklist.db") < 3600:
+            return
+    except OSError:
+        pass  # no copy yet
 
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
@@ -1235,6 +1228,7 @@ def _refresh_blocklist_if_stale():
         if not os.path.exists("blocklist.db"):
             raise  # no copy at all: scraping unchecked isn't allowed, scrape.py retries the url later
         failure_print(f"Could not refresh blocklist, using the old copy: {e!r}")
+        os.utime("blocklist.db", (time.time() - 3300,) * 2)  # try again in 5 minutes, not on every url
         return
     os.replace(tmp_path, "blocklist.db")
 
