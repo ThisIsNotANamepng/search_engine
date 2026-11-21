@@ -1101,6 +1101,7 @@ def finish_claims(done=(), release=()):
     cur.close()
     conn.close()
 
+@functools.cache  # a DNS lookup, and it doesn't change while the scraper runs; log_db() calls this for every log
 def get_host_ip():
     """Return the host machine IP address. Try local hostname first, then fallback to external lookup."""
     try:
