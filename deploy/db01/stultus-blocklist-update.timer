@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the Stultus blocklist every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

@@ -42,7 +42,7 @@ def delete_bench_pages():
     conn = utils.get_conn()
     cur = conn.cursor()
     ids = f"(SELECT id FROM urls WHERE url LIKE '{BENCH_URL}%')"
-    for table in ("word_urls", "bigram_urls", "trigram_urls", "prefix_urls", "url_token_counts"):
+    for table in ("word_urls", "bigram_urls", "trigram_urls", "prefix_urls"):
         cur.execute(f"DELETE FROM {table} WHERE url_id IN {ids};")
     cur.execute(f"DELETE FROM urls_references WHERE url LIKE '{BENCH_URL}%';")
     cur.execute(f"DELETE FROM urls WHERE url LIKE '{BENCH_URL}%';")

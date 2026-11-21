@@ -27,7 +27,7 @@ def db(monkeypatch):
     utils.create_database()
     conn = utils.get_conn()
     cur = conn.cursor()
-    cur.execute("TRUNCATE urls, url_token_counts, words, prefixes, " + ", ".join(POSTING_TABLES) + " CASCADE;")
+    cur.execute("TRUNCATE urls, words, prefixes, " + ", ".join(POSTING_TABLES) + " CASCADE;")
     conn.commit()
     conn.close()
     return utils

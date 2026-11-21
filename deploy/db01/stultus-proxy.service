@@ -1,0 +1,17 @@
+# Forward proxy the crawlers fetch through (SCRAPER_PROXY=http://db01:8888).
+# Build the binary first: see install.sh.
+[Unit]
+Description=Stultus forward proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+EnvironmentFile=/etc/stultus/proxy.env
+ExecStart=/usr/local/bin/stultus-proxy
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

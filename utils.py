@@ -262,15 +262,6 @@ def create_database():
         PRIMARY KEY (url, referenced_domain)
     );
                 
-    CREATE TABLE IF NOT EXISTS url_token_counts (
-        url_id INT PRIMARY KEY REFERENCES urls(id),
-        word_count INT NOT NULL DEFAULT 1,
-        bigram_count INT NOT NULL DEFAULT 0,
-        trigram_count INT NOT NULL DEFAULT 0,
-        prefix_count INT NOT NULL DEFAULT 0
-    );
-                
-
     -- BIGSERIAL: every url ever queued takes a new id and ids are never reused, so INT runs out. Older databases get it from widen_url_queue_id.py
     CREATE TABLE IF NOT EXISTS url_queue (
         id BIGSERIAL PRIMARY KEY,
@@ -833,8 +824,6 @@ def store(content, url):
     trigram_counts = tokens[2]
     prefix_counts = {p: n for p, n in tokens[3].items() if 0 < len(p) <= MAX_TOKEN_LENGTH}
 
-    # word_list keeps repeats so url_token_counts.word_count is the same as before
-    word_list = [w for w, n in word_counts.items() for _ in range(n)]
     words = set(word_counts)
     bigrams = set(bigram_counts)
     trigrams = set(trigram_counts)
@@ -872,23 +861,6 @@ def store(content, url):
         for table in ("word_urls", "bigram_urls", "trigram_urls", "prefix_urls"):
             cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = %s;").format(sql.Identifier(table)), (url_id,))
 
-
-    cur.execute("""
-        INSERT INTO url_token_counts (url_id, word_count, bigram_count, trigram_count, prefix_count)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (url_id)
-        DO UPDATE SET
-            word_count = EXCLUDED.word_count,
-            bigram_count = EXCLUDED.bigram_count,
-            trigram_count = EXCLUDED.trigram_count,
-            prefix_count = EXCLUDED.prefix_count;
-    """, (
-        url_id,
-        len(word_list),
-        len(bigrams),
-        len(trigrams),
-        len(prefixes)
-    ))
     
     # Bulk insert new words/prefixes (bigrams/trigrams are pre-populated).
     # Only rows that don't exist yet: postgres burns an id for every attempted row even when ON CONFLICT skips it, which overflows the INT ids.

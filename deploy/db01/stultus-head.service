@@ -1,0 +1,20 @@
+# Head server: dashboard, search frontend and the node agents' heartbeat endpoint
+# (HEAD_URL=http://db01:8000 on the workers).
+[Unit]
+Description=Stultus head (dashboard + search + agent heartbeats)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@REPO@/frontend
+EnvironmentFile=/etc/stultus/head.env
+# One worker, many threads: app.py refreshes the heavy dashboard stats in a background
+# thread per process, so extra processes would just repeat those slow queries.
+# "python -m gunicorn" rather than a gunicorn script: SELinux blocks systemd from executing scripts under /home.
+ExecStart=@PYTHON@ -m gunicorn --workers 1 --threads 16 --timeout 120 --bind 0.0.0.0:8000 app:app
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
