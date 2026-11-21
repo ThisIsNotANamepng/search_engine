@@ -16,17 +16,20 @@ commits batches of pages. No schema changes: all writes are the row writes utils
 
 import argparse
 import asyncio
+import functools
 import ipaddress
 import json
 import math
 import os
+import queue
 import random
 import signal
 import socket
 import sys
+import threading
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -67,7 +70,7 @@ def parse_args(argv=None):
     src.add_argument("-f", "--file", help="crawl the urls in this file, one per line (not from the queue)")
     src.add_argument("--seed-file", help="enqueue these urls (one per line, or first CSV column) at startup and crawl them first")
     src.add_argument("--nodb", "--dry-run", dest="nodb", action="store_true", help="no postgres/redis: everything except the writes (needs -u, -f or --seed-file)")
-    src.add_argument("--follow", action="store_true", help="--nodb only: also crawl links found (in memory); with a database links always go to url_queue")
+    src.add_argument("--follow", action="store_true", help="also crawl links found, from an in-memory frontier (with --nodb, or with -f/-u against a database; combine with --no-enqueue to keep this crawl off the shared url_queue)")
     src.add_argument("--no-enqueue", action="store_true", help="don't add discovered links to the queue (use for tiny test runs against a real db)")
     lim = p.add_argument_group("limits")
     lim.add_argument("--max-pages", type=int, default=0, help="stop after starting this many pages (0 = no limit)")
@@ -89,6 +92,7 @@ def parse_args(argv=None):
     misc = p.add_argument_group("misc")
     misc.add_argument("--blocklist", default="blocklist.db", help="local blocklist sqlite file (default ./blocklist.db; skipped if missing)")
     misc.add_argument("--claim-batch", type=int, default=200, help="urls claimed from url_queue at a time (default 200)")
+    misc.add_argument("--db-watchdog", type=float, default=120.0, help="abort (and retry) a database flush running longer than this many seconds, and complain when no flush completed for this long while work waits (default 120)")
     misc.add_argument("--parse-timeout", type=int, default=60, help="seconds before a page's parse is abandoned (default 60)")
     misc.add_argument("--dump", help="write one JSON line per page (url, title, lang, status, text length, link count) to this file")
     misc.add_argument("--verbose", "-v", action="store_true", help="print every log message")
@@ -98,8 +102,8 @@ def parse_args(argv=None):
         p.error("Cannot use both --file and --url")
     if args.nodb and not (args.url or args.file or args.seed_file):
         p.error("--nodb needs --url, --file or --seed-file")
-    if args.follow and not args.nodb:
-        p.error("--follow is for --nodb; with a database discovered links are queued automatically (see --no-enqueue)")
+    if args.follow and not args.nodb and not (args.url or args.file):
+        p.error("--follow with a database needs -u or -f (queue mode already follows links through url_queue)")
     return args
 
 
@@ -111,6 +115,16 @@ def read_url_file(path):
             if line and not line.startswith("#"):
                 urls.append(line)
     return urls
+
+
+def apply_session_env():
+    """Connections made through utils.get_conn() (create_database check, queue_has_claims) get the same safety timeouts and name
+    as ours, through libpq's environment variables (explicit values in the environment win)"""
+    from crawl_lib.db import SESSION_OPTIONS
+    current = os.environ.get("PGOPTIONS", "")
+    if "lock_timeout" not in current:
+        os.environ["PGOPTIONS"] = (current + " " + SESSION_OPTIONS).strip()
+    os.environ.setdefault("PGAPPNAME", "fast_crawl")
 
 
 def rss_mb(pid):
@@ -148,27 +162,70 @@ class NullWriter:
     async def flush_now(self):
         pass
 
-    async def stop(self):
+    async def stop(self, timeout=None):
         pass
 
     def pending(self):
         return 0
 
 
+class DaemonExecutor(Executor):
+    """A single daemon worker thread. Unlike ThreadPoolExecutor a hung thread can be abandoned (replace the executor) and never blocks exit"""
+
+    def __init__(self, name):
+        self._q = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._work, name=name, daemon=True)
+        self._thread.start()
+
+    def _work(self):
+        while True:
+            job = self._q.get()
+            if job is None:
+                return
+            fut, fn = job
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn())
+            except BaseException as e:
+                fut.set_exception(e)
+
+    def submit(self, fn, *args, **kwargs):
+        fut = Future()
+        self._q.put((fut, functools.partial(fn, *args, **kwargs)))
+        return fut
+
+    def shutdown(self, wait=True, **kwargs):
+        self._q.put(None)
+
+
+def _swallow(fut):
+    if not fut.cancelled():
+        fut.exception()  # an abandoned (watchdog-timed-out) write finishing later is not an unretrieved-exception warning
+
+
 class AsyncWriter:
-    """Collects items from the fetch tasks and commits them in batches from one thread"""
+    """Collects items from the fetch tasks and commits them in batches from one thread.
+    Watchdog: a flush that runs longer than db_watchdog seconds is aborted (connection torn down, the server rolls back and drops its
+    locks) and retried; if the writer thread does not come back either it is abandoned and a new thread + connection take over"""
 
     MAX_BUFFER = 400
+    ABORT_GRACE = 15
 
     def __init__(self, crawler, db):
         self.c = crawler
         self.db = db
         self.items = []
-        self.exec = ThreadPoolExecutor(1, thread_name_prefix="db-writer")
+        self.exec = DaemonExecutor("db-writer")
         self.last_flush = time.monotonic()
+        self.last_ok = time.monotonic()      # last time a flush completed (or nothing was waiting to be flushed)
+        self.flush_started = None
         self.stopping = False
+        self.deadline = None                  # monotonic: give up flushing at shutdown
+        self.flush_timeout = getattr(crawler.args, "db_watchdog", 120.0)
         self.flush_lock = asyncio.Lock()
         self.stats = Counter()
+        self.consecutive_aborts = 0
 
     def submit(self, item):
         self.items.append(item)
@@ -184,15 +241,60 @@ class AsyncWriter:
         a = self.c.args
         while not self.stopping:
             await asyncio.sleep(0.2)
+            if not self.items and self.flush_started is None:
+                self.last_ok = time.monotonic()
             pages = sum(len(i.get("pages", ())) for i in self.items)
             if self.items and (pages >= a.batch_pages or time.monotonic() - self.last_flush >= a.flush_interval):
                 await self.flush_now()
 
+    def abort_flush(self):
+        """Tear the writer's connection down (safe from the event loop thread: never blocks)"""
+        self.stats["watchdog_aborts"] += 1
+        self.db.abort()
+
+    def replace_thread(self):
+        """The writer thread did not return after abort: abandon it, continue with a fresh thread and connection"""
+        from crawl_lib.db import DbWriter
+        old = self.db
+        self.exec.shutdown(wait=False)
+        self.exec = DaemonExecutor("db-writer")
+        new = DbWriter(old.dsn)
+        new.maps, new.claims = old.maps, old.claims
+        self.db = self.c.db = new
+        self.stats["writer_replaced"] += 1
+        self.c.hung = True
+
+    async def _write(self, batch):
+        """db.write on the writer thread, with the watchdog. Raises FlushAborted when the watchdog had to abort it"""
+        from crawl_lib.db import FlushAborted
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(self.exec, self.db.write, batch)
+        fut.add_done_callback(_swallow)
+        self.flush_started = t0 = time.monotonic()
+        try:
+            timeout = self.flush_timeout
+            if self.deadline is not None:
+                timeout = max(0.5, min(timeout, self.deadline - time.monotonic()))
+            done, _ = await asyncio.wait({fut}, timeout=timeout)
+            if not done:
+                self.c.note(f"WATCHDOG: a database flush has been running for {time.monotonic() - t0:.0f}s (limit {timeout:.0f}s): "
+                            f"aborting it (connection closed, the server rolls the transaction back)")
+                self.abort_flush()
+                done, _ = await asyncio.wait({fut}, timeout=min(self.ABORT_GRACE, max(1.0, timeout)))
+                if not done:
+                    self.c.note("WATCHDOG: the writer thread is still stuck after the abort: abandoning it, new thread and connection")
+                    self.replace_thread()
+                raise FlushAborted(f"flush exceeded {timeout:.0f}s")
+            return fut.result()
+        finally:
+            self.flush_started = None
+
     async def flush_now(self):
-        from crawl_lib.db import Batch
+        from crawl_lib.db import Batch, FlushAborted
         async with self.flush_lock:
-            loop = asyncio.get_running_loop()
             while self.items:
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    break
                 # at most batch_pages pages per transaction, everything else (logs, seen, enqueue) rides along
                 taken, pages = [], 0
                 while self.items and pages < max(1, self.c.args.batch_pages):
@@ -204,34 +306,45 @@ class AsyncWriter:
                     batch.add_item(item)
                 t0 = time.monotonic()
                 try:
-                    stats = await loop.run_in_executor(self.exec, self.db.write, batch)
+                    stats = await self._write(batch)
                     self.stats["flushes"] += 1
                     self.stats["rows"] += stats.get("rows", 0)
                     self.stats["write_seconds"] += time.monotonic() - t0
+                    self.consecutive_aborts = 0
                     self._committed(taken)
+                except FlushAborted as e:
+                    self.consecutive_aborts += 1
+                    print(f"DB batch of {len(taken)} items aborted by the watchdog ({e!r}); attempt {self.consecutive_aborts}", file=sys.stderr, flush=True)
+                    if self.consecutive_aborts < 3:
+                        self.items[:0] = taken  # retry the same batch on a fresh connection
+                        await asyncio.sleep(1.0)
+                    else:
+                        self.consecutive_aborts = 0
+                        for item in taken:
+                            await self._write_single(item)
                 except Exception as e:
-                    print(f"DB batch of {len(taken)} items failed ({e!r}), retrying one by one", file=sys.stderr)
+                    print(f"DB batch of {len(taken)} items failed ({e!r}), retrying one by one", file=sys.stderr, flush=True)
                     for item in taken:
-                        await self._write_single(loop, item)
-                self.last_flush = time.monotonic()
+                        await self._write_single(item)
+                self.last_flush = self.last_ok = time.monotonic()
 
-    async def _write_single(self, loop, item):
+    async def _write_single(self, item):
         from crawl_lib.db import Batch
         batch = Batch()
         batch.add_item(item)
         try:
-            await loop.run_in_executor(self.exec, self.db.write, batch)
+            await self._write(batch)
             self._committed([item])
         except Exception as e:
             self.c.stats["db_errors"] += 1
-            print(f"DB write failed for {item.get('refs_from') or item.get('done')}: {e!r}", file=sys.stderr)
+            print(f"DB write failed for {item.get('refs_from') or item.get('done')}: {e!r}", file=sys.stderr, flush=True)
             # a page that can't be stored must not come back forever: log it and finish its claim
             rescue = Batch()
             urls = list(item.get("done", ()))
             rescue.done.update(urls)
             rescue.logs.append(f"Error Unhandled exception {e!r} {(urls or ['?'])[0]}")
             try:
-                await loop.run_in_executor(self.exec, self.db.write, rescue)
+                await self._write(rescue)
                 self._committed([{"done": urls}])
             except Exception:
                 pass  # claim stays: it's handed back when we exit, or times out
@@ -241,10 +354,17 @@ class AsyncWriter:
             for u in item.get("done", ()):
                 self.c.claimed_open.discard(u)
 
-    async def stop(self):
+    async def stop(self, timeout=None):
+        """Final flush. timeout: give up (leaving the rest unflushed: its claims are handed back) after this many seconds"""
         self.stopping = True
-        await self.flush_now()
-        self.exec.shutdown(wait=True)
+        if timeout is not None:
+            self.deadline = time.monotonic() + timeout
+        try:
+            await asyncio.wait_for(self.flush_now(), timeout + 2 if timeout is not None else None)
+        except asyncio.TimeoutError:
+            self.c.hung = True
+            self.c.note("WARNING: final flush did not finish in time; unflushed work is handed back")
+        self.exec.shutdown(wait=False)
 
 
 class Crawler:
@@ -268,7 +388,9 @@ class Crawler:
         self.t_start = time.monotonic()
         self.wake = asyncio.Event()
         self.db_mode = not args.nodb
-        self.db = None
+        self.db = None                 # DbWriter: the writer thread's connection, nothing else may touch it
+        self.queue = None              # QueueDb: its own connection for seeds, claims, hand-backs, the progress estimate
+        self.seed_pending = []         # seeds enqueued but not claimed yet: claimed claim_batch at a time
         self.writer = None
         self.redis = None
         self.blocklist = None
@@ -278,6 +400,7 @@ class Crawler:
         self.session = None
         self.robots = None
         self.queue_empty = False       # last claim returned nothing
+        self.hung = False              # a database thread was abandoned (watchdog): the process must not wait for it at exit
         self.dump = open(args.dump, "w", encoding="utf-8") if args.dump else None
         self.web_text_server = os.getenv("WEB_TEXT_STORAGE_SERVER_ADDRESS")
         self.proxy = utils.SCRAPER_PROXY
@@ -316,11 +439,13 @@ class Crawler:
 
         # database
         if self.db_mode:
-            from crawl_lib.db import DbWriter
+            from crawl_lib.db import DbWriter, QueueDb
             utils.NODB = False
+            apply_session_env()
             await asyncio.to_thread(utils.create_database)  # read-only check unless STULTUS_ALLOW_DDL=1
             self.db = DbWriter()
             await asyncio.to_thread(self.db.connect)
+            self.queue = QueueDb(claims=self.db.claims)
             self.note(f"queue protocol: {'claims (claimed_at)' if self.db.claims else 'claimless (pop = DELETE, unfinished urls re-inserted, explicit ids)'}")
             self.writer = AsyncWriter(self, self.db)
             await self.init_redis()
@@ -368,7 +493,10 @@ class Crawler:
 
     async def close(self):
         if self.session is not None:
-            await self.session.close()
+            try:
+                await asyncio.wait_for(self.session.close(), 3)
+            except Exception:
+                pass
         if self.redis is not None:
             try:
                 await self.redis.aclose()
@@ -538,21 +666,52 @@ class Crawler:
         self.accepted[self.frontier.state(url).key] += 1
         return True
 
+    async def queue_call(self, fn, *args, timeout=90, queue=None):
+        """A url_queue call on its own connection, off the event loop, bounded: when it hangs its connection is torn down (the server rolls it back)"""
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout)
+        except asyncio.TimeoutError:
+            self.hung = True
+            self.note(f"WATCHDOG: url_queue call {getattr(fn, '__name__', fn)} took over {timeout:.0f}s: aborting its connection")
+            (queue or self.queue).abort()
+            raise
+
+    async def claim_some(self):
+        """Next urls for the frontier, at most about claim_batch of them: seeds first (a chunk of the seed list at a time), then the queue.
+        Returns None when only seeds were looked at and none were left to claim (call again at once)"""
+        a = self.args
+        low_water = max(a.fetchers * 2, a.claim_batch // 2)
+        size = max(min(a.claim_batch, 50), max(a.claim_batch, low_water + 1) - self.frontier.queued)  # the frontier never holds much more than claim_batch popped urls
+        size = min(size, a.claim_batch)
+        if self.seed_pending:
+            chunk, self.seed_pending = self.seed_pending[:size], self.seed_pending[size:]
+            urls = await self.queue_call(self.queue.claim_urls, chunk)
+            self.stats["seeds_claimed"] += len(urls)
+            return urls or None
+        if self.not_queue_sourced:
+            return []
+        return await self.queue_call(self.queue.claim, size)
+
     async def loader(self):
-        """Keep the frontier stocked from url_queue (claim protocol: utils.get_next_urls / finish_claims semantics)"""
+        """Keep the frontier stocked from url_queue (claim protocol: utils.get_next_urls / finish_claims semantics), a bounded number of urls at a time"""
         a = self.args
         low_water = max(a.fetchers * 2, a.claim_batch // 2)
         while not self.stop_requested:
             if a.max_pages and self.started >= a.max_pages:
                 return
             if self.frontier.queued < low_water:
+                if self.not_queue_sourced and not self.seed_pending:
+                    return  # -u / -f with --seed-file: only the seeds come from the queue
                 try:
-                    urls = await asyncio.to_thread(self.utils.get_next_urls, a.claim_batch)
+                    urls = await self.claim_some()
                 except Exception as e:
-                    print(f"claiming urls failed: {e!r}", file=sys.stderr)
+                    print(f"claiming urls failed: {e!r}", file=sys.stderr, flush=True)
                     await asyncio.sleep(3)
                     continue
-                self.queue_empty = not urls
+                if urls is None:
+                    continue
+                if not self.seed_pending:
+                    self.queue_empty = not urls
                 if self.stop_requested:
                     self.claimed_open.update(urls)  # claimed while shutting down: handed straight back
                     return
@@ -591,10 +750,9 @@ class Crawler:
         """Discovered links: db mode -> url_queue (in the writer's transaction); --nodb --follow -> straight into the frontier"""
         if not urls:
             return
-        if self.db_mode:
-            if not self.args.no_enqueue:
-                item["enqueue"] = list(item.get("enqueue", ())) + urls
-        elif self.args.follow:
+        if self.db_mode and not self.args.no_enqueue:
+            item["enqueue"] = list(item.get("enqueue", ())) + urls
+        if self.args.follow:
             for u in urls:
                 if u not in self.seen_mem:
                     self.seen_mem.add(u)
@@ -821,9 +979,20 @@ class Crawler:
             last_t, last_n = now, done
             parent, kids = self.rss_line()
             dbq = ""
-            if self.db_mode and self.db is not None:
-                est = await asyncio.to_thread(self.db.queue_estimate)
-                dbq = f" dbq~{est}"
+            if self.db_mode and self.queue is not None:
+                # the queue estimate is a courtesy: a short bound and its own connection, the progress line never waits for the database
+                try:
+                    est = await asyncio.wait_for(asyncio.to_thread(self.queue.queue_estimate), 3)
+                except Exception:
+                    est = None
+                dbq = f" dbq~{'?' if est is None else est}"
+            if self.db_mode and self.writer is not None:
+                age = now - self.writer.last_ok
+                if age > a.db_watchdog and (self.writer.pending() or self.writer.flush_started is not None):
+                    self.note(f"WATCHDOG: no database flush completed for {age:.0f}s with {self.writer.pending()} items waiting: aborting the writer's connection")
+                    self.writer.abort_flush()
+                    self.writer.last_ok = now  # complain again after another full interval
+                dbq += f" lastflush={now - self.writer.last_ok:.0f}s"
             skipped = s["skipped_not_scrapable"] + s["robots_blocked"] + s["blocked"] + s["redirected"]
             self.note(f"[{elapsed:5.0f}s] done={done} stored={s['indexed']} parsed={s['pages']} skipped={skipped} err={s['errors']} | "
                       f"{rate_now:.0f}/min now, {done / max(elapsed, 1) * 60:.0f}/min avg | active={len(self.active)} frontier={self.frontier.queued} "
@@ -854,18 +1023,19 @@ class Crawler:
                     self.add_url(u, claimed=False)
         if seeds:
             if self.db_mode:
-                n, claimed = await asyncio.to_thread(self.db.enqueue_and_claim, seeds)
-                self.note(f"seeds: {len(seeds)} given, {n} newly queued, {len(claimed)} claimed to crawl first ({len(seeds) - n} already stored or queued)")
-                for u in claimed:
-                    self.add_url(u, claimed=True)
+                # all seeds go into url_queue (one explicit-id insert per 2000), but only claim_batch at a time are popped into memory:
+                # a hard kill loses the popped urls only, the rest of the seeds are still queued
+                n = await self.queue_call(self.queue.enqueue, seeds, timeout=300)
+                self.seed_pending = list(dict.fromkeys(seeds))
+                self.note(f"seeds: {len(seeds)} given, {n} newly queued ({len(seeds) - n} already stored or queued); claiming them first, {a.claim_batch} at a time")
             else:
                 for u in seeds:
                     self.seen_mem.add(u)
                     self.add_url(u, claimed=False)
-        if self.db_mode and not self.not_queue_sourced:
+        if self.db_mode and (not self.not_queue_sourced or self.seed_pending):
             loader_task = asyncio.create_task(self.loader())
         self.note(f"crawling: fetchers={a.fetchers} parsers={a.parsers} per-host cap={a.max_pages_per_host} min-delay={a.min_delay}s "
-                  f"mode={'nodb' if a.nodb else 'database'} initial urls={self.frontier.queued}")
+                  f"mode={'nodb' if a.nodb else 'database'} initial urls={self.frontier.queued} seeds waiting={len(self.seed_pending)}")
 
         # ---- dispatch loop
         idle_since = None
@@ -895,7 +1065,7 @@ class Crawler:
 
             # nothing left anywhere?
             if not self.active and self.frontier.queued == 0 and self.frontier.next_wakeup() is None and self.writer.pending() == 0:
-                if loader_task is None or (a.exit_when_empty and self.queue_empty):
+                if loader_task is None or loader_task.done() or (a.exit_when_empty and self.queue_empty):
                     if idle_since is None:
                         idle_since = time.monotonic()
                     if time.monotonic() - idle_since > 1.0:
@@ -912,34 +1082,63 @@ class Crawler:
             except asyncio.TimeoutError:
                 pass
 
-        # ---- shutdown: let in-flight pages finish (they're mid-parse), then flush and hand back claims
+        # ---- shutdown: let in-flight pages finish (they're mid-parse), then flush and hand back claims. Every wait is bounded; after a
+        # SIGINT/SIGTERM the whole thing takes ~20 s at most even with a dead database (a hard-exit timer backs that up)
+        urgent = self.stop_reason in ("SIGINT", "SIGTERM")
+        if urgent:
+            hard_exit = threading.Timer(22.0, self.hard_exit)
+            hard_exit.daemon = True
+            hard_exit.start()
+        t_stop = time.monotonic()
+        stage = (lambda name: self.note(f"shutdown +{time.monotonic() - t_stop:.1f}s: {name}")) if urgent else (lambda name: None)
         if self.active:
-            grace = 25 if self.stop_reason in ("SIGINT", "SIGTERM") else 120
+            grace = 5 if urgent else 120
             done, pending = await asyncio.wait(set(self.active), timeout=grace)
             for t in pending:
                 t.cancel()
             if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+                await asyncio.wait(pending, timeout=1)
+        stage('in-flight pages done')
         if loader_task:
             loader_task.cancel()
-            await asyncio.gather(loader_task, return_exceptions=True)
+            await asyncio.wait({loader_task}, timeout=1)
+        stage('loader stopped')
         progress_task.cancel()
-        await asyncio.gather(progress_task, return_exceptions=True)
+        await asyncio.wait({progress_task}, timeout=1)
+        stage('progress stopped')
         for u in self.frontier.drain_dropped():
             if u in self.claimed_open:
                 self.writer.submit({"done": [u]})
         self.writer.submit({"logs": ["Finished scraping"]})
-        await self.writer.stop()
+        await self.writer.stop(timeout=4 if urgent else 120)
+        stage('final flush over')
         if self.db_mode:
-            await self.release_claims()
+            await self.release_claims(timeout=4 if urgent else 60)
+        stage('claims released')
         writer_task.cancel()
-        await asyncio.gather(writer_task, return_exceptions=True)
-        await asyncio.to_thread(self.pool.shutdown, True)
+        await asyncio.wait({writer_task}, timeout=1)
+        stage('writer stopped')
+        self.stop_pool()
         self.report()
 
-    async def release_claims(self):
+    def hard_exit(self):
+        print("WATCHDOG: shutdown did not finish in time: exiting now (unfinished claims time out / were not handed back)", file=sys.stderr, flush=True)
+        os._exit(1)
+
+    def stop_pool(self):
+        """Don't wait for parser processes (one may be stuck in a parse): ask them to stop, then end whatever is left"""
+        try:
+            procs = list((getattr(self.pool, "_processes", None) or {}).values())
+            self.pool.shutdown(wait=False, cancel_futures=True)
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+        except Exception:
+            pass
+
+    async def release_claims(self, timeout=60):
         """Hand back every claim we still hold (queued but never started, or cut off mid-flight); rate-limited ones stay claimed on purpose"""
-        if self.not_queue_sourced:
+        if self.not_queue_sourced and not self.stats["seeds_claimed"]:
             return
         if self.db is not None and not self.db.claims:
             # claimless queue (no claimed_at): popped urls are gone from it, so everything unfinished, rate-limited ones too, goes back in
@@ -949,7 +1148,12 @@ class Crawler:
         if not release:
             return
         try:
-            await asyncio.to_thread(self.utils.finish_claims, (), release)
+            from crawl_lib.db import QueueDb
+            fresh = QueueDb(claims=self.db.claims if self.db is not None else None)  # its own connection: the shared one may be stuck in a hung call
+            try:
+                await self.queue_call(fresh.release, release, timeout=timeout, queue=fresh)
+            finally:
+                fresh.close()
             self.note(f"released {len(release)} unfinished claims back to url_queue")
         except Exception as e:
             print(f"could not hand back {len(release)} claims (they time out in {self.utils.CLAIM_TIMEOUT}): {e!r}", file=sys.stderr)
@@ -985,6 +1189,11 @@ async def amain(args):
         await crawler.run()
     finally:
         await crawler.close()
+        if crawler.db_mode and (crawler.hung or crawler.stop_reason in ("SIGINT", "SIGTERM")):
+            # a database call may still be blocked in a worker thread: asyncio.run() would wait for it at exit. Everything is flushed/handed back by now
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
 
 def main(argv=None):
@@ -995,3 +1204,6 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)  # abandoned (watchdog-timed-out) database threads must not keep the process alive

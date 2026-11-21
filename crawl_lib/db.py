@@ -13,6 +13,7 @@ import io
 import os
 import random
 import socket
+import threading
 import time
 from collections import Counter
 
@@ -210,7 +211,11 @@ def flush(conn, maps, batch, ip, claims=True):
     return stats
 
 
+_SEQUENCE_EXHAUSTED = False  # url_queue_id_seq at its limit (seen once, then not tried again)
+
+
 def enqueue_new(cur, urls, claims=True):
+    global _SEQUENCE_EXHAUSTED
     """
     Queue the urls that are neither stored nor already queued (filter_new_urls + enqueue_urls in one statement).
     The filter is in the SELECT so skipped urls don't burn sequence ids.
@@ -233,31 +238,86 @@ def enqueue_new(cur, urls, claims=True):
                 cur.execute("ROLLBACK TO SAVEPOINT enq;")
                 time.sleep(0.05 * (attempt + 1) + random.random() * 0.1)
         raise RuntimeError("enqueue kept colliding with concurrent writers")
-    cur.execute("""
-        INSERT INTO url_queue (url)
-        SELECT u FROM unnest(%s::varchar[]) AS u
-        WHERE NOT EXISTS (SELECT 1 FROM urls WHERE urls.url = u)
-          AND NOT EXISTS (SELECT 1 FROM url_queue WHERE url_queue.url = u)
-        ORDER BY u
-        ON CONFLICT (url) DO NOTHING;""", (urls,))
-    return cur.rowcount
+    if not _SEQUENCE_EXHAUSTED:
+        cur.execute("SAVEPOINT enq_default;")
+        try:
+            cur.execute("""
+                INSERT INTO url_queue (url)
+                SELECT u FROM unnest(%s::varchar[]) AS u
+                WHERE NOT EXISTS (SELECT 1 FROM urls WHERE urls.url = u)
+                  AND NOT EXISTS (SELECT 1 FROM url_queue WHERE url_queue.url = u)
+                ORDER BY u
+                ON CONFLICT (url) DO NOTHING;""", (urls,))
+            n = cur.rowcount
+            cur.execute("RELEASE SAVEPOINT enq_default;")
+            return n
+        except psycopg2.errors.SequenceGeneratorLimitExceeded:
+            # the production url_queue has claimed_at (added by other scrapers) but its id sequence hit the INT limit: explicit ids from now on
+            cur.execute("ROLLBACK TO SAVEPOINT enq_default;")
+            _SEQUENCE_EXHAUSTED = True
+    return enqueue_new(cur, urls, claims=False)
+
+
+SESSION_OPTIONS = "-c lock_timeout=15s -c idle_in_transaction_session_timeout=60s -c statement_timeout=300s"
+
+# errors that mean "the server gave up on this transaction, nothing is wrong with the batch": roll back, wait, retry
+RETRYABLE = (psycopg2.errors.DeadlockDetected, psycopg2.errors.SerializationFailure, psycopg2.errors.UniqueViolation,
+             psycopg2.errors.LockNotAvailable, psycopg2.errors.QueryCanceled)
+
+
+class FlushAborted(Exception):
+    """The watchdog aborted this flush (connection torn down so the server rolled the transaction back)"""
+
+
+def connect(dsn, statement_timeout=None):
+    """Every crawler connection: named, bounded waits on locks / idle transactions / statements, TCP keepalives.
+    A bug (or a hung thread) can then never hold row locks for minutes or queue other sessions' DDL behind them"""
+    options = SESSION_OPTIONS
+    if statement_timeout:
+        options = options.replace("statement_timeout=300s", f"statement_timeout={statement_timeout}")
+    return psycopg2.connect(dsn, application_name="fast_crawl", options=options, connect_timeout=15,
+                            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+
+
+def hard_close(fd):
+    """Break a connection that another thread is blocked on: shutdown() on a dup of its socket makes that thread's read fail
+    (psycopg2 holds a per-connection lock during a query, so conn.close() from here would just block) and the server rolls back"""
+    if fd is None:
+        return
+    try:
+        s = socket.socket(fileno=os.dup(fd))
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        finally:
+            s.close()
+    except Exception:
+        pass
 
 
 class DbWriter:
-    """Owns one connection. All methods are blocking: call from a single dedicated thread"""
+    """
+    Owns one connection and may only be used from ONE thread at a time (the db-writer thread). Concurrent use (the cause of a production
+    hang: a progress query ran, then rolled back, in the middle of a flush's transaction) raises RuntimeError instead of corrupting it.
+    Everything else (claims, queue estimate, seeds) goes through QueueDb, which has its own connection. abort() is the one method
+    that is safe to call from any thread.
+    """
 
     def __init__(self, dsn=None):
         self.dsn = dsn or os.getenv("DATABASE_URL")
         self.conn = None
+        self.fd = None
         self.maps = None
         self.ip = utils.get_host_ip()
         self.flushes = 0
         self.claims = None  # url_queue has claimed_at?
+        self._busy = threading.Lock()
+        self._gen = 0       # bumped by abort(): a write() that started before it must not retry
 
     def connect(self):
         if self.conn is not None and not self.conn.closed:
             return
-        self.conn = psycopg2.connect(self.dsn, application_name="fast_crawl")
+        self.conn = connect(self.dsn)
+        self.fd = self.conn.fileno()
         if self.maps is None:
             self.maps = load_static_maps(self.conn)
         if self.claims is None:
@@ -267,32 +327,57 @@ class DbWriter:
         if self.conn is not None and not self.conn.closed:
             self.conn.close()
 
+    def abort(self):
+        """Any thread. Cancel the running statement, then break the socket: the writer thread gets an error, the server rolls back and
+        releases the row locks. The interrupted write() raises FlushAborted (no retry on a connection that was torn down on purpose)"""
+        self._gen += 1
+        conn, fd = self.conn, self.fd
+        if conn is None:
+            return
+        try:
+            conn.cancel()
+        except Exception:
+            pass
+        hard_close(fd)
+
     def write(self, batch):
-        """Write a batch, retrying deadlocks / dropped connections. Returns (stats, failed_batch_or_None)"""
-        last = None
-        for attempt in range(4):
-            try:
-                self.connect()
-                stats = flush(self.conn, self.maps, batch, self.ip, self.claims)
-                self.conn.commit()
-                self.flushes += 1
-                return stats
-            except (psycopg2.errors.DeadlockDetected, psycopg2.errors.SerializationFailure, psycopg2.errors.UniqueViolation) as e:
-                last = e
-                self._rollback()
-                time.sleep(0.2 + random.random() * 0.5 * (attempt + 1))
-            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                last = e
-                self._rollback()
+        """Write a batch, retrying deadlocks / lock timeouts / dropped connections. Returns stats"""
+        if not self._busy.acquire(blocking=False):
+            raise RuntimeError("DbWriter used from two threads at once: a psycopg2 connection must never be shared between threads")
+        try:
+            gen = self._gen
+            last = None
+            for attempt in range(4):
                 try:
-                    self.conn.close()
+                    self.connect()
+                    stats = flush(self.conn, self.maps, batch, self.ip, self.claims)
+                    self.conn.commit()
+                    self.flushes += 1
+                    return stats
+                except RETRYABLE as e:
+                    last = e
+                    self._rollback()
+                    if self._gen != gen:
+                        raise FlushAborted(repr(e))
+                    time.sleep(0.2 + random.random() * 0.5 * (attempt + 1))
+                except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.errors.IdleInTransactionSessionTimeout) as e:
+                    last = e
+                    self._rollback()
+                    try:
+                        self.conn.close()
+                    except Exception:
+                        pass
+                    if self._gen != gen:
+                        raise FlushAborted(repr(e))
+                    time.sleep(1 + attempt * 2)
                 except Exception:
-                    pass
-                time.sleep(1 + attempt * 2)
-            except Exception:
-                self._rollback()
-                raise
-        raise last
+                    self._rollback()
+                    if self._gen != gen:
+                        raise FlushAborted("aborted")
+                    raise
+            raise last
+        finally:
+            self._busy.release()
 
     def _rollback(self):
         try:
@@ -301,30 +386,156 @@ class DbWriter:
         except Exception:
             pass
 
-    def queue_estimate(self):
-        """Approximate url_queue length (planner statistics, free) or None"""
+
+class QueueDb:
+    """
+    url_queue access for every thread but the writer's: seeds, claims, hand-backs, the progress estimate. Its OWN connection (never the
+    writer's), used by one caller at a time (a lock), rolled back on any error, dropped on a connection error.
+    Shorter statement timeout than the writer's: these statements are small.
+    """
+
+    def __init__(self, dsn=None, claims=None, statement_timeout="60s"):
+        self.dsn = dsn or os.getenv("DATABASE_URL")
+        self.claims = claims
+        self.statement_timeout = statement_timeout
+        self.conn = None
+        self.fd = None
+        self._lock = threading.Lock()
+
+    def _connect(self):
+        if self.conn is None or self.conn.closed:
+            self.conn = connect(self.dsn, self.statement_timeout)
+            self.fd = self.conn.fileno()
+        if self.claims is None:
+            self.claims = utils.queue_has_claims()
+
+    def _drop(self):
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def abort(self):
+        """Any thread: break the connection of a call that hangs"""
+        hard_close(self.fd)
+
+    def close(self):
+        if self._lock.acquire(timeout=2):
+            try:
+                self._drop()
+            finally:
+                self._lock.release()
+        else:
+            hard_close(self.fd)  # a call is still hanging on it: break the socket instead of waiting
+
+    def _run(self, fn, blocking=True):
+        if not self._lock.acquire(blocking=blocking):
+            return None
         try:
-            self.connect()
-            cur = self.conn.cursor()
+            for attempt in range(3):
+                try:
+                    self._connect()
+                    cur = self.conn.cursor()
+                    try:
+                        result = fn(cur)
+                    finally:
+                        cur.close()
+                    self.conn.commit()
+                    return result
+                except RETRYABLE as e:
+                    self._rollback()
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.2 + random.random() * 0.5 * (attempt + 1))
+                except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.errors.IdleInTransactionSessionTimeout):
+                    self._drop()
+                    if attempt == 2:
+                        raise
+                    time.sleep(1 + attempt)
+                except Exception:
+                    self._rollback()
+                    raise
+        finally:
+            self._lock.release()
+
+    def _rollback(self):
+        try:
+            if self.conn is not None and not self.conn.closed:
+                self.conn.rollback()
+        except Exception:
+            self._drop()
+
+    def queue_estimate(self):
+        """Approximate url_queue length (planner statistics, free) or None. Never waits for a busy connection"""
+        def q(cur):
+            cur.execute("SET LOCAL statement_timeout = '3s';")
             cur.execute("SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass('url_queue');")
             row = cur.fetchone()
-            self.conn.rollback()
             return row[0] if row else None
+        try:
+            return self._run(q, blocking=False)
         except Exception:
-            self._rollback()
             return None
 
-    def enqueue_and_claim(self, urls):
-        """For --seed-file: queue the new seeds and claim them right away (so they're crawled first, not after a long backlog).
-        Returns (newly_queued, claimed_urls)"""
-        self.connect()
-        cur = self.conn.cursor()
-        n = enqueue_new(cur, sorted(urls), self.claims)
-        if self.claims:
-            cur.execute("UPDATE url_queue SET claimed_at = now() WHERE url = ANY(%s) AND claimed_at IS NULL RETURNING url;", (list(urls),))
-        else:
-            cur.execute("DELETE FROM url_queue WHERE url = ANY(%s) RETURNING url;", (list(urls),))
-        claimed = [r[0] for r in cur.fetchall()]
-        self.conn.commit()
-        cur.close()
-        return n, claimed
+    def enqueue(self, urls):
+        """Queue urls that are neither stored nor queued (no claim). Returns how many were new"""
+        urls = sorted(urls)
+        total = 0
+        for start in range(0, len(urls), 2000):
+            chunk = urls[start:start + 2000]
+            total += self._run(lambda cur: enqueue_new(cur, chunk, self.claims))
+        return total
+
+    def claim(self, num_urls):
+        """Pop / claim the next urls of the queue (same semantics as utils.get_next_urls)"""
+        def q(cur):
+            if not self.claims:
+                cur.execute("""
+                    DELETE FROM url_queue WHERE id IN (
+                        SELECT id FROM url_queue ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
+                    ) RETURNING id, url;""", (num_urls,))
+                return [url for _, url in sorted(cur.fetchall())]
+            cur.execute("""
+                UPDATE url_queue SET claimed_at = NULL WHERE id IN (
+                    SELECT id FROM url_queue WHERE claimed_at < now() - %s::interval FOR UPDATE SKIP LOCKED
+                );""", (utils.CLAIM_TIMEOUT,))
+            cur.execute("""
+                UPDATE url_queue SET claimed_at = now() WHERE id IN (
+                    SELECT id FROM url_queue WHERE claimed_at IS NULL ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
+                ) RETURNING url;""", (num_urls,))
+            return [r[0] for r in cur.fetchall()]
+        return self._run(q)
+
+    def claim_urls(self, urls):
+        """Claim / pop these specific urls if they are still unclaimed in the queue (seeds, a bounded chunk at a time). Returns the urls got"""
+        urls = list(urls)
+        if not urls:
+            return []
+        def q(cur):
+            if not self.claims:
+                cur.execute("""
+                    DELETE FROM url_queue WHERE id IN (
+                        SELECT id FROM url_queue WHERE url = ANY(%s) ORDER BY id FOR UPDATE SKIP LOCKED
+                    ) RETURNING url;""", (urls,))
+            else:
+                cur.execute("""
+                    UPDATE url_queue SET claimed_at = now() WHERE id IN (
+                        SELECT id FROM url_queue WHERE url = ANY(%s) AND claimed_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED
+                    ) RETURNING url;""", (urls,))
+            got = {r[0] for r in cur.fetchall()}
+            return [u for u in urls if u in got]
+        return self._run(q)
+
+    def release(self, urls):
+        """Hand claims back: claimed rows get claimed_at = NULL, popped urls of a claimless queue are inserted again"""
+        urls = sorted(urls)
+        for start in range(0, len(urls), 2000):
+            chunk = urls[start:start + 2000]
+            def q(cur):
+                if self.claims:
+                    cur.execute("UPDATE url_queue SET claimed_at = NULL WHERE url = ANY(%s);", (chunk,))
+                else:
+                    enqueue_new(cur, chunk, False)
+            self._run(q)
