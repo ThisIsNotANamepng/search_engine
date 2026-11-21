@@ -18,21 +18,12 @@ TMP_PATH = "blocklist.db.tmp"
 response = requests.get(HOSTS_URL, timeout=60)
 response.raise_for_status()
 
-with open("hosts.txt", "wb") as f:
-    f.write(response.content)
-
-with open ("cleaned_hosts.txt", "w") as cleaned:
-    cleaned.write("")
-
-with open("hosts.txt", "r") as hosts:
-    with open ("cleaned_hosts.txt", "a") as cleaned:
-        for i in hosts.readlines():
-
-            if i[0] == "#":
-                continue
-
-            if len(i) > 4:
-                cleaned.write(i.split()[1]+"\n")
+# Hosts file lines are "<ip> <domain>", with # comments (whole-line, indented or after the entry)
+hosts_domains = []
+for line in response.text.splitlines():
+    parts = line.split("#", 1)[0].split()
+    if len(parts) >= 2:
+        hosts_domains.append(parts[1])
 
 # Built in a temp file and swapped in at the end, so serve_blocklist.py never serves a half-written database
 with open(TMP_PATH, "w") as f:
@@ -43,12 +34,7 @@ cursor = conn.cursor()
 # PRIMARY KEY: scrapers look up every url, so this needs an index
 cursor.execute("CREATE TABLE blocklist (domain TEXT PRIMARY KEY);")
 cursor.execute("CREATE TABLE last_updated (last_updated TEXT);")
-with open("cleaned_hosts.txt", "r") as f:
-    for i in f.readlines():
-        domain = i.strip()
-        if not domain:
-            continue
-        cursor.execute("INSERT OR IGNORE INTO blocklist VALUES (?)", (domain,))
+cursor.executemany("INSERT OR IGNORE INTO blocklist VALUES (?)", [(d,) for d in hosts_domains])
 
 pg = psycopg2.connect(os.environ["DATABASE_URL"])
 pg_cursor = pg.cursor()
@@ -56,6 +42,7 @@ pg_cursor.execute("SELECT domain FROM blocked_domains;")
 cursor.executemany("INSERT OR IGNORE INTO blocklist VALUES (?)", pg_cursor)
 pg.close()
 
+# Scrapers now judge staleness by the file's age; kept for scrapers on older images, which read this row
 cursor.execute("INSERT INTO last_updated VALUES (?)", (time.time(),))
 conn.commit()
 conn.close()
