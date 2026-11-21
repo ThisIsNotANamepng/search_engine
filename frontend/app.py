@@ -14,6 +14,7 @@ Graphs:
 
 import os, sys, time, threading, socket, collections
 import urllib.request, urllib.error
+import urllib.parse
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
@@ -451,12 +452,55 @@ def _check_postgres():
     return None
 
 
+# The proxy check fetches a real page through the whole chain (db01:8888 -> upstream proxy -> site),
+# because a proxy that's listening but can't reach its upstream stops every crawler. It needs the
+# shared proxy password (the crawlers' SCRAPER_PROXY_PASSWORD) in the head's env file.
+PROXY_CHECK_PASSWORD = os.getenv("SCRAPER_PROXY_PASSWORD") or os.getenv("PROXY_PASSWORD") or ""
+PROXY_CHECK_URL = os.getenv("DASHBOARD_PROXY_CHECK_URL", "https://example.com/")
+PROXY_CHECK_TIMEOUT_SECONDS = 8.0
+PROXY_CHECK_CACHE_SECONDS = 30.0  # don't send the test site a request every poll
+_proxy_check_cache = {"at": 0.0, "result": None}
+_proxy_check_lock = threading.Lock()
+
+
+def _check_proxy_chain():
+    if not PROXY_CHECK_PASSWORD:
+        _check_tcp(8888)
+        return "warn", "listening; set SCRAPER_PROXY_PASSWORD in /etc/stultus/head.env to test fetching through it"
+    with _proxy_check_lock:
+        if _proxy_check_cache["result"] is not None and time.time() - _proxy_check_cache["at"] < PROXY_CHECK_CACHE_SECONDS:
+            outcome = _proxy_check_cache["result"]
+        else:
+            outcome = _fetch_through_proxy()
+            _proxy_check_cache.update(at=time.time(), result=outcome)
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+
+def _fetch_through_proxy():
+    """None if a page came back through the chain, else ("down", reason) or an exception."""
+    query = urllib.parse.urlencode({"url": PROXY_CHECK_URL})
+    req = urllib.request.Request(f"http://{HEALTH_HOST}:8888/fetch?{query}",
+                                 headers={"X-Proxy-Auth": PROXY_CHECK_PASSWORD})
+    try:
+        with urllib.request.urlopen(req, timeout=PROXY_CHECK_TIMEOUT_SECONDS):
+            return None
+    except urllib.error.HTTPError as e:
+        reason = (e.read(200).decode("utf-8", "replace").strip().splitlines() or [""])[0]
+        if e.code == 401:
+            reason = "password rejected (head.env's SCRAPER_PROXY_PASSWORD doesn't match the proxy's)"
+        return "down", f"can't fetch pages: HTTP {e.code} {reason}".strip()
+    except Exception as e:  # timeouts, refused connections
+        return e
+
+
 HEALTH_CHECKS = [
     # (name, what the crawlers use it for, check)
     ("Postgres", "index + URL queue", _check_postgres),
     # Redis answers PING with +PONG, or -NOAUTH if it wants a password (still up).
     ("Redis", "domain politeness locks", lambda: _check_tcp(6379, b"PING\r\n", (b"+PONG", b"-NOAUTH"))),
-    ("Proxy", "all page fetches", lambda: _check_tcp(8888)),
+    ("Proxy", "all page fetches", _check_proxy_chain),
     ("Text storage", "page text archive", lambda: _check_tcp(8003)),
     ("Blocklist", "blocked-domain list", lambda: _check_http(8002, "/blocklist.db", "HEAD")),
     ("Registry", "crawler images", lambda: _check_http(5000, "/v2/")),
