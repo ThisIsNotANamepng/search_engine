@@ -1,22 +1,19 @@
-// High-performance HTTP/HTTPS forward proxy.
+// The crawlers' fetch proxy. One endpoint:
 //
-//   - HTTP: forwards the absolute-URI request to the origin via the shared
-//     http.Transport (connection pooling, HTTP/1.1 keep-alive, HTTP/2 to origins
-//     that offer it) and streams the response back.
-//   - HTTPS: handles CONNECT, hijacks the client conn, splices it to a fresh
-//     TCP conn to the origin. TLS stays end-to-end; the proxy never decrypts.
-//   - GET /fetch?url=<target>: URL-forwarding endpoint that supports chaining
-//     proxies. If PROXY_UPSTREAM is set, the request is forwarded to
-//     <upstream>/fetch?url=<target>; otherwise the target is fetched directly.
-//     Origin status, headers, and body are streamed back to the caller.
+//	GET /fetch?url=<target>
 //
-// Designed to run as a Service in k3s. Single binary, no deps. Scale by
-// raising the Deployment replica count.
+// With PROXY_UPSTREAM set (the head node, db01:8888) the request goes on to <upstream>/fetch?url=<target>.
+// Without it (the cloud VPS, the last hop) the target is fetched, and only public internet addresses may be
+// dialed. Redirects aren't followed: the scraper checks each hop itself. Status, headers and body are streamed
+// back unchanged. Errors that are the proxy's own fault carry an X-Proxy-Error header, so the scraper retries
+// the url later instead of dropping it. Single binary, standard library only.
+//
+// Setup: deploy/vps/install_proxy.sh (last hop) and deploy/db01/connect_vps_proxy.sh (head).
 //
 // Env vars:
 //
 //	PROXY_ADDR              listen address                   (default :8888)
-//	PROXY_CONNECT_TIMEOUT   dial timeout to origin           (default 10s)
+//	PROXY_CONNECT_TIMEOUT   dial timeout to origin           (default 5s)
 //	PROXY_IDLE_TIMEOUT      idle conn timeout                (default 90s)
 //	PROXY_READ_HEADER_TO    header read timeout              (default 10s)
 //	PROXY_MAX_IDLE_CONNS    pooled idle conns total          (default 4096)
@@ -44,6 +41,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -91,21 +89,43 @@ func envInt(key string, def int) int {
 }
 
 type proxy struct {
-	transport      *http.Transport
-	dialer         *net.Dialer
-	password       string // shared secret; empty disables auth
-	connectTimeout time.Duration
-	upstream       *url.URL // next-hop proxy for /fetch chaining; nil = terminal
-	debug          bool     // if true, log each request and its duration
+	transport *http.Transport
+	password  string   // shared secret; empty disables auth
+	upstream  *url.URL // next-hop proxy for /fetch chaining; nil = terminal
+	debug     bool     // if true, log each request and its duration
 }
 
 func newProxy() *proxy {
-	connectTO := envDur("PROXY_CONNECT_TIMEOUT", 10*time.Second)
+	connectTO := envDur("PROXY_CONNECT_TIMEOUT", 5*time.Second) // same as the scraper's own connect timeout
 	idleTO := envDur("PROXY_IDLE_TIMEOUT", 90*time.Second)
 	maxIdle := envInt("PROXY_MAX_IDLE_CONNS", 4096)
 	maxPerHost := envInt("PROXY_MAX_PER_HOST", 64)
 
+	var upstream *url.URL
+	if u := os.Getenv("PROXY_UPSTREAM"); u != "" {
+		parsed, err := url.Parse(u)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			log.Fatalf("invalid PROXY_UPSTREAM %q: %v", u, err)
+		}
+		upstream = parsed
+	}
+
 	d := &net.Dialer{Timeout: connectTO, KeepAlive: 30 * time.Second}
+	if upstream != nil {
+		// A powered-off upstream sends no RST and no ACKs: without this, requests on the pooled connection hang for
+		// ~15 minutes of kernel retries. With it they fail in seconds, before the scraper's 10s timeout, as a marked 502.
+		d.Control = func(_, _ string, c syscall.RawConn) error {
+			var serr error
+			if err := c.Control(func(fd uintptr) {
+				serr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeout, 3000)
+			}); err != nil {
+				return err
+			}
+			return serr
+		}
+	} else {
+		d.Control = refuseNonPublic // this proxy fetches the pages itself
+	}
 
 	tr := &http.Transport{
 		Proxy:                 nil,
@@ -128,22 +148,11 @@ func newProxy() *proxy {
 
 	password := strings.TrimSpace(os.Getenv("PROXY_PASSWORD"))
 
-	var upstream *url.URL
-	if u := os.Getenv("PROXY_UPSTREAM"); u != "" {
-		parsed, err := url.Parse(u)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			log.Fatalf("invalid PROXY_UPSTREAM %q: %v", u, err)
-		}
-		upstream = parsed
-	}
-
 	return &proxy{
-		transport:      tr,
-		dialer:         d,
-		password:       password,
-		connectTimeout: connectTO,
-		upstream:       upstream,
-		debug:          os.Getenv("DEBUG") != "",
+		transport: tr,
+		password:  password,
+		upstream:  upstream,
+		debug:     os.Getenv("DEBUG") != "",
 	}
 }
 
@@ -155,8 +164,45 @@ func (p *proxy) checkAuth(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(p.password)) == 1
 }
 
-func (p *proxy) requireAuth(w http.ResponseWriter) {
-	http.Error(w, "proxy auth required", http.StatusUnauthorized)
+const tcpUserTimeout = 0x12 // TCP_USER_TIMEOUT on linux; package syscall doesn't name it
+
+var errNotPublic = errors.New("not a public address")
+
+// IPv4 ranges netip doesn't flag that still aren't the public internet: "this network", CGNAT (also Tailscale),
+// IETF protocol assignments, benchmarking, reserved.
+var nonPublic = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
+// refuseNonPublic runs on every connection the last-hop proxy opens. It sees the IP actually being dialed, after DNS,
+// so a page or redirect can't reach our own network or the cloud metadata service (169.254.169.254), even with a
+// name that resolved to a public address for the scraper (DNS rebinding).
+func refuseNonPublic(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return err
+	}
+	ip := ap.Addr().Unmap() // ::ffff:127.0.0.1 is 127.0.0.1
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return errNotPublic
+	}
+	for _, p := range nonPublic {
+		if p.Contains(ip) {
+			return errNotPublic
+		}
+	}
+	return nil
+}
+
+// proxyError answers with an error that is the proxy's fault, not the page's. The X-Proxy-Error header tells the
+// scraper to retry the url later instead of dropping it; hops in front of this one pass it through unchanged.
+func proxyError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("X-Proxy-Error", "1")
+	http.Error(w, msg, code)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -169,37 +215,22 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 	if !p.checkAuth(r) {
-		p.requireAuth(w)
+		proxyError(w, "proxy auth required", http.StatusUnauthorized)
 		return
 	}
-	if r.Method == http.MethodConnect {
-		p.handleConnect(w, r)
+	if r.URL.Path != "/fetch" {
+		http.NotFound(w, r) // also CONNECT and absolute-form requests: this isn't a general-purpose proxy
 		return
 	}
-	if r.URL.Path == "/fetch" {
-		p.handleFetch(w, r)
-		return
-	}
-	p.handleHTTP(w, r)
+	p.handleFetch(w, r)
 }
 
-// requestSummary picks the most useful one-line description of an inbound
-// request for debug logging. For /fetch it surfaces the wrapped target URL;
-// for absolute-form proxy requests it shows the URL as the client sent it;
-// otherwise it falls back to host + request URI.
+// requestSummary is the debug log's one-line description of a request: the target url, unescaped, for /fetch.
 func requestSummary(r *http.Request) string {
-	if r.URL.Path == "/fetch" {
-		if t := r.URL.Query().Get("url"); t != "" {
-			return "/fetch?url=" + t
-		}
+	if t := r.URL.Query().Get("url"); r.URL.Path == "/fetch" && t != "" {
+		return "/fetch?url=" + t
 	}
-	if r.URL.IsAbs() {
-		return r.URL.String()
-	}
-	if r.Method == http.MethodConnect {
-		return r.Host
-	}
-	return r.Host + r.URL.RequestURI()
+	return r.RequestURI
 }
 
 // fetchHeaders is the set of client request headers that get forwarded along
@@ -226,7 +257,7 @@ var fetchHeaders = []string{
 // are streamed back to the caller. Each Go request runs in its own goroutine,
 // so concurrency is unbounded by design — rely on the transport's pool limits.
 func (p *proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+	if r.Method != http.MethodGet { // it's always sent on as a GET, so don't accept anything that has a body
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -278,8 +309,16 @@ func (p *proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	roundStart := time.Now()
 	resp, err := p.transport.RoundTrip(outReq)
 	if err != nil {
+		if errors.Is(err, errNotPublic) {
+			http.Error(w, "not a public address", http.StatusForbidden)
+			return
+		}
 		log.Printf("fetch upstream error: dialing %s (target=%s): %v", nextURL, target, err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
+		if p.upstream != nil {
+			proxyError(w, "upstream proxy unreachable", http.StatusBadGateway) // our next hop is down, not the site
+		} else {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -301,115 +340,6 @@ func (p *proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	if !r.URL.IsAbs() {
-		http.Error(w, "non-absolute request URI; proxy expects absolute-form", http.StatusBadRequest)
-		return
-	}
-
-	outReq := r.Clone(r.Context())
-	outReq.RequestURI = ""
-	outReq.Header = cloneAndStripHopByHop(r.Header)
-
-	resp, err := p.transport.RoundTrip(outReq)
-	if err != nil {
-		log.Printf("upstream error: %s %s: %v", r.Method, r.URL, err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	dst := w.Header()
-	for k, vv := range resp.Header {
-		if _, drop := hopByHop[http.CanonicalHeaderKey(k)]; drop {
-			continue
-		}
-		dst[k] = append(dst[k][:0], vv...)
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
-
-func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
-	host := r.URL.Host // "example.com:443"
-	if host == "" {
-		host = r.Host
-	}
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		http.Error(w, "bad CONNECT target", http.StatusBadRequest)
-		return
-	}
-
-	dialCtx, cancel := context.WithTimeout(r.Context(), p.connectTimeout)
-	defer cancel()
-	upstream, err := p.dialer.DialContext(dialCtx, "tcp", host)
-	if err != nil {
-		log.Printf("CONNECT %s dial failed: %v", host, err)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		_ = upstream.Close()
-		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
-		return
-	}
-	client, bufrw, err := hj.Hijack()
-	if err != nil {
-		_ = upstream.Close()
-		log.Printf("hijack failed: %v", err)
-		return
-	}
-
-	if _, err := bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		_ = upstream.Close()
-		_ = client.Close()
-		return
-	}
-	if err := bufrw.Flush(); err != nil {
-		_ = upstream.Close()
-		_ = client.Close()
-		return
-	}
-
-	// Splice both directions. Use TCP CloseWrite for half-close so the peer
-	// sees EOF instead of RST when one side finishes.
-	go splice(upstream, client)
-	splice(client, upstream)
-}
-
-func splice(dst, src net.Conn) {
-	defer func() {
-		if c, ok := dst.(*net.TCPConn); ok {
-			_ = c.CloseWrite()
-		} else {
-			_ = dst.Close()
-		}
-		if c, ok := src.(*net.TCPConn); ok {
-			_ = c.CloseRead()
-		}
-	}()
-	_, _ = io.Copy(dst, src)
-}
-
-func cloneAndStripHopByHop(h http.Header) http.Header {
-	out := make(http.Header, len(h))
-	for k, vv := range h {
-		if _, drop := hopByHop[http.CanonicalHeaderKey(k)]; drop {
-			continue
-		}
-		// Per RFC 7230, Connection: header may list other headers to drop.
-		if strings.EqualFold(k, "Connection") {
-			continue
-		}
-		clone := make([]string, len(vv))
-		copy(clone, vv)
-		out[k] = clone
-	}
-	return out
-}
-
 func main() {
 	addr := env("PROXY_ADDR", ":8888")
 	readHeaderTO := envDur("PROXY_READ_HEADER_TO", 10*time.Second)
@@ -420,8 +350,8 @@ func main() {
 		Addr:              addr,
 		Handler:           p,
 		ReadHeaderTimeout: readHeaderTO,
-		// No ReadTimeout/WriteTimeout: CONNECT tunnels can legitimately stay
-		// open for the lifetime of a long-lived TLS session.
+		// No WriteTimeout: a response streams for as long as the origin sends it; the scraper's own timeouts end
+		// a stalled one, and its disconnect cancels the request through every hop.
 		IdleTimeout: envDur("PROXY_IDLE_TIMEOUT", 90*time.Second),
 	}
 

@@ -20,6 +20,8 @@ CERT=/etc/stultus/vps-proxy.crt
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 command -v go >/dev/null || { echo "go is missing (dnf install golang)" >&2; exit 1; }
+go_minor="$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')"
+(( go_minor >= 18 )) || { echo "proxy.go needs Go 1.18 or newer, found $(go env GOVERSION)" >&2; exit 1; }
 openssl x509 -in "$CERT_IN" -noout 2>/dev/null || { echo "$CERT_IN is not a PEM certificate" >&2; exit 1; }
 
 if [[ -z ${PROXY_PASSWORD:-} && -f $ENV_FILE ]]; then
@@ -39,11 +41,15 @@ case $code in
     000) echo "can't reach https://$host:$PORT (VPS firewall / cloud security group / wrong address or cert?)" >&2; exit 1 ;;
     *)   echo "the VPS answered HTTP $code: check journalctl -u stultus-proxy on the VPS" >&2; exit 1 ;;
 esac
+# Crawlers going through the proxy leave the "public address only" check to the VPS, so it must have it
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --cacert "$CERT_IN" \
+    -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$host:$PORT/fetch?url=http://127.0.0.1:22/" || true)"
+[[ $code == 403 ]] || { echo "the VPS runs an old proxy.go (an internal address got HTTP $code, want 403): rerun install_proxy.sh there with the current proxy.go" >&2; exit 1; }
 
-echo "== building proxy -> /usr/local/bin/stultus-proxy"
+echo "== testing and building proxy -> /usr/local/bin/stultus-proxy"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-(cd "$REPO/supporting_servers" && GOCACHE="$tmp/cache" go build -o "$tmp/stultus-proxy" proxy.go)
+(cd "$REPO/supporting_servers" && export GOCACHE="$tmp/cache" && go test -count=1 proxy.go proxy_test.go && go build -o "$tmp/stultus-proxy" proxy.go)
 install -m 755 "$tmp/stultus-proxy" /usr/local/bin/stultus-proxy
 
 mkdir -p /etc/stultus

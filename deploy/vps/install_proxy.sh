@@ -36,6 +36,9 @@ else
     echo "unsupported distro: needs apt-get or dnf" >&2; exit 1
 fi
 
+go_minor="$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')"
+(( go_minor >= 18 )) || { echo "proxy.go needs Go 1.18 or newer, this distro has $(go env GOVERSION): install one from https://go.dev/dl/" >&2; exit 1; }
+
 echo "== building proxy -> /usr/local/bin/stultus-proxy"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -127,7 +130,10 @@ if [[ $code != 200 ]]; then
     echo "self test failed (HTTP $code). Logs: journalctl -u stultus-proxy -n 50" >&2
     exit 1
 fi
-echo "ok"
+code="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CRT" --connect-to "$NAME:$PORT:127.0.0.1:$PORT" \
+    -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$NAME:$PORT/fetch?url=http://127.0.0.1:22/" || true)"
+[[ $code == 403 ]] || { echo "self test failed: an internal address got HTTP $code, want 403 (old proxy.go?)" >&2; exit 1; }
+echo "ok (and internal addresses are refused)"
 
 cat <<EOF
 

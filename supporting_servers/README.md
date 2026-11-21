@@ -10,7 +10,7 @@ The script `update_local_blocklist.py` downloads Steven Black's host file and th
 
 ## Proxy
 
-The way we have our scrapers set up internally, a proxy is run on the head node and another copy on the cloud proxy server. It's a vibe coded go file `proxy.go`
+The way we have our scrapers set up internally, a proxy is run on the head node and another copy on the cloud proxy server. It's a vibe coded go file `proxy.go`. How it works, what happens when it's down, and its settings: [docs/docs/proxy.md](../docs/docs/proxy.md)
 
 To set up the cloud proxy on a new VPS, copy `deploy/vps/install_proxy.sh` and `proxy.go` to it and run:
 

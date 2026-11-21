@@ -24,7 +24,7 @@
 - [ ] Handle scraping pdf files
 - [ ] Handle urls which redirect to another (probably just resolve all urls) (for example https://woo.app)
 - [ ] Still tries to scrape image files, fix that
-- [ ] Add logging to store which pages are in which language so we can measure how much of the web is in which language
+- [x] Add logging to store which pages are in which language so we can measure how much of the web is in which language
 - [ ] Add global function for cleaning the links we get (there are duplicate functions in scrape.py and utils.py)
 - [ ] Investigate potentially weighing some parts of the website to matter more in the search algorithm 
 
