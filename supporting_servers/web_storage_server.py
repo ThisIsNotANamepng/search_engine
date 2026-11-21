@@ -24,7 +24,9 @@ from datetime import datetime, timezone
 from flask import Flask, request, g, jsonify, send_file, abort
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# Where the page text and its sqlite index live. On db01 this is on the big disk:
+# WEB_STORAGE_DATA_DIR=/home/matt/harddrive/webtext/data (set in /etc/stultus/storage.env)
+DATA_DIR = os.getenv("WEB_STORAGE_DATA_DIR") or os.path.join(BASE_DIR, "data")
 FILES_DIR = os.path.join(DATA_DIR, "files")
 DB_PATH = os.path.join(DATA_DIR, "database.db")
 SHARD_BYTES = 6
