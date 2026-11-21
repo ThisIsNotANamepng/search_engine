@@ -2,78 +2,119 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stultus Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
 <style>
 /* =====================
    Base
 ===================== */
-* {
-    box-sizing: border-box;
+:root {
+    color-scheme: dark;  /* dark scrollbars and form controls */
+    --bg: #0f172a;
+    --card: #020617;
+    --line: #1e293b;
+    --text: #e5e7eb;
+    --muted: #94a3b8;
+    --faint: #64748b;
+    --accent: #93c5fd;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --idle: #64748b;
 }
+
+* { box-sizing: border-box; }
 
 body {
     margin: 0;
     font-family: Inter, system-ui, sans-serif;
-    background: #0f172a;
-    color: #e5e7eb;
+    background: var(--bg);
+    color: var(--text);
 }
 
-.container {
-    padding: 32px;
+.container { padding: 32px; max-width: 1600px; margin: 0 auto; }
+
+header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px 24px;
+    margin: 0 0 24px;
 }
 
-h1 {
-    margin: 0 0 32px;
-    font-size: 28px;
+h1 { margin: 0; font-size: 28px; }
+
+.live {
+    font-size: 13px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
 }
+.live .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--idle); margin-right: 6px; }
+.live.ok .dot { background: var(--ok); }
+.live.bad .dot { background: var(--bad); }
 
 /* =====================
    Grid System (12 cols)
 ===================== */
 .dashboard-grid {
     display: grid;
-    grid-template-columns: repeat(12, 1fr);
-    grid-auto-rows: minmax(160px, auto);
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    grid-auto-rows: minmax(140px, auto);
     gap: 24px;
 }
 
-/* Horizontal span */
 .col-3  { grid-column: span 3; }
 .col-4  { grid-column: span 4; }
 .col-6  { grid-column: span 6; }
 .col-8  { grid-column: span 8; }
 .col-12 { grid-column: span 12; }
 
-/* Vertical span */
 .row-1 { grid-row: span 1; }
 .row-2 { grid-row: span 2; }
-.row-3 { grid-row: span 3; }
+
+.auto-row { grid-row: auto; }
+/* In cards that size to their content, tables take their natural height (scrolling past 480px). */
+.auto-row .table-box { flex: none; max-height: 480px; }
 
 /* =====================
    Card
 ===================== */
 .card {
-    background: #020617;
+    background: var(--card);
     border-radius: 16px;
     padding: 20px;
-    border: 1px solid #1e293b;
+    border: 1px solid var(--line);
     box-shadow: 0 20px 40px rgba(0,0,0,.45);
     display: flex;
     flex-direction: column;
+    min-width: 0;
 }
+
+.card h2 {
+    margin: 0 0 16px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: var(--accent);
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+}
+.card h2 .sub { color: var(--faint); letter-spacing: .04em; text-transform: none; font-weight: 400; }
+
+.chart-box { position: relative; flex: 1 1 auto; min-height: 240px; }
 
 /* =====================
    Metric (Number Only)
 ===================== */
-.metric {
-    justify-content: center;
-}
+.metric { justify-content: center; }
 
 .metric-label {
     font-size: 12px;
-    color: #94a3b8;
+    color: var(--muted);
     letter-spacing: .1em;
     text-transform: uppercase;
 }
@@ -82,103 +123,167 @@ h1 {
     font-size: 44px;
     font-weight: 700;
     margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
 }
 
 .metric.accent {
-    background:
-        radial-gradient(circle at top left,
-        rgba(59,130,246,.15),
-        transparent 60%),
-        #020617;
+    background: radial-gradient(circle at top left, rgba(59,130,246,.15), transparent 60%), var(--card);
 }
 
 /* =====================
-   Charts / Titles
+   Services health strip
 ===================== */
-.card h2 {
-    margin: 0 0 16px;
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: .12em;
-    color: #93c5fd;
+.services {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
 }
-
-.card canvas {
-    flex: 1;
+.service {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 2px 10px;
 }
+.service .dot { width: 10px; height: 10px; border-radius: 50%; grid-row: span 2; }
+.service .name { font-weight: 600; font-size: 14px; }
+.service .ms { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.service .purpose { font-size: 12px; color: var(--faint); grid-column: 2 / 4; overflow-wrap: anywhere; }
+.service.ok .dot { background: var(--ok); }
+.service.warn .dot { background: var(--warn); }
+.service.down { border-color: rgba(248,113,113,.5); }
+.service.down .dot { background: var(--bad); }
+.service.down .purpose { color: var(--bad); }
 
 /* =====================
-   Table
+   Tables
 ===================== */
-table {
-    width: 100%;
-    border-collapse: collapse;
+.table-box {
+    flex: 1 1 0;
+    overflow: auto;
+    scrollbar-color: #334155 transparent;
+    border: 1px solid var(--line);
+    border-radius: 6px;
 }
+
+table { width: 100%; border-collapse: collapse; }
 
 th, td {
     padding: 10px;
-    border-bottom: 1px solid #1e293b;
+    border-bottom: 1px solid var(--line);
     font-size: 14px;
+    text-align: left;
 }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.url { overflow-wrap: anywhere; }
 
 th {
-    color: #93c5fd;
-    text-align: left;
+    position: sticky;
+    top: 0;
+    background: var(--card);
+    color: var(--accent);
     font-weight: 600;
+    z-index: 1;
 }
+
+.muted { color: var(--faint); }
+
+/* =====================
+   Crawler nodes
+===================== */
+.node-summary { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: -4px 0 14px; font-size: 14px; color: var(--muted); }
+.node-summary b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+tr.node-row { cursor: pointer; }
+tr.node-row:hover td { background: rgba(147,197,253,.04); }
+tr.node-row td:first-child::before { content: "▸"; display: inline-block; width: 16px; color: var(--faint); }
+tr.node-row.open td:first-child::before { content: "▾"; }
+tr.crawler-row td { background: rgba(15,23,42,.6); font-size: 13px; color: var(--muted); }
+tr.crawler-row td:first-child { padding-left: 36px; }
+
+.pill { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.pill.ok { color: var(--ok); }
+.pill.warn { color: var(--warn); }
+.pill.bad { color: var(--bad); }
+.pill.idle { color: var(--idle); }
+
+.bar { display: inline-block; width: 64px; height: 6px; border-radius: 3px; background: var(--line); vertical-align: middle; margin-left: 8px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--ok); }
+.bar.warn > span { background: var(--warn); }
+
+.scale { white-space: nowrap; }
+.scale input {
+    width: 60px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px;
+}
+.scale input.dirty { border-color: var(--warn); }
+button {
+    background: var(--line); color: var(--text); border: 1px solid #334155;
+    border-radius: 6px; padding: 4px 9px; cursor: pointer; font: inherit; font-size: 13px;
+}
+button:hover { background: #334155; }
+
+.banner {
+    display: none; margin: 0 0 16px; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid rgba(248,113,113,.5); color: var(--bad); font-size: 14px;
+}
+.banner.show { display: block; }
+
+/* =====================
+   Search
+===================== */
+.search-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 24px; align-items: start; }
+.search-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.search-stats .metric-value { font-size: 32px; }
 
 /* =====================
    Responsive
 ===================== */
-@media (max-width: 1000px) {
-    .dashboard-grid {
-        grid-template-columns: repeat(6, 1fr);
-    }
+@media (max-width: 1100px) {
+    .dashboard-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    .col-3 { grid-column: span 3; }
+    .col-4, .col-6, .col-8, .col-12 { grid-column: span 6; }
 }
 
-@media (max-width: 600px) {
-    .dashboard-grid {
-        grid-template-columns: 1fr;
-    }
+@media (max-width: 640px) {
+    .container { padding: 16px; }
+    .dashboard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: auto; gap: 16px; }
+    .col-3 { grid-column: span 1; }   /* headline numbers two per row */
+    .col-4, .col-6, .col-8, .col-12 { grid-column: 1 / -1; }
+    .metric { padding: 16px; }
+    .row-2 { grid-row: auto; }
+    .metric-value { font-size: 22px; }
+    .services { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .service { padding: 8px 10px; }
+    .search-stats .metric-value { font-size: 24px; }
+    .search-layout { grid-template-columns: minmax(0, 1fr); }
+    .hide-sm { display: none; }
 }
-
-
-/* scrollable table that fills its card */
-.table-box {
-  flex: 1 1 0;          /* fill remaining height */
-  overflow: auto;     /* scroll when content overflows */
-  border: 1px solid #1e293b;
-  border-radius: 6px;
-}
-
-.table-box table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.table-box th,
-.table-box td {
-  padding: 10px;
-  font-size: 14px;
-  border-bottom: 1px solid #1e293b;
-}
-
-.table-box th {
-  position: sticky;   /* keep header visible while scrolling */
-  top: 0;
-  background: #020617;
-  color: #93c5fd;
-  z-index: 1;
-}
-
 </style>
 </head>
-
 <body>
 <div class="container">
-    <h1>Stultus Index Dashboard</h1>
+
+    <header>
+        <h1>Stultus Index Dashboard</h1>
+        <div class="live" id="live"><span class="dot"></span><span id="live-text">connecting…</span></div>
+    </header>
+
+    <div class="banner" id="banner"></div>
 
     <div class="dashboard-grid">
+
+        <!-- Services the crawlers depend on -->
+        <div class="card col-12 auto-row">
+            <h2>Services <span class="sub" id="services-sub"></span></h2>
+            <div class="services" id="services">
+                <div class="muted">Checking…</div>
+            </div>
+        </div>
 
         <!-- Metrics -->
         <div class="card metric accent col-3 row-1">
@@ -197,69 +302,14 @@ th {
         </div>
 
         <div class="card metric col-3 row-1">
-            <div class="metric-label">URLS/Minute</div>
+            <div class="metric-label">URLs / Minute</div>
             <div class="metric-value" id="m-scrapes-per-minute">…</div>
         </div>
 
-
-        <div class="card col-4 row-2">
-            <h2>Scraped vs Blocked (Pie)</h2>
-            <canvas id="pie_scraped_vs_blocked"></canvas>
-        </div>
-
-        <div class="card col-8 row-2">
-            <h2>Scraped vs Blocked (Bar)</h2>
-            <canvas id="bar_scraped_vs_blocked"></canvas>
-        </div>
-
-        <div class="card col-8 row-2">
-            <h2>Scrapes per Day</h2>
-            <canvas id="scrapes_per_minute"></canvas>
-        </div>
-        
-
-        <div class="card col-4 row-2">
-            <h2>Last URLs Scraped</h2>
-            <table>
-                <tr>
-                    <th>URL</th>
-                    <th>Time Scraped (UTC)</th>
-                </tr>
-                <tbody id="last-scraped-body"><tr><td colspan="2" style="color:#64748b">Loading…</td></tr></tbody>
-            </table>
-        </div>
-
-
-        <div class="card col-8 row-2">
-            <h2>Pages in the Index</h2>
-            <canvas id="cumulative_scrapes_per_day"></canvas>
-        </div>
-
-
-        <div class="card col-4 row-2">
-        <h2>Active Scrapers</h2>
-        <div class="table-box">
-            <table>
-            <thead>
-                <tr>
-                <th>IP (K8)</th>
-                <th>Scraped</th>
-                <th>Alive Since</th>
-                </tr>
-            </thead>
-            <tbody id="scrapers-body">
-                <tr><td colspan="3" style="color:#64748b">Loading…</td></tr>
-            </tbody>
-            </table>
-        </div>
-        </div>
-
-
-
-
-        <!-- Crawler nodes (replaces the k8s control plane) -->
-        <div class="card col-12 row-2">
-            <h2>Crawler Nodes</h2>
+        <!-- Crawler nodes (from the node agents' heartbeats) -->
+        <div class="card col-12 auto-row">
+            <h2>Crawler Nodes <span class="sub">click a node to see its crawlers</span></h2>
+            <div class="node-summary" id="node-summary"></div>
             <div class="table-box">
                 <table>
                     <thead>
@@ -267,195 +317,376 @@ th {
                             <th>Node</th>
                             <th>Status</th>
                             <th>Running / Desired</th>
-                            <th>CPU</th>
-                            <th>RAM</th>
-                            <th>Last Seen (s ago)</th>
+                            <th class="num hide-sm">Restarts</th>
+                            <th class="num hide-sm">CPU</th>
+                            <th class="num hide-sm">RAM</th>
+                            <th class="num">Last Seen</th>
                             <th>Scale</th>
                         </tr>
                     </thead>
-                    <tbody>
-                        {% for n in nodes %}
-                        {% set stale = n.age_s is not none and n.age_s > node_stale_seconds %}
-                        <tr>
-                            <td>
-                                {{ n.node_id }}
-                                {% if n.hostname and n.hostname != n.node_id %}
-                                    <span style="color:#64748b">({{ n.hostname }})</span>
-                                {% endif %}
-                            </td>
-                            <td>
-                                {% if stale %}
-                                    <span style="color:#f87171">● stale</span>
-                                {% else %}
-                                    <span style="color:#4ade80">● live</span>
-                                {% endif %}
-                            </td>
-                            <td>{{ n.alive_count }} / {{ n.desired_count }}</td>
-                            <td>{{ n.cpu_percent | round(0) if n.cpu_percent is not none else '–' }}%</td>
-                            <td>{{ n.mem_percent | round(0) if n.mem_percent is not none else '–' }}%</td>
-                            <td>{{ n.age_s | round(0) if n.age_s is not none else '–' }}</td>
-                            <td style="white-space:nowrap">
-                                <button onclick="adjustScale('{{ n.node_id }}', -1)">−</button>
-                                <input id="scale-{{ n.node_id }}" type="number" min="0"
-                                       value="{{ n.desired_count }}"
-                                       style="width:60px;background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:6px;padding:4px">
-                                <button onclick="setScale('{{ n.node_id }}', this)">Set</button>
-                                <button onclick="adjustScale('{{ n.node_id }}', 1)">＋</button>
-                            </td>
-                        </tr>
-                        {% else %}
-                        <tr><td colspan="7" style="color:#64748b">No crawler nodes have reported in yet.</td></tr>
-                        {% endfor %}
+                    <tbody id="nodes-body">
+                        <tr><td colspan="8" class="muted">Loading…</td></tr>
                     </tbody>
                 </table>
             </div>
         </div>
 
-
-        <!-- Search Speed Metrics -->
-        <div class="card metric col-3 row-1">
-            <div class="metric-label">Search speed - "Something here"</div>
-            <div class="metric-value">0.25s</div>
+        <!-- Search performance (measured from real /search requests) -->
+        <div class="card col-12 auto-row">
+            <h2>Search Speed <span class="sub" id="search-sub"></span></h2>
+            <div class="search-layout">
+                <div class="search-stats">
+                    <div><div class="metric-label">Median</div><div class="metric-value" id="s-p50">–</div></div>
+                    <div><div class="metric-label">95th pct</div><div class="metric-value" id="s-p95">–</div></div>
+                    <div><div class="metric-label">Searches</div><div class="metric-value" id="s-count">–</div></div>
+                </div>
+                <div class="table-box">
+                    <table>
+                        <thead><tr><th>Recent searches (timings only)</th><th class="num">Duration</th><th class="num">Results</th></tr></thead>
+                        <tbody id="searches-body"><tr><td colspan="3" class="muted">No searches since the head started.</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
-        <div class="card metric col-3 row-1">
-            <div class="metric-label">Search speed - "University of Wisconsin, Eau Claire"</div>
-            <div class="metric-value">0.32s</div>
+        <!-- Crawl stats (slow queries, cached on the server) -->
+        <div class="card col-4 row-2">
+            <h2>Scraped vs Blocked</h2>
+            <div class="chart-box"><canvas id="pie_scraped_vs_blocked"></canvas></div>
         </div>
 
-        <div class="card metric col-3 row-1">
-            <div class="metric-label">Search speed - "How much wood could a woodchuck chuck if a woodchuck could chuck wood?"</div>
-            <div class="metric-value">0.49s</div>
+        <div class="card col-8 row-2">
+            <h2>Scraped vs Blocked</h2>
+            <div class="chart-box"><canvas id="bar_scraped_vs_blocked"></canvas></div>
         </div>
 
-        <div class="card metric col-3 row-1">
-            <div class="metric-label">Search speed - "Why does worf lose every fight?"</div>
-            <div class="metric-value">0.37s</div>
+        <div class="card col-8 row-2">
+            <h2>Scrapes per Day</h2>
+            <div class="chart-box"><canvas id="scrapes_per_day"></canvas></div>
         </div>
 
+        <div class="card col-4 row-2">
+            <h2>Last URLs Scraped</h2>
+            <div class="table-box">
+                <table>
+                    <thead><tr><th>URL</th><th>Time Scraped (UTC)</th></tr></thead>
+                    <tbody id="last-scraped-body"><tr><td colspan="2" class="muted">Loading…</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card col-8 row-2">
+            <h2>Pages in the Index</h2>
+            <div class="chart-box"><canvas id="cumulative_scrapes_per_day"></canvas></div>
+        </div>
+
+        <div class="card col-4 row-2">
+            <h2>Scraping Hosts <span class="sub">last 3 min</span></h2>
+            <div class="table-box">
+                <table>
+                    <thead><tr><th>Host IP</th><th class="num">Scraped</th><th>Since</th></tr></thead>
+                    <tbody id="scrapers-body"><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
+                </table>
+            </div>
+        </div>
 
     </div>
 </div>
 
 <script>
-    // The page shell renders immediately; the slow stats are fetched here.
-    const charts = [];
+const NODE_STALE_SECONDS = {{ node_stale_seconds | tojson }};
+const LIVE_POLL_MS = 5000;
+const STATS_REFRESH_MS = 60000;
 
-    function setText(id, value) { document.getElementById(id).textContent = value; }
+// ---------- helpers ----------
+// Build DOM nodes with textContent only: hostnames, URLs and error text are never parsed as HTML.
+function el(tag, attrs = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+        if (k === "class") node.className = v;
+        else if (k === "text") node.textContent = v;
+        else node.setAttribute(k, v);
+    }
+    for (const c of children) if (c != null) node.append(c);
+    return node;
+}
+function setText(id, value) { document.getElementById(id).textContent = value; }
+function fmtNum(n) { return n == null ? "–" : Number(n).toLocaleString(); }
+function fmtMs(ms) { return ms == null ? "–" : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`; }
+function fmtDuration(s) {
+    if (s == null) return "–";
+    s = Math.round(s);
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+    return `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h`;
+}
+function fmtClock(unix) { return new Date(unix * 1000).toLocaleTimeString(); }
 
-    function fillRows(tbodyId, rows, cols) {
-        const tbody = document.getElementById(tbodyId);
-        tbody.replaceChildren();
-        for (const row of rows) {
-            const tr = document.createElement("tr");
-            for (const c of cols) {
-                const td = document.createElement("td");
-                td.textContent = row[c];   // textContent: URLs from the web are never parsed as HTML
-                tr.appendChild(td);
+// ---------- services ----------
+function renderHealth(checks) {
+    const box = document.getElementById("services");
+    box.replaceChildren(...checks.map(c => el("div", { class: `service ${c.status}`, title: c.detail || c.status },
+        el("span", { class: "dot" }),
+        el("span", { class: "name", text: c.name }),
+        el("span", { class: "ms", text: c.status === "down" ? "down" : `${c.ms} ms` }),
+        el("span", { class: "purpose", text: c.status === "ok" ? c.purpose : (c.detail || c.purpose) }),
+    )));
+    const down = checks.filter(c => c.status === "down").length;
+    setText("services-sub", down ? `${down} down` : "all up");
+}
+
+// ---------- crawler nodes ----------
+const openNodes = new Set();     // node_ids whose crawler rows are expanded
+const pendingScale = new Map();  // node_id -> value typed but not yet Set
+
+function nodeStatus(n) {
+    if (n.age_s > NODE_STALE_SECONDS) return ["bad", "offline"];
+    if (n.desired_count === 0) return ["idle", "idle"];
+    if (n.alive_count < n.desired_count) return ["warn", "degraded"];
+    return ["ok", "running"];
+}
+
+function scaleControls(n) {
+    const id = n.node_id;
+    const input = el("input", { type: "number", min: "0", max: "64", "aria-label": `Desired crawlers on ${id}` });
+    input.value = pendingScale.has(id) ? pendingScale.get(id) : n.desired_count;
+    if (pendingScale.has(id)) input.classList.add("dirty");
+    input.addEventListener("input", () => { pendingScale.set(id, input.value); input.classList.add("dirty"); });
+    const step = delta => {
+        input.value = Math.max(0, (parseInt(input.value, 10) || 0) + delta);
+        pendingScale.set(id, input.value);
+        input.classList.add("dirty");
+    };
+    const minus = el("button", { type: "button", text: "−", "aria-label": "One fewer" });
+    const plus = el("button", { type: "button", text: "+", "aria-label": "One more" });
+    const set = el("button", { type: "button", text: "Set" });
+    minus.addEventListener("click", () => step(-1));
+    plus.addEventListener("click", () => step(1));
+    set.addEventListener("click", () => setScale(id, input, set));
+    const box = el("div", { class: "scale" }, minus, " ", input, " ", plus, " ", set);
+    box.addEventListener("click", e => e.stopPropagation());  // don't toggle the row
+    return box;
+}
+
+function renderNodes(nodes) {
+    const tbody = document.getElementById("nodes-body");
+    // Don't rebuild the table while someone is typing a scale value into it.
+    if (tbody.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+
+    if (!nodes.length) {
+        tbody.replaceChildren(el("tr", {}, el("td", { colspan: "8", class: "muted", text: "No crawler nodes have reported in yet." })));
+        setText("node-summary", "");
+        return;
+    }
+
+    let alive = 0, desired = 0, offline = 0, degraded = 0;
+    const rows = [];
+    for (const n of nodes) {
+        const procs = Array.isArray(n.procs) ? n.procs : [];
+        const [cls, label] = nodeStatus(n);
+        if (cls === "bad") offline++; else { alive += n.alive_count; desired += n.desired_count; }
+        if (cls === "warn") degraded++;
+        const restarts = procs.reduce((sum, p) => sum + (p.restarts || 0), 0);
+        const frac = n.desired_count ? Math.min(1, n.alive_count / n.desired_count) : 0;
+
+        const row = el("tr", { class: "node-row" + (openNodes.has(n.node_id) ? " open" : "") },
+            el("td", {}, n.node_id, n.hostname && n.hostname !== n.node_id ? el("span", { class: "muted", text: ` (${n.hostname})` }) : null),
+            el("td", {}, el("span", { class: `pill ${cls}`, text: label })),
+            el("td", {}, `${n.alive_count} / ${n.desired_count}`,
+                el("span", { class: "bar" + (frac < 1 ? " warn" : "") }, el("span", { style: `width:${Math.round(frac * 100)}%` }))),
+            el("td", { class: "num hide-sm", text: fmtNum(restarts) }),
+            el("td", { class: "num hide-sm", text: n.cpu_percent == null ? "–" : `${Math.round(n.cpu_percent)}%` }),
+            el("td", { class: "num hide-sm", text: n.mem_percent == null ? "–" : `${Math.round(n.mem_percent)}%` }),
+            el("td", { class: "num", text: `${fmtDuration(n.age_s)} ago` }),
+            el("td", {}, scaleControls(n)),
+        );
+        row.addEventListener("click", () => {
+            openNodes.has(n.node_id) ? openNodes.delete(n.node_id) : openNodes.add(n.node_id);
+            renderNodes(lastLive.nodes);
+        });
+        rows.push(row);
+
+        if (openNodes.has(n.node_id)) {
+            if (!procs.length) {
+                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: "8", text: "No crawler containers running." })));
             }
-            tbody.appendChild(tr);
+            for (const p of procs) {
+                rows.push(el("tr", { class: "crawler-row" },
+                    el("td", { text: `slot ${p.slot}` }),
+                    el("td", { text: p.container }),
+                    el("td", { text: `up ${fmtDuration(p.uptime_s)}` }),
+                    el("td", { class: "num hide-sm", text: fmtNum(p.restarts) }),
+                    el("td", { class: "hide-sm", colspan: "2", text: `pid ${p.pid}` }),
+                    el("td", { colspan: "2" }),
+                ));
+            }
+            const missing = n.desired_count - procs.length;
+            if (missing > 0 && cls !== "bad") {
+                rows.push(el("tr", { class: "crawler-row" }, el("td", { colspan: "8",
+                    text: `${missing} slot${missing === 1 ? "" : "s"} not running (crashed or restarting; see journalctl -u crawler-agent on ${n.node_id})` })));
+            }
         }
     }
+    tbody.replaceChildren(...rows);
 
-    function renderDashboard(d) {
-        setText("m-db-size", d.db_size);
-        setText("m-url-count", d.url_count);
-        setText("m-unique-domains", d.unique_domains);
-        setText("m-scrapes-per-minute", d.scrapes_per_minute);
+    const summary = document.getElementById("node-summary");
+    summary.replaceChildren(
+        el("span", {}, el("b", { text: String(nodes.length - offline) }), ` of ${nodes.length} nodes reporting`),
+        el("span", {}, el("b", { text: `${alive} / ${desired}` }), " crawlers running"),
+        degraded ? el("span", {}, el("b", { text: String(degraded) }), " degraded") : null,
+        offline ? el("span", {}, el("b", { text: String(offline) }), " offline") : null,
+    );
+}
 
-        fillRows("last-scraped-body", d.last_10_scraped, [0, 1]);
-        fillRows("scrapers-body", d.scrapers, ["ip", "urls_scraped", "started_at"]);
+function setScale(nodeId, input, btn) {
+    const desired = Math.max(0, parseInt(input.value, 10) || 0);
+    fetch(`/nodes/${encodeURIComponent(nodeId)}/scale`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ desired }),
+    })
+    .then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)))
+    .then(() => {
+        pendingScale.delete(nodeId);
+        input.classList.remove("dirty");
+        btn.textContent = "✓";
+        setTimeout(() => { btn.textContent = "Set"; }, 1200);
+        pollLive();   // show the new desired count right away; the agent applies it on its next heartbeat
+    })
+    .catch(e => alert("Scale failed: " + ((e && e.error) || "unknown error")));
+}
 
-        const statusCounts = d.status_counts;
-        const scrapesOverTime = d.scrapes_over_time;
-        const cumScrapesOverTime = d.cumulative_scrapes_per_day;
-
-        const labels = statusCounts.map(s => s.status);
-        const values = statusCounts.map(s => s.count);
-
-        charts.forEach(c => c.destroy());
-        charts.length = 0;
-
-        charts.push(new Chart(document.getElementById("pie_scraped_vs_blocked"), {
-            type: "pie",
-            data: { labels, datasets: [{ data: values }] }
-        }));
-
-        charts.push(new Chart(document.getElementById("bar_scraped_vs_blocked"), {
-            type: "bar",
-            data: { labels, datasets: [{ label: "Count", data: values }] }
-        }));
-
-        charts.push(new Chart(document.getElementById("scrapes_per_minute"), {
-            type: "line",
-            data: {
-                labels: scrapesOverTime.map(d => d.minute),
-                datasets: [{
-                    label: "Scrapes / Day",
-                    data: scrapesOverTime.map(d => d.count),
-                    tension: 0.3
-                }]
-            }
-        }));
-
-        charts.push(new Chart(document.getElementById("cumulative_scrapes_per_day"), {
-            type: "line",
-            data: {
-                labels: cumScrapesOverTime.map(w => w.day),
-                datasets: [{
-                    label: "Scrapes / Day",
-                    data: cumScrapesOverTime.map(w => w.cumulative_scrapes),
-                    tension: 0.0
-                }]
-            }
-        }));
+// ---------- search ----------
+function renderSearch(s) {
+    setText("s-p50", fmtMs(s.p50_ms));
+    setText("s-p95", fmtMs(s.p95_ms));
+    setText("s-count", fmtNum(s.count));
+    setText("search-sub", `last ${Math.round(s.window_s / 60)} min` + (s.max_ms != null ? ` · slowest ${fmtMs(s.max_ms)}` : ""));
+    const tbody = document.getElementById("searches-body");
+    if (!s.recent.length) {
+        tbody.replaceChildren(el("tr", {}, el("td", { colspan: "3", class: "muted", text: "No searches in this window." })));
+        return;
     }
+    tbody.replaceChildren(...s.recent.map(r => el("tr", {},
+        el("td", { text: fmtClock(r.at) }),
+        el("td", { class: "num", text: fmtMs(r.ms) }),
+        el("td", { class: "num", text: fmtNum(r.results) }),
+    )));
+}
 
-    // Poll until the server has the stats ready (the first computation can take a few minutes
-    // after a cold start; later loads are served from its cache immediately).
-    function loadDashboardData() {
-        fetch("/dashboard/data")
-            .then(r => r.json())
-            .then(d => {
-                if (d.ready) { renderDashboard(d); }
-                else { setTimeout(loadDashboardData, 3000); }
-            })
-            .catch(() => setTimeout(loadDashboardData, 5000));
-    }
-    loadDashboardData();
+// ---------- live polling ----------
+let lastLive = { nodes: [] };
+let lastLiveAt = null;
 
-
-    // +/− only edit the input locally — nothing is sent to the worker until Set.
-    function adjustScale(nodeId, delta) {
-        const input = document.getElementById('scale-' + nodeId);
-        input.value = Math.max(0, (parseInt(input.value, 10) || 0) + delta);
-    }
-
-    // Set sends the current input value to the worker node. No page reload; the
-    // agent applies it on its next heartbeat and the 60s refresh reflects it.
-    function setScale(nodeId, btn) {
-        const input = document.getElementById('scale-' + nodeId);
-        const desired = Math.max(0, parseInt(input.value, 10) || 0);
-        input.value = desired;
-        const label = btn.textContent;
-        fetch(`/nodes/${nodeId}/scale`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ desired })
+function pollLive() {
+    return fetch("/dashboard/live", { cache: "no-store" })
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+        .then(d => {
+            lastLive = d;
+            lastLiveAt = Date.now();
+            renderHealth(d.health);
+            renderNodes(d.nodes);
+            renderSearch(d.search);
+            const banner = document.getElementById("banner");
+            banner.textContent = d.nodes_error ? `Couldn't read crawler nodes: ${d.nodes_error}` : "";
+            banner.classList.toggle("show", !!d.nodes_error);
         })
-        .then(r => { if (!r.ok) return r.json().then(e => Promise.reject(e)); })
-        .then(() => {                       // brief inline confirmation, no reload
-            btn.textContent = "✓";
-            setTimeout(() => { btn.textContent = label; }, 1200);
-        })
-        .catch(e => alert("Scale failed: " + (e.error || "unknown error")));
+        .catch(e => {
+            const banner = document.getElementById("banner");
+            banner.textContent = `Can't reach the head server (${e.message}). Showing the last data received.`;
+            banner.classList.add("show");
+            lastLiveAt = lastLiveAt || 0;
+        });
+}
+
+function tickLiveIndicator() {
+    const live = document.getElementById("live");
+    if (lastLiveAt == null) return;
+    const age = (Date.now() - lastLiveAt) / 1000;
+    const fresh = lastLiveAt && age < (LIVE_POLL_MS / 1000) * 3;
+    live.className = "live " + (fresh ? "ok" : "bad");
+    setText("live-text", lastLiveAt ? `updated ${fmtDuration(age)} ago` : "not connected");
+}
+
+pollLive();
+setInterval(pollLive, LIVE_POLL_MS);
+setInterval(tickLiveIndicator, 1000);
+
+// ---------- crawl stats (slow, cached server-side) ----------
+if (window.Chart) {
+    Chart.defaults.color = "#94a3b8";
+    Chart.defaults.borderColor = "#1e293b";
+    Chart.defaults.maintainAspectRatio = false;
+}
+const charts = {};
+
+function fillRows(tbodyId, rows, cols, classes = {}) {
+    const tbody = document.getElementById(tbodyId);
+    if (!rows.length) {
+        tbody.replaceChildren(el("tr", {}, el("td", { colspan: String(cols.length), class: "muted", text: "Nothing yet." })));
+        return;
     }
+    tbody.replaceChildren(...rows.map(row => el("tr", {},
+        ...cols.map(c => el("td", { class: classes[c] || "", text: row[c] == null ? "" : String(row[c]) })))));
+}
 
-    // Reload every minute
-    setInterval(() => {
-        location.reload();
-    }, 60000);
+function drawChart(id, config) {
+    if (!window.Chart) return;
+    if (charts[id]) charts[id].destroy();
+    charts[id] = new Chart(document.getElementById(id), config);
+}
 
+function renderDashboard(d) {
+    setText("m-db-size", d.db_size);
+    setText("m-url-count", fmtNum(d.url_count));
+    setText("m-unique-domains", fmtNum(d.unique_domains));
+    setText("m-scrapes-per-minute", fmtNum(d.scrapes_per_minute));
+
+    fillRows("last-scraped-body", d.last_10_scraped, [0, 1], { 0: "url" });
+    fillRows("scrapers-body", d.scrapers, ["ip", "urls_scraped", "started_at"], { urls_scraped: "num" });
+
+    const labels = d.status_counts.map(s => s.status);
+    const values = d.status_counts.map(s => s.count);
+    const colors = labels.map(l => ({ scraped: "#4ade80", blocked: "#f87171", error: "#fbbf24" }[l] || "#93c5fd"));
+
+    drawChart("pie_scraped_vs_blocked", {
+        type: "pie",
+        data: { labels, datasets: [{ data: values, backgroundColor: colors, borderColor: "#020617" }] },
+    });
+    drawChart("bar_scraped_vs_blocked", {
+        type: "bar",
+        data: { labels, datasets: [{ label: "Count", data: values, backgroundColor: colors }] },
+        options: { plugins: { legend: { display: false } } },
+    });
+    drawChart("scrapes_per_day", {
+        type: "line",
+        data: {
+            labels: d.scrapes_over_time.map(r => String(r.minute).slice(0, 10)),
+            datasets: [{ label: "Scrapes / day", data: d.scrapes_over_time.map(r => r.count), tension: 0.3, borderColor: "#93c5fd", pointRadius: 0 }],
+        },
+    });
+    drawChart("cumulative_scrapes_per_day", {
+        type: "line",
+        data: {
+            labels: d.cumulative_scrapes_per_day.map(r => String(r.day).slice(0, 10)),
+            datasets: [{ label: "Pages scraped (cumulative)", data: d.cumulative_scrapes_per_day.map(r => r.cumulative_scrapes), borderColor: "#4ade80", pointRadius: 0 }],
+        },
+    });
+}
+
+// The first computation can take a few minutes after a cold start; poll until it's ready,
+// then refresh in place every minute (no page reload, so open rows and typed values survive).
+function loadDashboardData() {
+    fetch("/dashboard/data", { cache: "no-store" })
+        .then(r => r.json())
+        .then(d => {
+            if (d.ready) { renderDashboard(d); setTimeout(loadDashboardData, STATS_REFRESH_MS); }
+            else { setTimeout(loadDashboardData, 3000); }
+        })
+        .catch(() => setTimeout(loadDashboardData, 5000));
+}
+loadDashboardData();
 </script>
 </body>
 </html>
