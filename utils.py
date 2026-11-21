@@ -401,14 +401,13 @@ def create_database():
     CREATE INDEX IF NOT EXISTS urls_domain_idx
         ON urls ((SUBSTRING(url FROM '^(?:https?://)?([^/]+)')));
 
-    -- Token -> page lookups (search) and page -> tokens (store() replacing a re-crawled page's postings)
-    CREATE INDEX IF NOT EXISTS idx_word_urls_word_id ON word_urls(word_id);
+    -- Page -> tokens (store() replacing a re-crawled page's postings)
+    -- Token -> page lookups (search) use the (token_id, url_id) INCLUDE (count) indexes from add_search_indexes.py, built CONCURRENTLY.
+    -- Don't add single-column token_id indexes here: search's re-score step picks them and reads every posting of each query word (~45x slower on 5M test rows),
+    -- and on a big table a missing one would be built with a write lock on every scraper start
     CREATE INDEX IF NOT EXISTS idx_word_urls_url_id ON word_urls(url_id);
-    CREATE INDEX IF NOT EXISTS idx_bigram_urls_bigram_id ON bigram_urls(bigram_id);
     CREATE INDEX IF NOT EXISTS idx_bigram_urls_url_id ON bigram_urls(url_id);
-    CREATE INDEX IF NOT EXISTS idx_trigram_urls_trigram_id ON trigram_urls(trigram_id);
     CREATE INDEX IF NOT EXISTS idx_trigram_urls_url_id ON trigram_urls(url_id);
-    CREATE INDEX IF NOT EXISTS idx_prefix_urls_prefix_id ON prefix_urls(prefix_id);
     CREATE INDEX IF NOT EXISTS idx_prefix_urls_url_id ON prefix_urls(url_id);
     """)
 
