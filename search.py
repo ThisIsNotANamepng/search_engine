@@ -157,16 +157,16 @@ def _cache_put(key, value):
 # word_score + bigram_score + trigram_score + prefix_score.
 _BRANCHES = {
     "word": """
-            SELECT url_id, count AS w FROM word_urls
+            SELECT url_id, count * 100 AS w FROM word_urls
             WHERE word_id = ANY(ARRAY(SELECT id FROM words WHERE word = ANY(%s)))""",
     "bigram": """
-            SELECT url_id, count AS w FROM bigram_urls
+            SELECT url_id, count * 1 AS w FROM bigram_urls
             WHERE bigram_id = ANY(ARRAY(SELECT id FROM bigrams WHERE bigram = ANY(%s)))""",
     "trigram": """
-            SELECT url_id, count AS w FROM trigram_urls
+            SELECT url_id, count * 1 AS w FROM trigram_urls
             WHERE trigram_id = ANY(ARRAY(SELECT id FROM trigrams WHERE trigram = ANY(%s)))""",
     "prefix": """
-            SELECT url_id, count AS w FROM prefix_urls
+            SELECT url_id, count * 2 AS w FROM prefix_urls
             WHERE prefix_id = ANY(ARRAY(SELECT id FROM prefixes WHERE prefix = ANY(%s)))""",
 }
 
@@ -275,10 +275,24 @@ def _fast_search(cur, groups):
     return cur.fetchall()
 
 
-def search(query):
+def show_results(results, details=False):
+    """Print search results, numbered. details=True adds the score breakdown under each one."""
+    if not results:
+        print("  no results")
+        return
+    for i, (url, title, score, relevance, ref_score, reference_count) in enumerate(results, 1):
+        print(f"{i:>2}. {title or '(no title)'}")
+        print(f"    {url}")
+        if details:
+            print(f"    score {score:.4f} | relevance {relevance:.4f} | "
+                  f"ref_score {ref_score:.4f} | reference_count {reference_count}")
+
+
+def search(query, print_results=False, details=False):
     """Run search against the Postgres DB.
 
     Returns a list of (url, title, search_output, relevance, ref_score, reference_count).
+    print_results=True also prints them; details=True adds each result's score breakdown.
     """
     tokenized = tokenizer.tokenize_all(query)
 
@@ -296,6 +310,8 @@ def search(query):
     cached = _cache_get(key)
     if cached is not None:
         debug_print("Cache hit for", query)
+        if print_results:
+            show_results(cached, details)
         return cached
 
     sql_query = _SQL_TEMPLATE.format(
@@ -334,4 +350,33 @@ def search(query):
         debug_print(f"{url}  | title: {title} |  score: {score}  |  relevance: {relevance}  |  ref_score: {ref_score} | reference_count: {ref_count}")
 
     _cache_put(key, results)
+    if print_results:
+        show_results(results, details)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Run from the terminal:  python search.py disney
+#                         python search.py --exact disney   (exact mode: score every matching page, no shortlist)
+# DATABASE_URL comes from the environment, or from the .env file next to this script.
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_file):
+        with open(env_file, encoding="utf-8-sig") as f:
+            for line in f:
+                if "=" in line and not line.strip().startswith("#"):
+                    key, value = line.strip().removeprefix("export ").split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+    args = sys.argv[1:]
+    if "--exact" in args:
+        args.remove("--exact")
+        SEARCH_MODE = "exact"
+
+    if not args:
+        raise SystemExit("Usage: python search.py [--exact] <query>")
+    search(" ".join(args), print_results=True)
