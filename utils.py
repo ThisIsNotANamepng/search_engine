@@ -9,8 +9,11 @@ import requests
 import socket
 import string
 import itertools
+import ipaddress
+import weakref
+import functools
+import queue
 from bs4 import BeautifulSoup
-from bs4.element import Comment
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
 import tldextract
@@ -22,8 +25,6 @@ from psycopg2.extras import execute_values
 from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
 import csv
-import signal
-import threading
 from typing import Optional
 import sqlite3
 import zlib
@@ -31,6 +32,7 @@ import trafilatura
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
 RATE_LIMITED = "rate_limited"
+REDIRECTED = "redirected"
 # Entry point of the proxy chain (proxy A). Proxy A forwards to proxy B
 # (configured on A via PROXY_UPSTREAM), which then makes the real outbound
 # request. Unset to fetch directly without a proxy.
@@ -56,6 +58,8 @@ WEB_STORAGE_CHUNK_SIZE = 64 * 1024
 MAX_URL_LENGTH = 2048  # urls.url, url_queue.url, urls_references.*, icon_link
 MAX_TITLE_LENGTH = 128  # urls.title
 MAX_TOKEN_LENGTH = 64  # words.word, prefixes.prefix
+
+MAX_PAGE_BYTES = 5 * 1024 * 1024  # pages bigger than this (after decompression) are skipped
 
 class CSVTracker:
     def __init__(self, filename: str = "timing.csv"):
@@ -217,9 +221,11 @@ def debug_print(text):
                 # "Committed and closed sql connection"
                 code = "committed_and_closed"
             else:
-                print(f"Code not found: {text}  ::  {text[0:5]}")
+                # Not one of the timed steps (e.g. "Sending to web text storage server"): just printed above
+                code = None
 
-            TIMING_TRACKER.update(URL, code, timing)
+            if code:
+                TIMING_TRACKER.update(URL, code, timing)
 
             DEBUG_BREAKPOINT_TIMER = time.time()
 
@@ -239,103 +245,51 @@ def failure_print(text):
     else:
         print(text)
 
-# --- Connection reuse -------------------------------------------------------
-# Almost every helper below opens a connection, runs one statement and closes it,
-# and the crawler calls several of them per page (log(), is_domain_blocked(),
-# filter_new_urls(), enqueue_urls(), ...). Against a remote database each fresh
-# connection costs several round trips (TCP + auth) -- far more than the query.
-# get_conn() therefore hands out a thin wrapper around a reusable connection:
-# callers still use cursor()/commit()/close() exactly as before, but close()
-# rolls back any open transaction and parks the connection for the next call.
-# Set DB_POOL=0 to get plain, unshared psycopg2 connections again.
-DB_POOL = os.environ.get("DB_POOL", "1") != "0"
-_DB_POOL_MAX_IDLE = 4
-_DB_PING_AFTER = 20.0  # seconds idle before we verify a parked connection is alive
-_idle_conns = []  # [(connection, last_used_monotonic)]
-_idle_lock = threading.Lock()
-
-
-class _PooledConnection:
-    """Proxy for a psycopg2 connection whose close() returns it to the pool."""
-
-    def __init__(self, conn):
-        object.__setattr__(self, "_conn", conn)
-        object.__setattr__(self, "_released", False)
-
+class _ReusableConnection(psycopg2.extensions.connection):
+    """
+    A connection whose close() rolls back and keeps it for the next get_conn() instead of disconnecting.
+    Opening a postgres connection costs a new server process and an auth round trip, and a scrape used ~10 per page.
+    At most one is kept idle; a get_conn() while it's in use (nested or another thread) opens its own, so transactions are never shared.
+    """
     def close(self):
-        if self._released:
-            return
-        object.__setattr__(self, "_released", True)
-        conn = self._conn
-        try:
-            if conn.closed == 0:
-                conn.rollback()  # discard any uncommitted/aborted transaction
-        except Exception:
+        if not self.closed and _IDLE_CONNS.qsize() < 1:
             try:
-                conn.close()
-            except Exception:
-                pass
-            return
-        if conn.closed != 0:
-            return
-        with _idle_lock:
-            if len(_idle_conns) < _DB_POOL_MAX_IDLE:
-                _idle_conns.append((conn, time.monotonic()))
+                self.rollback()  # leave it like a fresh connection (also clears an aborted transaction)
+                _IDLE_CONNS.put(self)
                 return
-        conn.close()
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-    def __setattr__(self, name, value):
-        setattr(self._conn, name, value)
-
-    def __enter__(self):
-        self._conn.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        return self._conn.__exit__(*exc)
-
-
-def _new_connection(database_url):
-    return psycopg2.connect(database_url, keepalives=1, keepalives_idle=30,
-                            keepalives_interval=10, keepalives_count=6)
-
-
-def _take_idle_connection():
-    while True:
-        with _idle_lock:
-            if not _idle_conns:
-                return None
-            conn, last_used = _idle_conns.pop()
-        try:
-            if conn.closed != 0:
-                continue
-            if time.monotonic() - last_used > _DB_PING_AFTER:
-                with conn.cursor() as c:
-                    c.execute("SELECT 1")
-                conn.rollback()
-            return conn
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
+            except psycopg2.Error:
                 pass
+        super().close()
 
+_IDLE_CONNS = queue.SimpleQueue()
 
 def get_conn():
-    """Return a psycopg2-style connection using `DATABASE_URL` (reused across calls, see above)."""
+    """Return a psycopg2 connection using `DATABASE_URL`, reusing the idle one if there is one. Call close() when done with it"""
+    while True:
+        try:
+            conn = _IDLE_CONNS.get_nowait()
+        except queue.Empty:
+            break
+        if not conn.closed:
+            return conn
     database_url = os.getenv("DATABASE_URL")
-    if not database_url:
+    if database_url:
+        conn = psycopg2.connect(database_url, connection_factory=_ReusableConnection)
+        _OPEN_CONNS.add(conn)
+        return conn
+    else:
         failure_print("No DATABASE_URL set, not connecting to server")
-        return None
-    if not DB_POOL:
-        return psycopg2.connect(database_url)
-    conn = _take_idle_connection() or _new_connection(database_url)
-    return _PooledConnection(conn)
 
-    #return psycopg2.connect(host=host, port=port, user=user, password=*** dbname=dbname)
+# Every connection get_conn() opened that's still alive, so close_all_connections() can find ones a caller never closed
+_OPEN_CONNS = weakref.WeakSet()
+
+def close_all_connections():
+    """
+    Really close every open connection (idle ones too), rolling back anything uncommitted.
+    Used on exit: a transaction cut off by SIGTERM (and still referenced, e.g. by the exception) keeps its row locks until the process ends, so the final requeue of the same urls would wait on it forever
+    """
+    for conn in list(_OPEN_CONNS):
+        psycopg2.extensions.connection.close(conn)  # the base close, not _ReusableConnection's which would keep it
 
 def create_database():
     conn = get_conn()
@@ -380,14 +334,6 @@ def create_database():
         referenced_domain VARCHAR(2048) NOT NULL,
         PRIMARY KEY (url, referenced_domain)
     );
-    CREATE TABLE IF NOT EXISTS entities (
-        entity_text VARCHAR(2048) NOT NULL PRIMARY KEY,
-        id INT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS entity_urls (
-        url VARCHAR(2048) NOT NULL PRIMARY KEY,
-        entity_url INT NOT NULL
-    );
                 
     CREATE TABLE IF NOT EXISTS url_token_counts (
         url_id INT PRIMARY KEY REFERENCES urls(id),
@@ -420,8 +366,6 @@ def create_database():
     CREATE TABLE IF NOT EXISTS prefix_urls (prefix_id INT NOT NULL, url_id INT NOT NULL, count INT NOT NULL DEFAULT 1);
     CREATE TABLE IF NOT EXISTS word_urls (word_id INT NOT NULL, url_id INT NOT NULL, count INT NOT NULL DEFAULT 1);
 
-    CREATE TABLE IF NOT EXISTS weights (type TEXT PRIMARY KEY, weight FLOAT NOT NULL);
-
     CREATE TABLE IF NOT EXISTS blocked_domains (
         domain VARCHAR(512) PRIMARY KEY,
         reason VARCHAR(128),
@@ -442,6 +386,16 @@ def create_database():
     -- Functional index matching the unique-domains regex in the dashboard
     CREATE INDEX IF NOT EXISTS urls_domain_idx
         ON urls ((SUBSTRING(url FROM '^(?:https?://)?([^/]+)')));
+
+    -- Token -> page lookups (search) and page -> tokens (store() replacing a re-crawled page's postings)
+    CREATE INDEX IF NOT EXISTS idx_word_urls_word_id ON word_urls(word_id);
+    CREATE INDEX IF NOT EXISTS idx_word_urls_url_id ON word_urls(url_id);
+    CREATE INDEX IF NOT EXISTS idx_bigram_urls_bigram_id ON bigram_urls(bigram_id);
+    CREATE INDEX IF NOT EXISTS idx_bigram_urls_url_id ON bigram_urls(url_id);
+    CREATE INDEX IF NOT EXISTS idx_trigram_urls_trigram_id ON trigram_urls(trigram_id);
+    CREATE INDEX IF NOT EXISTS idx_trigram_urls_url_id ON trigram_urls(url_id);
+    CREATE INDEX IF NOT EXISTS idx_prefix_urls_prefix_id ON prefix_urls(prefix_id);
+    CREATE INDEX IF NOT EXISTS idx_prefix_urls_url_id ON prefix_urls(url_id);
     """)
 
 
@@ -449,7 +403,6 @@ def create_database():
     cur.close()
     conn.close()
 
-    set_default_weights()
     populate_static_ngrams()
 
 def populate_static_ngrams():
@@ -495,42 +448,34 @@ def load_static_token_maps():
     cur.close()
     conn.close()
 
-def set_default_weights():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # Upsert default weights
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("word", 1.7))
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("bigram", 1.2))
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("trigram", 1.3))
-    cur.execute("""
-    INSERT INTO weights (type, weight) VALUES (%s, %s)
-    ON CONFLICT (type) DO UPDATE SET weight = EXCLUDED.weight;
-    """, ("prefix", 1.2))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
 # ----- HTML text extraction utilities
-def tag_visible(element):
-    if element.parent.name in ["style", "script", "head", "title", "meta", "[document]"]:
-        return False
-    if isinstance(element, Comment):
-        return False
-    return True
+# Robots meta / X-Robots-Tag directives aimed at us by name (<meta name="stultussearchengine">, "stultussearchengine: noindex")
+ROBOTS_NAME = USER_AGENT.split("/")[0].lower()
+# Directives that carry a "name: value" themselves, so their colon isn't a crawler name prefix
+_VALUED_DIRECTIVES = ("unavailable_after", "max-snippet", "max-image-preview", "max-video-preview")
+# Links marked with any of these aren't followed or counted as references
+_SKIP_LINK_RELS = {"nofollow", "sponsored", "ugc"}
 
-def extract_data_from_html(body, url):
+def robots_directives(values):
+    """
+    Returns the set of directives (noindex, nofollow, noarchive, ...) in robots meta contents / X-Robots-Tag values that apply to us
+
+    In "googlebot: noindex, nofollow" both directives are for googlebot only: a "name:" prefix applies until the next one
+    """
+    directives = set()
+    for value in values:
+        target = None  # None = every crawler
+        for part in value.lower().split(","):
+            name, colon, rest = part.partition(":")
+            if colon and name.strip() not in _VALUED_DIRECTIVES:
+                target, part = name.strip(), rest
+            if part.strip() and target in (None, ROBOTS_NAME):
+                directives.add(part.strip())
+    if "none" in directives:
+        directives |= {"noindex", "nofollow"}
+    return directives
+
+def extract_data_from_html(body, url, x_robots_tag=""):
     """
     Takes in the bs4 soup and returns the text, links, title, and favicon link from the page
 
@@ -539,18 +484,23 @@ def extract_data_from_html(body, url):
             The html of a page
         url : string
             The url of the page
+        x_robots_tag : string
+            The page's X-Robots-Tag header, combined with its robots meta tags
 
     Returns:
         list
-            [combined_text, links, title, icon_link]
+            [combined_text, links, title, icon_link, directives]
             combined_text : string
-                The visible text in the page
+                The main text of the page (menus, footers etc. left out by trafilatura), None if there is none
             links : list
                 All of the links on the page, as defined by <a> tags
             title : string
                 The title of the page, as defined by the <title> tag
             icon_link : string
                 The url to the favicon of the page
+            directives : set
+                The robots directives that apply to us (noindex, nofollow, noarchive, ...), see robots_directives()
+            Links are [] for a nofollow page and leave out rel="nofollow"/"sponsored"/"ugc" links
     """
 
     # Use lxml parser for speed
@@ -580,31 +530,23 @@ def extract_data_from_html(body, url):
             # If there's no link we still send a None variables to the database
             icon_link = None
 
-    # Remove tags that are not relevant for visible text
+    # Read before <head> and <meta> are dropped below
+    meta_robots = [m.get("content") or "" for m in soup.find_all("meta") if (m.get("name") or "").lower() in ("robots", ROBOTS_NAME)]
+    directives = robots_directives([x_robots_tag, *meta_robots])
+
+    # Links inside these aren't followed
     for tag in soup(["script", "style", "head", "meta", "noscript"]):
         tag.decompose()
 
-    # Prepare base URL for relative links
-    parsed = urlparse(url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    # Relative to the page itself, so href="page2" on /blog/post resolves to /blog/page2, not /page2
+    links = [] if "nofollow" in directives else [
+        urljoin(url, a["href"]) for a in soup.find_all("a", href=True)
+        if not _SKIP_LINK_RELS & {r.lower() for r in a.get("rel", [])}
+    ]
 
-    texts = []
-    links = []
+    combined_text = trafilatura.extract(body)
 
-    # Single tree traversal for both text and links
-    for element in soup.descendants:
-        if element.name == "a" and element.has_attr("href"):
-            links.append(urljoin(base_url, element["href"]))
-        elif isinstance(element, str):
-            # Only collect non-whitespace text
-            t = element.strip()
-            if t:
-                texts.append(t)
-
-    # Join all text fragments into one string
-    combined_text = " ".join(texts)
-
-    return [combined_text, links, title, icon_link]
+    return [combined_text, links, title, icon_link, directives]
 
 def determine_language(text):
     """
@@ -630,36 +572,6 @@ def determine_language(text):
     except LangDetectException:
         return 'unknown'
 
-# robots.txt rarely changes, but the crawler used to re-download it for every single page.
-# Cache the parsed result per origin for an hour (None = "no usable robots.txt, allow all").
-_ROBOTS_TTL = 3600.0
-_ROBOTS_CACHE_MAX = 10000
-_robots_cache = {}  # origin -> (fetched_at_monotonic, RobotFileParser | None)
-
-
-def _fetch_robots(robots_url, user_agent):
-    """Download and parse robots.txt. Returns a parser, or None when there is nothing to enforce."""
-    rp = RobotFileParser()
-    try:
-        rp.set_url(robots_url)
-        if SCRAPER_PROXY:
-            resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
-        else:
-            resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
-        if resp.status_code != 200:
-            # If robots.txt not found or inaccessible, assume allowed
-            return None
-        # rp.parse expects an iterable of lines
-        rp.parse(resp.text.splitlines())
-    except requests.exceptions.RequestException:
-        # Network errors/timeouts -> be permissive so we don't block scraping
-        return None
-    except Exception:
-        # Any unexpected parsing error, be permissive
-        return None
-    return rp
-
-
 def allowed_by_robots(url, user_agent):
     """
     Uses the robots.txt of the site and the user agent of the scraper to determine whether the scraper is allowed to scrape the page
@@ -673,117 +585,154 @@ def allowed_by_robots(url, user_agent):
     Returns:
         boolean
             Allowed to scrape if True, not allowed if False
-
-    Notes:
-        robots.txt is cached per origin for an hour (see _ROBOTS_TTL).
     """
 
     parsed = urlparse(url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    key = (origin, user_agent)
+    robots_url = urljoin(f"{parsed.scheme}://{parsed.netloc}", "robots.txt")
 
-    entry = _robots_cache.get(key)
-    if entry is None or time.monotonic() - entry[0] > _ROBOTS_TTL:
-        rp = _fetch_robots(urljoin(origin, "robots.txt"), user_agent)
-        if len(_robots_cache) >= _ROBOTS_CACHE_MAX:
-            _robots_cache.clear()
-        _robots_cache[key] = (time.monotonic(), rp)
+    try:
+        # The day number is part of the cache key, so each site's robots.txt is fetched at most once a day per scraper instead of once per page
+        rp = _robots_parser(robots_url, user_agent, int(time.time() // 86400))
+    except Exception:
+        # Network errors/timeouts or an unexpected parsing error -> be permissive so we don't block scraping (not cached, so the next page retries)
+        return True
+
+    # No robots.txt (not found or inaccessible) -> assume allowed
+    return rp is None or rp.can_fetch(user_agent, url)
+
+@functools.lru_cache(maxsize=10000)
+def _robots_parser(robots_url, user_agent, day):
+    """Fetch and parse one site's robots.txt. Returns None if the site has none (cached); raises on network errors (lru_cache doesn't cache exceptions)"""
+    if SCRAPER_PROXY:
+        resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
     else:
-        rp = entry[1]
+        resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
+    if resp.status_code != 200:
+        return None
+    rp = RobotFileParser()
+    # rp.parse expects an iterable of lines
+    rp.parse(resp.text.splitlines())
+    return rp
 
-    return True if rp is None else rp.can_fetch(user_agent, url)
+def is_public_host(url):
+    """
+    True if the url's host resolves only to public internet addresses.
+    Stops the crawler from following links or redirects into our own network (db01, localhost, 10.x, ...) and indexing internal pages.
+    shortcut: the host is resolved again for the real request (DNS rebinding could slip past), fine while our internal services aren't high value, pin the resolved IP if that changes
+    """
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except (socket.gaierror, UnicodeError):
+        return False
+    return all(ipaddress.ip_address(a.split("%", 1)[0]).is_global for a in addresses)  # split drops an IPv6 zone like %eth0
 
-def get_page_html(url, timeout=None):
+def get_page_html(url):
     """
     Download the html of a page
-    
+
+    Same-host redirects (http -> https, /old -> /new) are followed here, each hop checked against robots.txt.
+    Redirects to another host aren't followed: they're returned as REDIRECTED so the scraper queues the target, which then gets that host's blocklist, robots.txt and cooldown checks like any other url
+
     Args:
         url : string
             The url of the page you are scraping
-        timeout : int
-            The number of seconds to wait before timing out a connection (might not work, needs testing)
 
     Returns:
-        tuple
-            Directly from extract_data_from_html(), (combined_text, links, title, icon_link)
-            combined_text : string
-                The visible text in the page
-            links : list
-                All of the links on the page, as defined by <a> tags
-            title : string
-                The title of the page, as defined by the <title> tag
-            icon_link : string
-                The url to the favicon of the page
-
-    Notes:
-        On network errors or timeouts, returns empty text and empty links list
-        Maybe think about changing to a Raise error instead of returning empty
+        (result, final_url, x_robots_tag)
+            result is one of:
+                bytes         the raw html of the page
+                RATE_LIMITED  the site answered 429
+                REDIRECTED    the page redirects to another host, final_url is the target
+                False         the page can't or mustn't be scraped (robots.txt, not html, too large, error status, network error)
+            final_url is the url the result came from, after any redirects (not cleaned, so relative links resolve against it)
+            x_robots_tag is the page's X-Robots-Tag header ("" if none), for extract_data_from_html
     """
 
-    def handler(signum, frame):
-        log(f"Error URL took too long to download {url}")
+    if not is_public_host(url):
+        log(f"Error Not a public address {url}")
+        return False, url, ""
 
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
         info_print("Not allowed by robots.txt")
-        ## TODO: Add a line to send this domain to the redis or postgres db so that we don't even attempt to scrape this domain again
-        #Changed this from: return "", [], []
-        #return False, [], []
-        return False
+        return False, url, ""
 
     headers = {
         "User-Agent": USER_AGENT,
         "From": "crawler@stultus.rip"
     }
 
-    signal.signal(signal.SIGALRM, handler)
-    signal.alarm(timeout or 0)
-
-    try:
+    def fetch(target):
+        # One hop: redirects are followed below so every target is checked first
+        # stream=True: only the headers are read here, so status and Content-Type are checked before any body is downloaded
         if SCRAPER_PROXY:
-            request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False)
-            redirect_hops = 0
-            while request.is_redirect and redirect_hops < 5:
-                location = request.headers.get("Location", "")
-                if not location:
-                    break
-                url = urljoin(url, location)  # relative Location -> absolute target url
-                request = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False)
-                redirect_hops += 1
-        else:
-            request = requests.get(url, headers=headers, timeout=(5, 10))
+            return requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": target}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
+        return requests.get(target, headers=headers, timeout=(5, 10), allow_redirects=False, stream=True)
+
+    request = None
+    try:
+        request = fetch(url)
+        redirect_hops = 0
+        while request.is_redirect:
+            location = request.headers.get("Location", "")
+            if not location or redirect_hops >= 5:
+                log(f"Error Empty redirect or too many redirects {url}")
+                return False, url, ""
+            target = urljoin(url, location)  # relative Location -> absolute target url
+            if urlparse(target).hostname != urlparse(url).hostname:
+                return REDIRECTED, target, ""
+            url = target
+            request.close()
+            if not is_public_host(url):
+                log(f"Error Redirect to a non-public address {url}")
+                return False, url, ""
+            if not allowed_by_robots(url, USER_AGENT):
+                log(f"Blocked by robots.txt {url}")
+                return False, url, ""
+            request = fetch(url)
+            redirect_hops += 1
 
         content_type = request.headers.get("Content-Type", "").lower()
 
+        # Skip just this page: one protected url (/admin, a bot challenge) shouldn't block the whole host
         if request.status_code in (401, 403):
-            block_domain(url, f"HTTP {request.status_code}")
-            return False
+            log(f"Error HTTP {request.status_code} {url}")
+            return False, url, ""
 
         if request.status_code == 429:
             log(f"Error Rate limited {url}")
-            return RATE_LIMITED
+            return RATE_LIMITED, url, ""
 
         # Only allow HTML content
         if not (
             content_type.startswith("text/html")
         ):
             log(f"Error Invalid data type {url}")
-            return False
+            return False, url, ""
 
-        content = request.content
-            
+        # Read at most MAX_PAGE_BYTES; a huge page would otherwise be loaded into memory whole
+        content = bytearray()
+        for chunk in request.iter_content(chunk_size=64 * 1024):
+            content += chunk
+            if len(content) > MAX_PAGE_BYTES:
+                log(f"Error Page too large {url}")
+                return False, url, ""
+        content = bytes(content)
+
     except TimeoutError:
         log(f"Error Total timeout exceeded {url}")
-        return False
+        return False, url, ""
     except requests.exceptions.RequestException as e:
         log(f"Error HTTP error fetching: {url} : {e}")
-        return False
+        return False, url, ""
     finally:
-        #print(5)
-        signal.alarm(0)
+        if request is not None:
+            request.close()
 
-    return content
-    #return extract_data_from_html(content, url)
+    return content, url, request.headers.get("X-Robots-Tag", "")
 
 def log(message):
     """
@@ -845,68 +794,6 @@ def get_base_domain(url):
         return ext.top_domain_under_public_suffix
     return host
 
-def block_domain(url, reason=""):
-    """
-    Add a domain to the list (in the database) of domains we don't scrape
-    
-    Args:
-        url : string
-            The url which we aren't allowed to scrape
-        reason : string
-            The reason for not being allowed
-    
-    Returns:
-        Nothing
-
-    TODO:
-        - I don't think we use this blocked_domains table anywhere else, we should integrate that into scraping so we actually check it
-
-    Notes:
-        We don't use the reason variable at all, but we totally couple if we wanted
-    """
-    domain = get_base_domain(url)
-    if not domain:
-        return
-    
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("INSERT INTO blocked_domains (domain, reason) VALUES (%s, %s) ON CONFLICT (domain) DO NOTHING;", (domain, reason))
-    cur.execute("DELETE FROM url_queue WHERE url LIKE %s;", (f"%{domain}%",))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    log(f"Blocked domain {domain} reason={reason}")
-
-def is_domain_blocked(domain):
-    """
-    Checks the db table to determine whether a domain is allowed to be scraped
-    
-    Args:
-        domain : string
-            The domain to check
-    
-    Return:
-        boolean
-            True if the domain is blocked, False if not
-
-    TODO:
-        - This only checks the table in the big db for when we hit a domain which returns an error code that indicates we should stop scraping. We check the local distributed sqlite3 dbs which are created from malware blocklists in a different spot in the code, we should combine those two functions into one
-    """
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT 1 FROM blocked_domains WHERE domain = %s;", (domain,))
-
-    blocked = cur.fetchone() is not None
-    cur.close()
-    conn.close()
-
-    return blocked
-
 def clean_links(raw_links):
     """
     Takes in raw links and cleans them for storage in the index. Removes ? post parameter and # things and non-http links and any trailing slashes /
@@ -923,7 +810,7 @@ def clean_links(raw_links):
     # Clean links, this is copied from scrape.py, should probably have a shred function but it's 10:55pm and I'm tired
     # This above comment caused issues. The cleaning here is for cleaning links to add to the scraping, while cleaning in scrape.py is for references so it just need to be the base domains
     cleaned = []
-    seen = set()  # O(1) duplicate check (was a linear scan of `cleaned` per link)
+    seen = set()  # same contents as cleaned; a set so checking for duplicates doesn't rescan the list (O(n^2) on pages with thousands of links)
 
     for link in raw_links:
         clean_link = link.split('?', 1)[0] #gets rid of anything after a ?
@@ -937,8 +824,8 @@ def clean_links(raw_links):
         if clean_link not in seen:
             # Gets rid of links that aren't http(s) and are longer than the max url length (as dictated by the postgres length limits)
             if clean_link[0:4] == "http" and len(clean_link) <= MAX_URL_LENGTH:
-                seen.add(clean_link)
                 cleaned.append(clean_link)
+                seen.add(clean_link)
 
     return cleaned
 
@@ -961,27 +848,9 @@ def store(content, url):
 
     load_static_token_maps()
 
-    #content = get_page_html(url, timeout=timeout)
-
     debug_print("Visited site, got main text and links")
 
-    ## TODO: Changes moving some loop jurisdiction likely broke the need to return the rate limiting, need to fix that. Need to do what we need to do when we hit a rate limit here in this function, and then handle getting a rate limit signal in the scrape.py loop
-    if content == RATE_LIMITED:
-        return RATE_LIMITED
-
-    if content != False:
-        # The url contains real text to scrape
-        text = content[0]
-        links = content[1]
-        title = content[2]
-        icon_link = content[3]
-    else:
-        # Url is a file format which cannot be scraped
-        ## TODO: I don't think this completely works, need to test with a bunch of file formats so we don't try to scrape files like images and stuff
-
-        print(content)
-        info_print("URL stores a file format we can't scrape")
-        return
+    text, links, title, icon_link = content[:4]
     
     # Making sure there is text at all. I chose 4 arbitrarily
     if text != None and len(text) < 4:
@@ -1045,8 +914,12 @@ def store(content, url):
     if row:
         url_id = row[0]
     else:
+        # Already stored (re-crawl or two scrapers on the same url): the UPDATE locks the row so
+        # concurrent stores of this url run one at a time, and refreshes total_tokens for the new scrape
         cur.execute("UPDATE urls SET total_tokens = %s WHERE url = %s RETURNING id;", (total_tokens, url))
         url_id = cur.fetchone()[0]
+        for table in ("word_urls", "bigram_urls", "trigram_urls", "prefix_urls"):
+            cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = %s;").format(sql.Identifier(table)), (url_id,))
 
 
     cur.execute("""
@@ -1066,20 +939,19 @@ def store(content, url):
         len(prefixes)
     ))
     
-    # Bulk insert words/bigrams/trigrams/prefixes using execute_values.
-    if words:
-        extra_vals = [(w,) for w in words]
-        extras.execute_values(cur,
-            "INSERT INTO words (word) VALUES %s ON CONFLICT (word) DO NOTHING;",
-            extra_vals,
-            template=None)
+    # Bulk insert new words/prefixes (bigrams/trigrams are pre-populated).
+    # Only rows that don't exist yet: postgres burns an id for every attempted row even when ON CONFLICT skips it, which overflows the INT ids.
+    # ORDER BY: every scraper locks new tokens in the same order, otherwise two scrapers inserting the same new words deadlock.
+    for column, table, tokens in (("word", "words", words), ("prefix", "prefixes", prefixes)):
+        if tokens:
+            cur.execute(sql.SQL("""
+                INSERT INTO {tbl} ({col})
+                SELECT t FROM unnest(%s::varchar[]) AS t
+                WHERE NOT EXISTS (SELECT 1 FROM {tbl} WHERE {col} = t)
+                ORDER BY t
+                ON CONFLICT ({col}) DO NOTHING;
+            """).format(col=sql.Identifier(column), tbl=sql.Identifier(table)), (list(tokens),))
 
-    if prefixes:
-        extra_vals = [(p,) for p in prefixes]
-        extras.execute_values(cur,
-            "INSERT INTO prefixes (prefix) VALUES %s ON CONFLICT (prefix) DO NOTHING;",
-            extra_vals)
-        
     if links:
         extra_vals = [(url, l) for l in links]
         extras.execute_values(cur, "INSERT INTO urls_references (url, referenced_domain) VALUES %s ON CONFLICT DO NOTHING;", extra_vals, template=None)
@@ -1142,32 +1014,13 @@ def store(content, url):
 
     return links
 
-def delete_url(url):
+def mark_url_seen(url):
+    """Record a url without indexing its text (no tokens, so it never shows up in search), so filter_new_urls() won't queue it again"""
+    if NODB or len(url) > MAX_URL_LENGTH:
+        return
     conn = get_conn()
     cur = conn.cursor()
-
-    cur.execute("SELECT id FROM urls WHERE url = %s", (url,))
-    row = cur.fetchone()
-    if not row:
-        cur.close()
-        conn.close()
-        return
-
-    url_id = row[0]
-
-    cur.execute("DELETE FROM word_urls WHERE url_id = %s", (url_id,))
-    cur.execute("DELETE FROM bigram_urls WHERE url_id = %s", (url_id,))
-    cur.execute("DELETE FROM trigram_urls WHERE url_id = %s", (url_id,))
-    cur.execute("DELETE FROM prefix_urls WHERE url_id = %s", (url_id,))
-
-    cur.execute("DELETE FROM urls WHERE id = %s", (url_id,))
-
-    # cleanup orphaned entries
-    cur.execute("DELETE FROM words WHERE id NOT IN (SELECT DISTINCT word_id FROM word_urls)")
-    cur.execute("DELETE FROM bigrams WHERE id NOT IN (SELECT DISTINCT bigram_id FROM bigram_urls)")
-    cur.execute("DELETE FROM trigrams WHERE id NOT IN (SELECT DISTINCT trigram_id FROM trigram_urls)")
-    cur.execute("DELETE FROM prefixes WHERE id NOT IN (SELECT DISTINCT prefix_id FROM prefix_urls)")
-
+    cur.execute("INSERT INTO urls (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (url,))
     conn.commit()
     cur.close()
     conn.close()
@@ -1183,111 +1036,25 @@ def enqueue_url(url):
     conn.close()
 
 
-def queue_size():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM url_queue;")
-    count = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    return count
-
 def get_next_urls(num_urls):
-    # Returns a list of the next urls in the queue, deletes them from the db queue
+    # Returns a list of the next urls in the queue ([] if empty), deletes them from the db queue
+    # SKIP LOCKED in one statement so concurrent scrapers never claim the same rows
 
     conn = get_conn()
     cur = conn.cursor()
 
-    # One atomic statement. FOR UPDATE SKIP LOCKED means concurrent crawlers never
-    # receive the same URLs (the old SELECT-then-DELETE could hand one URL to several
-    # crawlers), and it needs one round trip instead of two.
     cur.execute("""
-        DELETE FROM url_queue
-        WHERE id IN (
+        DELETE FROM url_queue WHERE id IN (
             SELECT id FROM url_queue ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
-        )
-        RETURNING id, url;
+        ) RETURNING url;
     """, (num_urls,))
-    rows = sorted(cur.fetchall())  # RETURNING order is unspecified; keep queue (id) order
+    urls = [row[0] for row in cur.fetchall()]
+
     conn.commit()
     cur.close()
     conn.close()
 
-    # Nothing in the queue
-    if not rows:
-        return None
-
-    return [row[1] for row in rows]
-
-def pop_next_url():
-    """
-    Pop the next URL from the queue and return it.
-    If the queue's first two URLs are from the same base domain, rotate the first URL to the end and return None.
-    If the queue is empty, return None.
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-
-    def get_next_urls(conn, cur):
-        cur.execute("SELECT id, url FROM url_queue ORDER BY id LIMIT 2;")
-        rows = cur.fetchall()
-        if not rows:
-            cur.close()
-            conn.close()
-            return None
-
-        if len(rows) == 1:
-            row = rows[0]
-            cur.execute("DELETE FROM url_queue WHERE id = %s;", (row[0],))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return row[1]
-
-        # Two rows: check domain
-        first_id, first_url = rows[0]
-        
-        second_id, second_url = rows[1]
-
-        return(first_id, first_url, second_id, second_url)
-       
-    def check_for_bad_domain(url):
-        try:
-            second_domain = get_base_domain(second_url)
-            return False
-        except:
-            delete_from_queue(second_url)
-            return True
-
-    data = get_next_urls(conn, cur)
-    first_id = data[0]
-    first_url = data[1]
-    second_id = data[2]
-    second_url = data[3]
-
-    while check_for_bad_domain(second_url):
-        # check_for_bad_domain() returns False for a good domain
-        data = get_next_urls(conn, cur)
-        first_id = data[0]
-        first_url = data[1]
-        second_url = data[3]
-
-    if get_base_domain(first_url) == get_base_domain(second_url):
-        # rotate: remove first then reinsert it so it goes to the end
-        cur.execute("DELETE FROM url_queue WHERE id = %s;", (first_id,))
-        cur.execute("INSERT INTO url_queue (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (first_url,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return None
-
-    # otherwise pop the first
-    cur.execute("DELETE FROM url_queue WHERE id = %s;", (first_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return first_url
-
+    return urls
 
 def get_host_ip():
     """Return the host machine IP address. Try local hostname first, then fallback to external lookup."""
@@ -1312,16 +1079,6 @@ def log_db(message):
     conn.close()
     #print("DB Log time:", time.time()-start)
 
-"""
-def enqueue_urls(urls):
-    conn = get_conn()
-    cur = conn.cursor()
-    for u in urls:
-        cur.execute("INSERT INTO url_queue (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (u,))
-    conn.commit()
-    cur.close()
-    conn.close()
-"""
 def enqueue_urls(urls):
     if not urls:
         return
@@ -1378,35 +1135,16 @@ def filter_new_urls(urls):
     return result
 
 
-def delete_from_queue(url):
-    """Delete `url` from the `url_queue` table.
-
-    Returns the number of rows deleted (0 if not present, 1 if removed).
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM url_queue WHERE url = %s;", (url,))
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    return deleted
-
 # ------------ Redis functions
 
 def mark_domain(domain, redis_client):
-    # Marks domain as scraped
+    # Called after a scrape finishes: restart the 10 second cooldown so it also counts from the end of a slow scrape
+    redis_client.set(f"domain:{domain}", 1, ex=10)
 
-    key = f"domain:{domain}"
-    # SET key with NX (only if not exists) and EX (expire)
-    redis_client.set(key, 1, nx=True, ex=10)
-
-def domain_free_for_scraping(domain, redis_client):
-    # Checks the redis db if domain has been scraped in the last 10 seconds
-    # True for not in db and can be scraped, False for not
-
-    key = f"domain:{domain}"
-    return not redis_client.exists(key)
+def claim_domain(domain, redis_client):
+    # Atomically claims the domain for 10 seconds (SET NX): True if it was free and is now ours, False if another scraper touched it in the last 10 seconds
+    # Check and claim must be one step, otherwise scrapers that check at the same time all see it free
+    return bool(redis_client.set(f"domain:{domain}", 1, nx=True, ex=10))
 
 def _refresh_blocklist_if_stale():
     """
@@ -1451,18 +1189,20 @@ def _refresh_blocklist_if_stale():
 
 def check_url_in_blocklist(url):
     """
-    Takes url, checks if base domain in the blocklist.db
+    Takes url, checks if its exact host or base domain is in blocklist.db (Steven Black's hosts + postgres blocked_domains)
 
-    Returns True if the domain is in the blocklist (cannot scrape), False if not
+    Exact host catches the hosts file's subdomain entries, base domain catches opt-outs (example.com also covers www.example.com)
+
+    Returns True if blocked (cannot scrape), False if not
     """
+
+    domains = (urlparse(url).hostname, get_base_domain(url))
 
     _refresh_blocklist_if_stale()
 
-    domain = get_base_domain(url)
-
     conn = sqlite3.connect("blocklist.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * from blocklist where domain=(?)", (domain,))
+    cursor.execute("SELECT 1 FROM blocklist WHERE domain IN (?, ?)", domains)
     result = cursor.fetchone()
     conn.close()
 

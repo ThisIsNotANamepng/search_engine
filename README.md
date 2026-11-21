@@ -41,7 +41,7 @@ git clone https://github.com/ThisIsNotANamepng/search_engine.git
 cd search_engine
 python -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt  # requirements.txt alone is enough to run the scraper/servers
 DATABASE_URL="postgres://postgres:postgressPassword@postgressIP:5432/search_engine" python3 fileNameHere.py
 ```
 
@@ -52,7 +52,7 @@ git clone https://github.com/ThisIsNotANamepng/search_engine.git
 cd search_engine
 python -m venv venv
 venv\Scripts\Activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt  # requirements.txt alone is enough to run the scraper/servers
 $env:DATABASE_URL = "postgres://postgres:postgressPassword@postgressIP:5432/search_engine" 
 ```
 

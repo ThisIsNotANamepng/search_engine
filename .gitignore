@@ -22,4 +22,12 @@ cleaned_hosts.txt
 hosts.txt
 supporting_servers/data/
 supporting_servers/stats.py
+<<<<<<< HEAD
 setup_worker.sh
+=======
+supporting_servers/data/*
+setup_worker.sh
+
+# Downloaded production pages for tests/search_lab
+tests/search_lab/data/
+>>>>>>> 73cd0f001c5df88fa2ab99b2950dfef4a05fd090

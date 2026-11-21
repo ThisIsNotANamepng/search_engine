@@ -40,6 +40,8 @@ Design notes:
 
 Configuration (environment variables):
   HEAD_URL              (required) base URL of the head/dashboard, e.g. http://db01:5000
+  ADMIN_PASSWORD        (required with HEAD_URL) the head's ADMIN_PASSWORD, sent as
+                        HTTP basic auth on each heartbeat
   NODE_ID               stable id for this box            (default: hostname)
   CRAWLER_IMAGE         container image to run            (default: localhost/stultus:latest)
   CTR_BIN               ctr executable                    (default: /usr/local/bin/ctr)
@@ -66,6 +68,7 @@ named "stultus-<node>-<slot>" within the CTR_NAMESPACE.
 
 import os
 import re
+import base64
 import time
 import json
 import shlex
@@ -121,6 +124,7 @@ def _float_env(name, default):
 
 
 HEAD_URL = os.getenv("HEAD_URL", "").rstrip("/")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 NODE_ID = os.getenv("NODE_ID") or socket.gethostname()
 
 CTR_BIN = os.getenv("CTR_BIN", "/usr/local/bin/ctr")
@@ -394,10 +398,14 @@ class NodeAgent:
         if not HEAD_URL:
             return  # standalone mode: no head, just supervise at INITIAL_DESIRED
         try:
+            headers = {"Content-Type": "application/json"}
+            if ADMIN_PASSWORD:
+                token = base64.b64encode(f"agent:{ADMIN_PASSWORD}".encode()).decode()
+                headers["Authorization"] = f"Basic {token}"
             req = urllib.request.Request(
                 f"{HEAD_URL}/agent/heartbeat",
                 data=json.dumps(self._state()).encode(),
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=5) as resp:

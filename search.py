@@ -202,7 +202,7 @@ _SQL_TEMPLATE = """
             ref_score,
             reference_count
         FROM scored
-        ORDER BY search_output DESC
+        ORDER BY search_output DESC, url  -- url breaks ties so results are stable
         LIMIT 10;
 """
 
@@ -339,7 +339,3 @@ def search(query):
 
     _cache_put(key, results)
     return results
-
-# Example usage:
-query = input("Search query: ")
-print(search(query))

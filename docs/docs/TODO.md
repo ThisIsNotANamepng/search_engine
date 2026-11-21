@@ -5,7 +5,7 @@
 ## Summer 2026 Cleanup
 
 - [ ] Add standardized comments describing the inputs/outputs for all utils.py functions
-- [ ] Make the tests code work for testing new algorithms and speed
+- [x] Make the tests code work for testing new algorithms and speed
 - [x] Add ability to give a scraper a link to scrape for debugging, also not add to the index
 
 ## Web Crawling
