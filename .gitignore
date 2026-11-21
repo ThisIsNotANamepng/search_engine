@@ -22,3 +22,6 @@ reeds-secrets-he-doesnt-want-to-share.md
 supporting_servers/stats.py
 supporting_servers/data/*
 setup_worker.sh
+
+# Downloaded production pages for tests/search_lab
+tests/search_lab/data/

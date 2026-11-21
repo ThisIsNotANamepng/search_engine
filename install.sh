@@ -1,7 +1,7 @@
 # Installs the Stultus crawler code
-# Really just does pip install a bunch of times
+# Really just does pip install (requirements.txt is the one list of what the code needs)
 
 python3 -m venv .env
 source .env/bin/activate
-pip install langdetect psycopg2-binary nltk tldextract bs4 trafilatura attrs requests redis lxml gunicorn trafilatura
+pip install -r requirements.txt
 
