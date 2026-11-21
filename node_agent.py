@@ -63,6 +63,8 @@ Configuration (environment variables):
   HEARTBEAT_INTERVAL    seconds between heartbeats        (default: 10)
   RECONCILE_INTERVAL    seconds between supervise ticks   (default: 1)
   TERM_GRACE            seconds to wait for a container to stop before SIGKILL (default: 10)
+  START_SPACING         seconds between starting two crawlers on this box, so their
+                        startup database setup doesn't collide (default: 5)
 
 The forwarded env vars (DATABASE_URL, SCRAPER_PROXY, etc.) only need to be set
 once in the agent's environment (systemd unit / EnvironmentFile). Containers are
@@ -70,6 +72,7 @@ named "stultus-<node>-<slot>" within the CTR_NAMESPACE.
 """
 
 import os
+import random
 import re
 import time
 import json
@@ -152,6 +155,7 @@ INITIAL_DESIRED = _int_env("INITIAL_DESIRED", 1)
 HEARTBEAT_INTERVAL = _float_env("HEARTBEAT_INTERVAL", 10.0)
 RECONCILE_INTERVAL = _float_env("RECONCILE_INTERVAL", 1.0)
 TERM_GRACE = _float_env("TERM_GRACE", 10.0)
+START_SPACING = _float_env("START_SPACING", 5.0)
 
 RUN_BATCHER = _flag("RUN_BATCHER", "0")
 BATCHER_PORT = _int_env("BATCHER_PORT", 8004)
@@ -312,6 +316,9 @@ class NodeAgent:
         self.slots = {}
         self.desired = INITIAL_DESIRED
         self.running = True
+        # When the next crawler may start (see START_SPACING). The random first wait spreads
+        # out the nodes too, when they all restart at once.
+        self.next_crawler_start = time.time() + random.uniform(0, START_SPACING)
         # Prime cpu_percent() so later calls return a real delta, not 0.0.
         cpu_percent()
 
@@ -383,12 +390,17 @@ class NodeAgent:
             self._stop(slot_id)
 
         # 3. Scale up / restart: ensure the batcher (first, the crawlers write to it) and slots 0..desired-1 are running.
+        #    Crawlers start one at a time, START_SPACING apart: several running their startup
+        #    database setup at once deadlock in postgres and crash.
         for slot_id in ([BATCHER_SLOT] if RUN_BATCHER else []) + list(range(self.desired)):
             slot = self.slots.get(slot_id)
-            if slot is None:
-                self._spawn(slot_id, restarts=0)
-            elif slot["proc"] is None and now >= slot["next_start"]:
-                self._spawn(slot_id, restarts=slot["restarts"])
+            if slot is not None and (slot["proc"] is not None or now < slot["next_start"]):
+                continue
+            if slot_id != BATCHER_SLOT:
+                if now < self.next_crawler_start:
+                    break
+                self.next_crawler_start = now + START_SPACING
+            self._spawn(slot_id, restarts=slot["restarts"] if slot else 0)
 
     # ---- heartbeat --------------------------------------------------------- #
     def _state(self):
