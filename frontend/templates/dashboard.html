@@ -294,10 +294,37 @@ button:focus-visible, .scale input:focus-visible { outline: 3px solid var(--yell
 .search-stats .metric-label { font-size: 12px; }
 
 /* =====================
+   Scrape now / queue
+===================== */
+.queue-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 24px; align-items: start; }
+.push-form { display: flex; flex-direction: column; gap: 10px; }
+.push-form textarea {
+    width: 100%; resize: vertical; min-height: 84px; padding: 10px 12px;
+    font: inherit; font-size: 15px; color: var(--ink); background: #fff;
+    border: 3px solid var(--ink); border-radius: 0;
+}
+.push-form textarea:focus-visible { outline: 3px solid var(--yellow); outline-offset: 1px; }
+.push-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.push-actions button { font-size: 15px; padding: 8px 18px; background: var(--red); border-color: var(--red); color: #fff; }
+.push-actions button:hover { background: var(--ink); border-color: var(--ink); }
+.push-actions button:disabled { opacity: .5; cursor: wait; }
+.push-results { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+.push-results li { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.push-results li .shape { width: 10px; height: 10px; }
+.queue-counts { display: grid; grid-template-columns: 1fr 1fr; border: 2px solid var(--ink); margin-bottom: 14px; }
+.queue-counts > div { padding: 12px 14px; border-top: 10px solid var(--blue); }
+.queue-counts > div + div { border-left: 2px solid var(--ink); border-top-color: var(--yellow); }
+.queue-counts .metric-value { font-size: 30px; margin-top: 4px; }
+.queue-counts .metric-label { font-size: 12px; }
+tr.pushed td:first-child { font-weight: 700; }
+tr.pushed td:first-child::before { content: ""; display: inline-block; width: 8px; height: 8px; background: var(--red); margin-right: 8px; vertical-align: middle; }
+
+/* =====================
    Responsive
 ===================== */
 @media (max-width: 1100px) {
     .dashboard-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    .queue-layout { grid-template-columns: minmax(0, 1fr); }
     .col-3 { grid-column: span 3; }
     .col-4, .col-6, .col-8, .col-12 { grid-column: span 6; }
 }
@@ -323,7 +350,8 @@ button:focus-visible, .scale input:focus-visible { outline: 3px solid var(--yell
     .service .name { font-size: 13px; }
     .search-stats .metric-value { font-size: 19px; }
     .search-stats > div { padding: 10px; }
-    .search-layout { grid-template-columns: minmax(0, 1fr); }
+    .search-layout, .queue-layout { grid-template-columns: minmax(0, 1fr); }
+    .queue-counts .metric-value { font-size: 20px; }
     .hide-sm { display: none; }
 }
 </style>
@@ -397,6 +425,34 @@ button:focus-visible, .scale input:focus-visible { outline: 3px solid var(--yell
                         <tr><td colspan="8" class="muted">Loading…</td></tr>
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <!-- Scrape now: push URLs to the front of the crawl queue -->
+        <div class="card c-red col-12 auto-row">
+            <h2>Scrape Now <span class="sub">goes to the front of the queue; the next crawler that needs work takes it</span></h2>
+            <div class="queue-layout">
+                <form id="push-form" class="push-form">
+                    <label for="push-urls" class="metric-label">Sites to scrape, one per line</label>
+                    <textarea id="push-urls" rows="3" placeholder="https://example.com/&#10;uwec.edu" spellcheck="false" autocomplete="off"></textarea>
+                    <div class="push-actions">
+                        <button type="submit" id="push-btn">Scrape now</button>
+                        <span class="muted" id="push-hint">Up to 50 at a time. https:// is added if missing.</span>
+                    </div>
+                    <ul class="push-results" id="push-results"></ul>
+                </form>
+                <div>
+                    <div class="queue-counts">
+                        <div><div class="metric-label">Waiting</div><div class="metric-value" id="q-waiting">–</div></div>
+                        <div><div class="metric-label">Being scraped</div><div class="metric-value" id="q-claimed">–</div></div>
+                    </div>
+                    <div class="table-box">
+                        <table>
+                            <thead><tr><th>Up next</th><th>Queued</th></tr></thead>
+                            <tbody id="queue-next"><tr><td colspan="2" class="muted">Loading…</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -644,6 +700,48 @@ function renderSearch(s) {
     )));
 }
 
+// ---------- scrape now / queue ----------
+function renderQueue(q) {
+    if (!q) return;
+    setText("q-waiting", (q.estimated ? "~" : "") + fmtNum(q.waiting));
+    setText("q-claimed", fmtNum(q.claimed));
+    const tbody = document.getElementById("queue-next");
+    if (!q.next.length) {
+        tbody.replaceChildren(el("tr", {}, el("td", { colspan: "2", class: "muted", text: "The queue is empty: crawlers have nothing to do." })));
+        return;
+    }
+    tbody.replaceChildren(...q.next.map(r => el("tr", { class: r.pushed ? "pushed" : "", title: r.pushed ? "Added from the dashboard" : "" },
+        el("td", { class: "url", text: r.url }),
+        el("td", { text: String(r.enqueued_at).slice(11, 19) }),
+    )));
+}
+
+document.getElementById("push-form").addEventListener("submit", e => {
+    e.preventDefault();
+    const box = document.getElementById("push-urls");
+    const btn = document.getElementById("push-btn");
+    const list = document.getElementById("push-results");
+    if (!box.value.trim()) { box.focus(); return; }
+    btn.disabled = true;
+    fetch("/queue/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls: box.value }),
+    })
+    .then(r => r.json().then(d => r.ok ? d : Promise.reject(d)))
+    .then(d => {
+        list.replaceChildren(...d.results.map(r => el("li", { class: r.ok ? "ok" : "bad" },
+            el("span", { class: "shape" }),
+            el("span", { text: `${r.url || r.input}: ${r.status}${r.already_indexed ? " (already in the index; it will be scraped again)" : ""}` }),
+        )));
+        if (d.results.every(r => r.ok)) box.value = "";
+        pollLive();
+    })
+    .catch(err => list.replaceChildren(el("li", { class: "bad" }, el("span", { class: "shape" }),
+        el("span", { text: (err && err.error) || "Couldn't reach the head server." }))))
+    .finally(() => { btn.disabled = false; });
+});
+
 // ---------- live polling ----------
 let lastLive = { nodes: [] };
 let lastLiveAt = null;
@@ -657,9 +755,11 @@ function pollLive() {
             renderHealth(d.health);
             renderNodes(d.nodes);
             renderSearch(d.search);
+            renderQueue(d.queue);
             const banner = document.getElementById("banner");
-            banner.textContent = d.nodes_error ? `Couldn't read crawler nodes: ${d.nodes_error}` : "";
-            banner.classList.toggle("show", !!d.nodes_error);
+            const dbError = d.nodes_error || d.queue_error;
+            banner.textContent = dbError ? `Couldn't read from Postgres: ${dbError}` : "";
+            banner.classList.toggle("show", !!dbError);
         })
         .catch(e => {
             const banner = document.getElementById("banner");
