@@ -80,3 +80,13 @@ TEST_DATABASE_URL=postgresql://user@host/stultus_test STULTUS_ALLOW_DDL=1 python
 ```
 
 The end-to-end test crawls a local server with five loopback "hosts" and checks one request in flight per host, delays, the per-host cap, robots.txt, skipped PDFs, cross-host redirects, 404s and a 429 host.
+
+## English only (default)
+
+`INDEX_LANGUAGES` defaults to `en`. In that mode the crawler:
+
+- indexes only pages the language gate (`tokenizer.language_gate`) detects as English; pages with no detectable language pass only if their letters are mostly Latin
+- skips urls that are very likely non-English *before fetching them*: non-English country TLDs (`.de`, `.ru`, `.jp`, `.com.br`, ...), language subdomains (`de.wikipedia.org`, `pt-br.example.com`) and language path prefixes (`/fr/`, `/de-de/`), see `crawl_lib/urls.looks_foreign`
+- once a host serves a non-English page, fetches nothing more from it and doesn't follow that page's links
+
+Set `INDEX_LANGUAGES=all` (or a list such as `en,de`) to index other languages with the multilingual tokenizer.

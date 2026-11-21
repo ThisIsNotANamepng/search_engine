@@ -23,7 +23,7 @@ Multilingual design
 * The bigram/trigram tables only hold a-z, so non-ASCII n-grams are dropped by the storer.
   Words and prefixes (VARCHAR(64)) carry the Unicode text.
 * language_gate(text) decides whether a page should be indexed at all; see its docstring.
-  Policy comes from env INDEX_LANGUAGES ('all' by default, or e.g. 'en,de,fr').
+  Policy comes from env INDEX_LANGUAGES ('en' by default; 'all', or a list like 'en,de,fr').
 """
 import math
 import os
@@ -291,7 +291,8 @@ def language_gate(text):
       * more than 50% of the letters (first 20k chars) in Thai/Lao/Khmer/Myanmar/Tibetan
         -> (False, 'unknown'-or-detected, 'unsupported_script')
       * no letters at all -> (False, 'unknown', 'no_letters')
-      * env INDEX_LANGUAGES='all' (default): index everything else, lang from langdetect
+      * env INDEX_LANGUAGES='en' (default): index only English (unknown-language pages pass if mostly Latin letters)
+      * INDEX_LANGUAGES='all': index everything else, lang from langdetect
         (first ~2000 chars, seed 0, 'unknown' if it fails)
       * INDEX_LANGUAGES='en,de,fr': index only those (compared on the part before '-', so zh-cn
         matches 'zh'). 'unknown' passes only if most letters are Latin.
@@ -311,7 +312,7 @@ def language_gate(text):
 
     lang = _langdetect(text[:_GATE_LANG_SAMPLE])
 
-    policy = os.environ.get('INDEX_LANGUAGES', 'all').strip().lower()
+    policy = os.environ.get('INDEX_LANGUAGES', 'en').strip().lower()
     if policy in ('', 'all', '*'):
         return True, lang, 'all_languages'
     allowed = {x.strip() for x in policy.split(',') if x.strip()}

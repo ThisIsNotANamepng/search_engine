@@ -380,6 +380,9 @@ class Crawler:
         self.accepted = Counter()      # host key -> urls this process queued (frontier or db queue)
         self.claimed_open = set()      # claimed from url_queue, not finished yet
         self.retry_later = set()       # claimed urls left claimed on purpose (rate limited): the claim timing out is their retry delay
+        self.foreign_hosts = set()     # hosts that served a non-English page this run
+        # English-only unless INDEX_LANGUAGES allows other languages: then foreign-looking urls are skipped before fetching too
+        self.english_only = os.environ.get("INDEX_LANGUAGES", "en").strip().lower() in ("en", "en-us", "en-gb")
         self.seen_mem = set()          # --nodb --follow: urls already queued/crawled
         self.active = set()
         self.started = 0
@@ -656,6 +659,8 @@ class Crawler:
             reject = "bad_url"
         elif self.urlhelp.looks_non_html(url):
             reject = "non_html_extension"
+        elif self.english_only and (self.urlhelp.looks_foreign(url) or self.urlhelp.host_key(self.urlhelp.host_of(url)) in self.foreign_hosts):
+            reject = "foreign"
         elif not self.frontier.add(url, time.monotonic()):
             reject = "host_cap"
         if reject:
@@ -736,6 +741,8 @@ class Crawler:
                 continue
             if self.blocklist is not None and self.blocklist.is_blocked(host):
                 continue
+            if self.english_only and (key in self.foreign_hosts or self.urlhelp.looks_foreign(links[0])):
+                continue
             if key == own_key:
                 internal.extend(links[:max(0, cap * 2 - self.accepted[key])])
             else:
@@ -814,6 +821,13 @@ class Crawler:
             stats["blocked"] += 1
             self.release_host(st, state, counted=True, delay=0)
             return "blocked"
+
+        if self.english_only and self.urlhelp.host_key(host) in self.foreign_hosts:
+            # queued before the host served a non-English page: don't fetch it (not recorded as seen, a later English-only run may want it)
+            item["done"].append(url)
+            stats["dropped_foreign"] += 1
+            self.release_host(st, state, counted=True, delay=0)
+            return "foreign"
 
         if st.public is None:
             st.public = await self.host_public(host)
@@ -902,6 +916,7 @@ class Crawler:
         job = None
 
         page_url = res["page_url"]
+        own_key = self.urlhelp.host_key(self.urlhelp.host_of(page_url))
         if page_url != url:
             item["seen"].append(url)   # the old url (a same-host redirect) is recorded as seen; the page lives under its final url
         status = res["status"]
@@ -914,6 +929,10 @@ class Crawler:
             logs.append(f"Language Not in English {page_url}")
             logs.append(f"Misc Language {res['lang']} {page_url}")
             item["seen"].append(page_url)
+            if self.english_only:
+                # A site whose page isn't English: fetch nothing more from it and don't follow its links (they lead to more of the same)
+                self.foreign_hosts.add(own_key)
+                res["candidates"] = {}
         elif status in ("noindex", "no_text", "short_text"):
             item["seen"].append(page_url)
         elif status == "indexed":
@@ -931,7 +950,6 @@ class Crawler:
             asyncio.create_task(self.send_text(page_url, res))
 
         # links: choose a few, shallow and spread over many hosts
-        own_key = self.urlhelp.host_key(self.urlhelp.host_of(page_url))
         self.enqueue_found(item, self.selected_links(own_key, res["candidates"]))
 
         logs.append(f"Scraped {page_url}")

@@ -52,6 +52,9 @@ def test_shapes_and_prefix_rule():
 
 def test_gate():
     os.environ.pop("INDEX_LANGUAGES", None)
+    de0 = "Der schnelle braune Fuchs springt über den faulen Hund und läuft durch den Wald. " * 5
+    assert T.language_gate(de0)[0] is False  # default policy is English only
+    os.environ["INDEX_LANGUAGES"] = "all"
     en = "The quick brown fox jumps over the lazy dog and keeps running through the forest. " * 5
     de = "Der schnelle braune Fuchs springt über den faulen Hund und läuft durch den Wald. " * 5
     ok, lang, why = T.language_gate(en); assert ok and lang == "en", (ok, lang, why)
