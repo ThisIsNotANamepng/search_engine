@@ -14,12 +14,12 @@ Each crawler is one containerd container. The agent supervises a *foreground*
 whole lifetime, so when the container exits `ctr` exits and the crash/restart
 logic below reacts exactly as it would for a bare process. This keeps container
 control (isolation, resource limits, image pinning) while the supervision engine
-stays dead simple — and it reuses the containerd that was already installed with
-your old Kubernetes, so there's nothing new to install.
+stays dead simple. The workers run plain containerd (the containerd.io package,
+socket /run/containerd/containerd.sock); see deploy/workers/migrate-to-containerd.sh.
 
 Notes on ctr vs docker/podman (handled below):
-  - No `--replace`, so we explicitly delete any leftover container of the same
-    id before (re)spawning.
+  - No `--replace`, so we explicitly delete any leftover container (and its
+    snapshot) of the same id before (re)spawning, and sweep leftovers at startup.
   - `--env` needs KEY=VALUE, so we resolve each CRAWLER_ENV var's value from the
     agent's own environment rather than passing the name through.
   - containerd has namespaces; we use our own (default "stultus") so we never
@@ -44,7 +44,7 @@ Configuration (environment variables):
                         HTTP basic auth on each heartbeat
   NODE_ID               stable id for this box            (default: hostname)
   CRAWLER_IMAGE         container image to run            (default: localhost/stultus:latest)
-  CTR_BIN               ctr executable                    (default: /usr/local/bin/ctr)
+  CTR_BIN               ctr executable                    (default: /usr/bin/ctr)
   CTR_NAMESPACE         containerd namespace to use       (default: stultus)
   CTR_PLAIN_HTTP        "1" to pull over plain HTTP (insecure registry)  (default: 0)
   CRAWLER_PULL          "1" to auto-pull the image if missing (default: 1)
@@ -127,7 +127,7 @@ HEAD_URL = os.getenv("HEAD_URL", "").rstrip("/")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 NODE_ID = os.getenv("NODE_ID") or socket.gethostname()
 
-CTR_BIN = os.getenv("CTR_BIN", "/usr/local/bin/ctr")
+CTR_BIN = os.getenv("CTR_BIN", "/usr/bin/ctr")  # where the containerd.io package installs it
 CTR_NAMESPACE = os.getenv("CTR_NAMESPACE", "stultus")
 CTR_PLAIN_HTTP = _flag("CTR_PLAIN_HTTP", "0")
 CRAWLER_PULL = _flag("CRAWLER_PULL", "1")
@@ -246,10 +246,15 @@ def run_command(slot_id):
 
 
 def ctr_rm(name):
-    """Force-remove a container and its task by id (idempotent, quiet)."""
+    """Force-remove a container, its task and its snapshot by id (idempotent, quiet)."""
     _quiet(_ctr("task", "kill", "--signal", "SIGKILL", name))
     _quiet(_ctr("task", "delete", "--force", name))
     _quiet(_ctr("container", "delete", name))
+    # `ctr run` keys the container's rootfs snapshot by the container id. If the run was
+    # killed before the container record existed (or the record was deleted on its own),
+    # the snapshot is orphaned and the next `ctr run` of this id fails with
+    # 'snapshot "<id>": already exists'.
+    _quiet(_ctr("snapshots", "rm", name))
 
 
 def ensure_image():
@@ -270,13 +275,19 @@ def ensure_image():
 
 
 def cleanup_stale_containers():
-    """Remove any leftover crawler containers from a previous unclean shutdown."""
+    """Remove crawler containers and orphaned snapshots left by a previous unclean shutdown."""
     res = subprocess.run(_ctr("container", "ls", "-q"),
                          capture_output=True, text=True)
-    stale = [n for n in res.stdout.split() if n.startswith(CONTAINER_PREFIX + "-")]
+    stale = {n for n in res.stdout.split() if n.startswith(CONTAINER_PREFIX + "-")}
+    # `ctr snapshots ls` prints a KEY/PARENT/KIND header, then one snapshot per line.
+    res = subprocess.run(_ctr("snapshots", "ls"), capture_output=True, text=True)
+    for line in res.stdout.splitlines()[1:]:
+        fields = line.split()
+        if fields and fields[0].startswith(CONTAINER_PREFIX + "-"):
+            stale.add(fields[0])
     if stale:
-        log(f"cleaning up {len(stale)} stale container(s)")
-        for name in stale:
+        log(f"cleaning up {len(stale)} stale container(s)/snapshot(s)")
+        for name in sorted(stale):
             ctr_rm(name)
 
 
