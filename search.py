@@ -16,6 +16,14 @@ where word_score = len(word)/2
 # popularity = reference_count
 # search_output = relevance * popularity
 
+# Current formula (token counts from the `count` column of each *_urls table):
+# search_output = ((prefix_score + bigram_score + trigram_score + word_score + total_tokens) / total_tokens) * reference_count
+#   word_score    = sum of word_urls.count    for the query's words    on that page
+#   prefix_score  = sum of prefix_urls.count  for the query's prefixes on that page
+#   bigram_score  = sum of bigram_urls.count  for the query's bigrams  on that page
+#   trigram_score = sum of trigram_urls.count for the query's trigrams on that page
+#   total_tokens  = urls.total_tokens
+
 """
 
 import tokenizer
@@ -47,13 +55,13 @@ def debug_print(text, text1=""):
 # * One round trip: token -> id lookups are inlined as ARRAY(subquery), so the
 #   dictionary lookups, the four posting-list scans and the scoring all run in
 #   a single statement.
-# * Scoring is mathematically identical to the old four-CTE version (the final
-#   score only ever used the *sum* weighted word*20 + bigram + trigram +
-#   prefix*2), so we aggregate the posting lists with ONE GROUP BY instead of
+# * The score only uses the *sum* word_score + bigram_score + trigram_score +
+#   prefix_score, so we aggregate the posting lists with ONE GROUP BY instead of
 #   four, and only touch URLs that actually matched instead of joining every
 #   row of `urls` on every query.
-# * The posting-list scans rely on the (token_id, url_id) indexes created by
-#   add_search_indexes.py.
+# * The posting-list scans rely on the (token_id, url_id) INCLUDE (count)
+#   indexes created by add_search_indexes.py, so url_id and count are both read
+#   straight from the index (index-only scan).
 # * Connections are pooled and results are cached for a short time.
 # ---------------------------------------------------------------------------
 
@@ -150,18 +158,20 @@ def _cache_put(key, value):
 
 
 # Each posting-list branch is only included when the query has tokens of that type.
+# w is how many times that token appears on the page, so SUM(w) per page is
+# word_score + bigram_score + trigram_score + prefix_score.
 _BRANCHES = {
     "word": """
-            SELECT url_id, 20 AS w FROM word_urls
+            SELECT url_id, count AS w FROM word_urls
             WHERE word_id = ANY(ARRAY(SELECT id FROM words WHERE word = ANY(%s)))""",
     "bigram": """
-            SELECT url_id, 1 AS w FROM bigram_urls
+            SELECT url_id, count AS w FROM bigram_urls
             WHERE bigram_id = ANY(ARRAY(SELECT id FROM bigrams WHERE bigram = ANY(%s)))""",
     "trigram": """
-            SELECT url_id, 1 AS w FROM trigram_urls
+            SELECT url_id, count AS w FROM trigram_urls
             WHERE trigram_id = ANY(ARRAY(SELECT id FROM trigrams WHERE trigram = ANY(%s)))""",
     "prefix": """
-            SELECT url_id, 2 AS w FROM prefix_urls
+            SELECT url_id, count AS w FROM prefix_urls
             WHERE prefix_id = ANY(ARRAY(SELECT id FROM prefixes WHERE prefix = ANY(%s)))""",
 }
 
@@ -177,8 +187,8 @@ _SQL_TEMPLATE = """
             SELECT
                 u.url,
                 u.title,
-                ((m.token_score + utc.word_count) / utc.word_count) AS relevance,
-                (2.0 - (POWER(u.reference_count, 1.0/1.2) / u.reference_count))::double precision AS ref_score,
+                (m.token_score + {total_tokens}) / {total_tokens} AS relevance,
+                u.reference_count::double precision AS ref_score,
                 u.reference_count
             FROM matched m
             JOIN url_token_counts utc ON utc.url_id = m.url_id
@@ -201,10 +211,9 @@ _SQL_TEMPLATE = """
 # Fast (approximate) ranking -- the default; set SEARCH_MODE=exact for the
 # original full-score query.
 #
-# The exact score adds +1 for every matching bigram/trigram. Common letter pairs
-# ("th", "in", "ing", ...) match tens of millions of posting rows per query, so
-# summing them for every page costs ~a minute but moves the ranking very little
-# next to the word (x20) and prefix (x2) terms. Fast mode therefore ranks in two
+# The exact score adds the bigram/trigram counts of every matching page. Common
+# letter pairs ("th", "in", "ing", ...) match tens of millions of posting rows per
+# query, so summing them for every page is slow. Fast mode therefore ranks in two
 # stages:
 #   1. Score every page matching a word/prefix with those two terms only and
 #      keep the best SEARCH_RESCORE_K candidates.
@@ -214,6 +223,12 @@ _SQL_TEMPLATE = """
 # (no word or prefix hit) is never returned, and a page ranked below the top K
 # by word/prefix score alone cannot be lifted into the top 10 by its n-grams.
 # ---------------------------------------------------------------------------
+
+# total_tokens as a float, so the division isn't rounded down to a whole number.
+# Pages stored before urls.total_tokens existed have it NULL: fall back to the token
+# totals in url_token_counts so they still get a score. GREATEST(..., 1) avoids dividing by 0.
+_TOTAL_TOKENS = ("GREATEST(COALESCE(u.total_tokens, utc.word_count + utc.bigram_count"
+                 " + utc.trigram_count + utc.prefix_count), 1)::double precision")
 
 SEARCH_MODE = os.environ.get("SEARCH_MODE", "fast").lower()
 STAGE1_BRANCHES = tuple(os.environ.get("SEARCH_STAGE1", "word,prefix").split(","))
@@ -231,8 +246,7 @@ _STAGE1_SQL = """
         FROM core
         JOIN url_token_counts utc ON utc.url_id = core.url_id
         JOIN urls u ON u.id = core.url_id
-        ORDER BY ((core.s + utc.word_count) / utc.word_count)
-                 * (2.0 - (POWER(u.reference_count, 1.0/1.2) / u.reference_count))::double precision DESC
+        ORDER BY ((core.s + {total_tokens}) / {total_tokens}) * u.reference_count DESC
         LIMIT {k};
 """
 
@@ -249,13 +263,15 @@ def _fast_search(cur, groups):
     g = dict(groups)
     cur.execute(
         _STAGE1_SQL.format(
-            branches="\n                UNION ALL".join(_BRANCHES[n] for n in core), k=RESCORE_K),
+            branches="\n                UNION ALL".join(_BRANCHES[n] for n in core), k=RESCORE_K,
+            total_tokens=_TOTAL_TOKENS),
         tuple(g[n] for n in core))
     cand = [r[0] for r in cur.fetchall()]
     if not cand:
         return []
     sql = _SQL_TEMPLATE.format(
-        branches="\n            UNION ALL".join(_BRANCHES_FOR_CANDIDATES[n] for n, _ in groups))
+        branches="\n            UNION ALL".join(_BRANCHES_FOR_CANDIDATES[n] for n, _ in groups),
+        total_tokens=_TOTAL_TOKENS)
     params = []
     for _, vals in groups:
         params += [vals, cand]
@@ -287,7 +303,8 @@ def search(query):
         return cached
 
     sql_query = _SQL_TEMPLATE.format(
-        branches="\n            UNION ALL".join(_BRANCHES[name] for name, _ in groups))
+        branches="\n            UNION ALL".join(_BRANCHES[name] for name, _ in groups),
+        total_tokens=_TOTAL_TOKENS)
     params = tuple(vals for _, vals in groups)
 
     debug_print("Searching....", query)
@@ -324,5 +341,5 @@ def search(query):
     return results
 
 # Example usage:
-# query = input("Search query: ")
-# print(search(query))
+query = input("Search query: ")
+print(search(query))
