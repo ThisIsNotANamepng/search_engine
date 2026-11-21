@@ -33,6 +33,7 @@ import trafilatura
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
 RATE_LIMITED = "rate_limited"
 REDIRECTED = "redirected"
+NOT_SCRAPABLE = "not_scrapable"
 # Entry point of the proxy chain (proxy A). Proxy A forwards to proxy B
 # (configured on A via PROXY_UPSTREAM), which then makes the real outbound
 # request. Unset to fetch directly without a proxy.
@@ -658,7 +659,8 @@ def get_page_html(url):
                 bytes         the raw html of the page
                 RATE_LIMITED  the site answered 429
                 REDIRECTED    the page redirects to another host, final_url is the target
-                False         the page can't or mustn't be scraped (robots.txt, not html, too large, error status, network error)
+                NOT_SCRAPABLE the site's answer won't change on a retry (robots.txt, not html, too large, redirect loop), so the scraper records the url as seen
+                False         the page can't be scraped right now (error status, network error, not a public address)
             final_url is the url the result came from, after any redirects (not cleaned, so relative links resolve against it)
             x_robots_tag is the page's X-Robots-Tag header ("" if none), for extract_data_from_html
     """
@@ -670,7 +672,7 @@ def get_page_html(url):
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
         info_print("Not allowed by robots.txt")
-        return False, url, ""
+        return NOT_SCRAPABLE, url, ""
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -692,7 +694,7 @@ def get_page_html(url):
             location = request.headers.get("Location", "")
             if not location or redirect_hops >= 5:
                 log(f"Error Empty redirect or too many redirects {url}")
-                return False, url, ""
+                return NOT_SCRAPABLE, url, ""
             target = urljoin(url, location)  # relative Location -> absolute target url
             if urlparse(target).hostname != urlparse(url).hostname:
                 return REDIRECTED, target, ""
@@ -703,7 +705,7 @@ def get_page_html(url):
                 return False, url, ""
             if not allowed_by_robots(url, USER_AGENT):
                 log(f"Blocked by robots.txt {url}")
-                return False, url, ""
+                return NOT_SCRAPABLE, url, ""
             request = fetch(url)
             redirect_hops += 1
 
@@ -723,7 +725,8 @@ def get_page_html(url):
             content_type.startswith("text/html")
         ):
             log(f"Error Invalid data type {url}")
-            return False, url, ""
+            # An error status isn't final: our proxy's own 502s look like this too
+            return (NOT_SCRAPABLE if request.status_code < 400 else False), url, ""
 
         # Read at most MAX_PAGE_BYTES; a huge page would otherwise be loaded into memory whole
         content = bytearray()
@@ -731,7 +734,7 @@ def get_page_html(url):
             content += chunk
             if len(content) > MAX_PAGE_BYTES:
                 log(f"Error Page too large {url}")
-                return False, url, ""
+                return NOT_SCRAPABLE, url, ""
         content = bytes(content)
 
     except TimeoutError:
@@ -876,6 +879,7 @@ def store(content, url):
     
     # Making sure there is text at all. I chose 4 arbitrarily
     if text != None and len(text) < 4:
+        mark_url_seen(url)  # so other pages linking here don't queue it again
         return [links, False]
     
     """
