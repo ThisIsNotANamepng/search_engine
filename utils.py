@@ -738,6 +738,8 @@ def get_page_html(url):
         log(f"Error Total timeout exceeded {url}")
         return False, url, ""
     except requests.exceptions.RequestException as e:
+        if SCRAPER_PROXY and isinstance(e, requests.exceptions.ConnectionError):
+            raise  # couldn't reach our own proxy, not the page: scrape.py retries the url later
         log(f"Error HTTP error fetching: {url} : {e}")
         return False, url, ""
     finally:
@@ -1218,12 +1220,18 @@ def _refresh_blocklist_if_stale():
 
     download_url = f"http://{host}:8002/blocklist.db"
     tmp_path = "blocklist.db.tmp"
-    with requests.get(download_url, stream=True, timeout=30) as resp:
-        resp.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
+    try:
+        with requests.get(download_url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+    except requests.RequestException as e:
+        if not os.path.exists("blocklist.db"):
+            raise  # no copy at all: scraping unchecked isn't allowed, scrape.py retries the url later
+        failure_print(f"Could not refresh blocklist, using the old copy: {e!r}")
+        return
     os.replace(tmp_path, "blocklist.db")
 
 def check_url_in_blocklist(url):
