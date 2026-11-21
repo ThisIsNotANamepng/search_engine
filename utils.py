@@ -4,8 +4,10 @@ Functions for scraping
 """
 
 import os
+import re
 import time
 import requests
+import http.cookiejar
 import socket
 import string
 import itertools
@@ -224,8 +226,23 @@ def create_database():
     conn = get_conn()
     cur = conn.cursor()
 
-    # create sequences for stable id generation and tables with id defaults
-    cur.execute("""
+    # Every scraper runs this on startup. CREATE INDEX IF NOT EXISTS takes a SHARE lock on its table even when the
+    # index exists, held until commit, so a scraper starting while others write blocks every write behind it (and
+    # several starting at once deadlock). So skip it all when everything already exists, and otherwise let only one
+    # scraper at a time build the schema.
+    names = re.findall(r"CREATE (?:SEQUENCE|TABLE|INDEX) IF NOT EXISTS (\w+)", _SCHEMA_SQL)
+    cur.execute("SELECT bool_and(to_regclass(n) IS NOT NULL) FROM unnest(%s::text[]) AS n;", (names,))
+    if not cur.fetchone()[0]:
+        cur.execute("SELECT pg_advisory_xact_lock(727274);")
+        cur.execute(_SCHEMA_SQL)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    populate_static_ngrams()
+
+# create sequences for stable id generation and tables with id defaults
+_SCHEMA_SQL = """
     CREATE SEQUENCE IF NOT EXISTS words_id_seq;
     CREATE SEQUENCE IF NOT EXISTS bigrams_id_seq;
     CREATE SEQUENCE IF NOT EXISTS trigrams_id_seq;
@@ -326,14 +343,7 @@ def create_database():
     CREATE INDEX IF NOT EXISTS idx_bigram_urls_url_id ON bigram_urls(url_id);
     CREATE INDEX IF NOT EXISTS idx_trigram_urls_url_id ON trigram_urls(url_id);
     CREATE INDEX IF NOT EXISTS idx_prefix_urls_url_id ON prefix_urls(url_id);
-    """)
-
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    populate_static_ngrams()
+    """
 
 def populate_static_ngrams():
     """Pre-populate all the bigrams/trigrams so store() doesn't have to re-insert every time"""
@@ -524,6 +534,10 @@ def allowed_by_robots(url, user_agent):
     try:
         # The day number is part of the cache key, so each site's robots.txt is fetched at most once a day per scraper instead of once per page
         rp = _robots_parser(robots_url, user_agent, int(time.time() // 86400))
+    except requests.ConnectionError:
+        if SCRAPER_PROXY:
+            raise  # our proxy failed, not the site: scrape.py retries the url later, and robots.txt is checked then
+        return True
     except Exception:
         # Network errors/timeouts or an unexpected parsing error -> be permissive so we don't block scraping (not cached, so the next page retries)
         return True
@@ -531,13 +545,35 @@ def allowed_by_robots(url, user_agent):
     # No robots.txt (not found or inaccessible) -> assume allowed
     return rp is None or rp.can_fetch(user_agent, url)
 
+# One keep-alive connection pool for every fetch instead of a new TCP connection per request (the scraper is single threaded).
+# No cookie jar: through the proxy every request goes to the proxy's host, so each site's cookies would be sent on to all sites
+_http = requests.Session()
+_http.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+
+def _get(url, headers, **kwargs):
+    """
+    GET url, through our proxy chain when SCRAPER_PROXY is set
+    Never follows redirects: requests would fetch the Location itself, around the proxy. Callers follow them through _get, so each hop goes via the proxy
+    Raises requests.ConnectionError when the proxy itself failed (down, unreachable next hop, wrong password), so scrape.py retries the url instead of dropping it
+    """
+    if not SCRAPER_PROXY:
+        return _http.get(url, headers=headers, allow_redirects=False, **kwargs)
+    resp = _http.get(f"{SCRAPER_PROXY}/fetch", params={"url": url}, headers={**headers, **_PROXY_HEADERS}, allow_redirects=False, **kwargs)
+    if resp.headers.get("X-Proxy-Error"):
+        resp.close()
+        raise requests.ConnectionError(f"proxy error (HTTP {resp.status_code}) fetching {url}")
+    return resp
+
 @functools.lru_cache(maxsize=10000)
 def _robots_parser(robots_url, user_agent, day):
     """Fetch and parse one site's robots.txt. Returns None if the site has none (cached); raises on network errors (lru_cache doesn't cache exceptions)"""
-    if SCRAPER_PROXY:
-        resp = requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": robots_url}, headers={"User-Agent": user_agent, **_PROXY_HEADERS}, timeout=5)
-    else:
-        resp = requests.get(robots_url, headers={"User-Agent": user_agent}, timeout=5)
+    for _ in range(5):  # RFC 9309: follow at least five redirects (http -> https is the usual one)
+        resp = _get(robots_url, {"User-Agent": user_agent}, timeout=5)
+        if not resp.is_redirect:
+            break
+        robots_url = urljoin(robots_url, resp.headers["Location"])
+    if resp.status_code >= 500:
+        raise requests.HTTPError(f"robots.txt answered {resp.status_code}")  # a temporary server error: don't cache "no robots.txt" for the day
     if resp.status_code != 200:
         return None
     rp = RobotFileParser()
@@ -549,6 +585,7 @@ def is_public_host(url):
     """
     True if the url's host resolves only to public internet addresses.
     Stops the crawler from following links or redirects into our own network (db01, localhost, 10.x, ...) and indexing internal pages.
+    Only needed when fetching directly: through SCRAPER_PROXY, the proxy's last hop refuses non-public addresses as it dials them.
     shortcut: the host is resolved again for the real request (DNS rebinding could slip past), fine while our internal services aren't high value, pin the resolved IP if that changes
     """
     host = urlparse(url).hostname
@@ -583,7 +620,7 @@ def get_page_html(url):
             x_robots_tag is the page's X-Robots-Tag header ("" if none), for extract_data_from_html
     """
 
-    if not is_public_host(url):
+    if not SCRAPER_PROXY and not is_public_host(url):
         log(f"Error Not a public address {url}")
         return False, url, ""
 
@@ -600,9 +637,7 @@ def get_page_html(url):
     def fetch(target):
         # One hop: redirects are followed below so every target is checked first
         # stream=True: only the headers are read here, so status and Content-Type are checked before any body is downloaded
-        if SCRAPER_PROXY:
-            return requests.get(f"{SCRAPER_PROXY}/fetch", params={"url": target}, headers={**headers, **_PROXY_HEADERS}, timeout=(5, 10), allow_redirects=False, stream=True)
-        return requests.get(target, headers=headers, timeout=(5, 10), allow_redirects=False, stream=True)
+        return _get(target, headers, timeout=(5, 10), stream=True)
 
     request = None
     try:
@@ -618,7 +653,7 @@ def get_page_html(url):
                 return REDIRECTED, target, ""
             url = target
             request.close()
-            if not is_public_host(url):
+            if not SCRAPER_PROXY and not is_public_host(url):
                 log(f"Error Redirect to a non-public address {url}")
                 return False, url, ""
             if not allowed_by_robots(url, USER_AGENT):
@@ -643,7 +678,7 @@ def get_page_html(url):
             content_type.startswith("text/html")
         ):
             log(f"Error Invalid data type {url}")
-            # An error status isn't final: our proxy's own 502s look like this too
+            # An error status isn't final: the site may be down for now
             return (NOT_SCRAPABLE if request.status_code < 400 else False), url, ""
 
         # Read at most MAX_PAGE_BYTES; a huge page would otherwise be loaded into memory whole

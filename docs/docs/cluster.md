@@ -136,5 +136,18 @@ ssh -t in01 sudo ctr -n stultus tasks ls        # running crawler containers
 
 ### Deploying a new crawler image
 
-Build and push to `db01:5000/stultus:<version>`, set `CRAWLER_IMAGE` to it in every worker's `crawler.env`, and
-restart `crawler-agent`. The agent pulls the image if it isn't present.
+On db01, from the repo, as your normal user (not with sudo):
+
+```bash
+git pull
+./deploy/workers/update-crawler-image.sh                      # all workers
+./deploy/workers/update-crawler-image.sh in03 in04            # or just some
+./deploy/workers/update-crawler-image.sh --set RUN_BATCHER=1  # and set crawler.env options
+```
+
+It builds the image from the checkout (tagged with the commit, e.g. `db01:5000/stultus:e56c1b9`), pushes it to
+the registry, then on each worker installs this checkout's `node_agent.py`, sets `CRAWLER_IMAGE` (and any
+`--set KEY=VALUE`) in `crawler.env` and restarts the agent. The agent stops the old crawlers (they hand their URLs
+back), pulls the new image and starts them again. Unreachable workers are skipped and listed at the end.
+`--no-build` reuses the image already pushed for this commit. If the proxy changed in the same update, update it
+first (see the proxy page).

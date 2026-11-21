@@ -269,9 +269,10 @@ while True:
 
         if page_data[0]:
             # Check for english language
-            if utils.determine_language(page_data[0]) != 'en':
-                # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
-                utils.log(f"Language Not in English {url}")
+            language = utils.determine_language(page_data[0])
+            if language != 'en':
+                # The code is logged so we can measure how much of the web is in each language ('unknown' when langdetect finds no language)
+                utils.log(f"Language Not in English {language} {url}")
                 utils.info_print("Language not in English, skipping")
 
                 # Not indexed, only recorded as seen so other pages linking here don't queue it again
@@ -321,7 +322,9 @@ while True:
             # Add url to the cooldown redis db
             utils.mark_domain(base_domain, redis_client)
 
-        utils.log(f"Scraped {url}")
+        # Non-English pages already have their "Language Not in English" row, keep them out of the dashboard's scraped count
+        if not page_not_in_english:
+            utils.log(f"Scraped {url}")
 
 
         if page_not_in_english:

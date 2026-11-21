@@ -20,10 +20,13 @@ CERT=/etc/stultus/vps-proxy.crt
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 command -v go >/dev/null || { echo "go is missing (dnf install golang)" >&2; exit 1; }
+go_minor="$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')"
+(( go_minor >= 18 )) || { echo "proxy.go needs Go 1.18 or newer, found $(go env GOVERSION)" >&2; exit 1; }
 openssl x509 -in "$CERT_IN" -noout 2>/dev/null || { echo "$CERT_IN is not a PEM certificate" >&2; exit 1; }
 
 if [[ -z ${PROXY_PASSWORD:-} && -f $ENV_FILE ]]; then
-    PROXY_PASSWORD="$(sed -n 's/^PROXY_PASSWORD=//p' "$ENV_FILE" | tail -1)"
+    # strip the quotes systemd allows around a value (PROXY_PASSWORD='...')
+    PROXY_PASSWORD="$(sed -nE "s/^PROXY_PASSWORD=['\"]?([^'\"]*)['\"]?\$/\1/p" "$ENV_FILE" | tail -1)"
 fi
 [[ -n ${PROXY_PASSWORD:-} && $PROXY_PASSWORD != CHANGE_ME ]] \
     || { echo "no PROXY_PASSWORD in $ENV_FILE: pass PROXY_PASSWORD=... (the VPS's password)" >&2; exit 1; }
@@ -31,19 +34,33 @@ fi
 host=$VPS; [[ $VPS == *:* ]] && host="[$VPS]"  # an IPv6 address needs brackets in a URL
 
 echo "== checking the VPS proxy directly"
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --cacert "$CERT_IN" \
-    -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$host:$PORT/fetch?url=https://example.com/" || true)"
+rc=0
+code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 --cacert "$CERT_IN" \
+    -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$host:$PORT/fetch?url=https://example.com/")" || rc=$?
 case $code in
     200) echo "ok" ;;
     401) echo "the VPS rejected the password: use the one in the VPS's /etc/stultus/proxy.env" >&2; exit 1 ;;
-    000) echo "can't reach https://$host:$PORT (VPS firewall / cloud security group / wrong address or cert?)" >&2; exit 1 ;;
+    000)
+        case $rc in
+            35|51|58|60|77|83|90|91)
+                echo "TLS failed (curl error $rc): $CERT_IN isn't the certificate the VPS serves. Copy /etc/stultus/proxy.crt from the VPS again." >&2
+                echo "  this file: $(openssl x509 -in "$CERT_IN" -noout -fingerprint -sha256)" >&2 ;;
+            28) echo "timed out connecting to $host:$PORT: something between here and the VPS drops it (often this network allows only ports 80/443 out: rerun install_proxy.sh with port 443, then this script with 443)" >&2 ;;
+            7)  echo "connection to $host:$PORT refused or no route (is stultus-proxy running on the VPS, on port $PORT? is the cloud firewall open?)" >&2 ;;
+            *)  echo "can't reach https://$host:$PORT (curl error $rc, see 'man curl' EXIT CODES)" >&2 ;;
+        esac
+        exit 1 ;;
     *)   echo "the VPS answered HTTP $code: check journalctl -u stultus-proxy on the VPS" >&2; exit 1 ;;
 esac
+# Crawlers going through the proxy leave the "public address only" check to the VPS, so it must have it
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --cacert "$CERT_IN" \
+    -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$host:$PORT/fetch?url=http://127.0.0.1:22/" || true)"
+[[ $code == 403 ]] || { echo "the VPS runs an old proxy.go (an internal address got HTTP $code, want 403): rerun install_proxy.sh on the VPS, it pulls the latest code" >&2; exit 1; }
 
-echo "== building proxy -> /usr/local/bin/stultus-proxy"
+echo "== testing and building proxy -> /usr/local/bin/stultus-proxy"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-(cd "$REPO/supporting_servers" && GOCACHE="$tmp/cache" go build -o "$tmp/stultus-proxy" proxy.go)
+(cd "$REPO/supporting_servers" && export GOCACHE="$tmp/cache" && go test -count=1 proxy.go proxy_test.go && go build -o "$tmp/stultus-proxy" proxy.go)
 install -m 755 "$tmp/stultus-proxy" /usr/local/bin/stultus-proxy
 
 mkdir -p /etc/stultus

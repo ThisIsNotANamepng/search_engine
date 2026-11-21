@@ -10,12 +10,13 @@ The script `update_local_blocklist.py` downloads Steven Black's host file and th
 
 ## Proxy
 
-The way we have our scrapers set up internally, a proxy is run on the head node and another copy on the cloud proxy server. It's a vibe coded go file `proxy.go`
+The way we have our scrapers set up internally, a proxy is run on the head node and another copy on the cloud proxy server. It's a vibe coded go file `proxy.go`. How it works, what happens when it's down, and its settings: [docs/docs/proxy.md](../docs/docs/proxy.md)
 
-To set up the cloud proxy on a new VPS, copy `deploy/vps/install_proxy.sh` and `proxy.go` to it and run:
+To set up (or update) the cloud proxy on a VPS, run this on it. It clones the `ai-supported` branch for the code:
 
 ```bash
-sudo PROXY_PASSWORD=<PROXY_PASSWORD from db01:/etc/stultus/proxy.env> ./install_proxy.sh <vps_ip_or_name> <head_public_ip>
+curl -fsSL https://raw.githubusercontent.com/ThisIsNotANamepng/search_engine/ai-supported/deploy/vps/install_proxy.sh \
+  | sudo PROXY_PASSWORD=<PROXY_PASSWORD from db01:/etc/stultus/proxy.env> bash -s -- <vps_ip_or_name>
 ```
 
 Then point the head's proxy at it, on db01 from the repo (the script prints the exact commands, including copying its certificate):
