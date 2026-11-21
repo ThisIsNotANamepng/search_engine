@@ -221,7 +221,15 @@ while True:
         url_scraping_timer = time.time()
         page_not_in_english = False
 
-        raw_html = utils.get_page_html(url)
+        raw_html, final_url = utils.get_page_html(url)
+
+        if raw_html == utils.REDIRECTED:
+            # Redirect to another host: queue the target so it goes through that host's checks, and stop re-queueing this url
+            if not args.nodb:
+                utils.mark_url_seen(url)
+                utils.enqueue_urls(utils.filter_new_urls(utils.clean_links([final_url])))
+            utils.info_print(f"Redirects to another host, queued {final_url} for {url}")
+            continue
 
         if raw_html == utils.RATE_LIMITED:
             if not args.nodb:
@@ -234,7 +242,14 @@ while True:
             utils.info_print(f"Fetch failed (blocked/timeout/non-HTML), skipping {url}")
             continue
 
-        page_data = utils.extract_data_from_html(raw_html, url) #[combined_text, links, title, icon_link]
+        # A same-host redirect was followed: index the page under where it actually lives, cleaned like every stored url
+        page_url = (utils.clean_links([final_url]) or [url])[0]
+        if page_url != url:
+            if not args.nodb:
+                utils.mark_url_seen(url)
+            url = page_url
+
+        page_data = utils.extract_data_from_html(raw_html, final_url) #[combined_text, links, title, icon_link]
 
         if page_data[0]:
             # Check for english language

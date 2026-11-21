@@ -32,6 +32,7 @@ import trafilatura
 
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
 RATE_LIMITED = "rate_limited"
+REDIRECTED = "redirected"
 # Entry point of the proxy chain (proxy A). Proxy A forwards to proxy B
 # (configured on A via PROXY_UPSTREAM), which then makes the real outbound
 # request. Unset to fetch directly without a proxy.
@@ -497,11 +498,8 @@ def extract_data_from_html(body, url):
     for tag in soup(["script", "style", "head", "meta", "noscript"]):
         tag.decompose()
 
-    # Prepare base URL for relative links
-    parsed = urlparse(url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-
-    links = [urljoin(base_url, a["href"]) for a in soup.find_all("a", href=True)]
+    # Relative to the page itself, so href="page2" on /blog/post resolves to /blog/page2, not /page2
+    links = [urljoin(url, a["href"]) for a in soup.find_all("a", href=True)]
 
     combined_text = trafilatura.extract(body)
 
@@ -592,30 +590,31 @@ def get_page_html(url):
     """
     Download the html of a page
 
+    Same-host redirects (http -> https, /old -> /new) are followed here, each hop checked against robots.txt.
+    Redirects to another host aren't followed: they're returned as REDIRECTED so the scraper queues the target, which then gets that host's blocklist, robots.txt and cooldown checks like any other url
+
     Args:
         url : string
             The url of the page you are scraping
 
     Returns:
-        bytes
-            The raw html of the page
-        RATE_LIMITED
-            If the site answered 429
-        False
-            If the page can't or mustn't be scraped (robots.txt, not html, too large, blocked, network error)
+        (result, final_url)
+            result is one of:
+                bytes         the raw html of the page
+                RATE_LIMITED  the site answered 429
+                REDIRECTED    the page redirects to another host, final_url is the target
+                False         the page can't or mustn't be scraped (robots.txt, not html, too large, error status, network error)
+            final_url is the url the result came from, after any redirects (not cleaned, so relative links resolve against it)
     """
 
     if not is_public_host(url):
         log(f"Error Not a public address {url}")
-        return False
+        return False, url
 
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
         info_print("Not allowed by robots.txt")
-        ## TODO: Add a line to send this domain to the redis or postgres db so that we don't even attempt to scrape this domain again
-        #Changed this from: return "", [], []
-        #return False, [], []
-        return False
+        return False, url
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -633,15 +632,22 @@ def get_page_html(url):
     try:
         request = fetch(url)
         redirect_hops = 0
-        while request.is_redirect and redirect_hops < 5:
+        while request.is_redirect:
             location = request.headers.get("Location", "")
-            if not location:
-                break
-            url = urljoin(url, location)  # relative Location -> absolute target url
+            if not location or redirect_hops >= 5:
+                log(f"Error Empty redirect or too many redirects {url}")
+                return False, url
+            target = urljoin(url, location)  # relative Location -> absolute target url
+            if urlparse(target).hostname != urlparse(url).hostname:
+                return REDIRECTED, target
+            url = target
             request.close()
             if not is_public_host(url):
                 log(f"Error Redirect to a non-public address {url}")
-                return False
+                return False, url
+            if not allowed_by_robots(url, USER_AGENT):
+                log(f"Blocked by robots.txt {url}")
+                return False, url
             request = fetch(url)
             redirect_hops += 1
 
@@ -650,18 +656,18 @@ def get_page_html(url):
         # Skip just this page: one protected url (/admin, a bot challenge) shouldn't block the whole host
         if request.status_code in (401, 403):
             log(f"Error HTTP {request.status_code} {url}")
-            return False
+            return False, url
 
         if request.status_code == 429:
             log(f"Error Rate limited {url}")
-            return RATE_LIMITED
+            return RATE_LIMITED, url
 
         # Only allow HTML content
         if not (
             content_type.startswith("text/html")
         ):
             log(f"Error Invalid data type {url}")
-            return False
+            return False, url
 
         # Read at most MAX_PAGE_BYTES; a huge page would otherwise be loaded into memory whole
         content = bytearray()
@@ -669,20 +675,20 @@ def get_page_html(url):
             content += chunk
             if len(content) > MAX_PAGE_BYTES:
                 log(f"Error Page too large {url}")
-                return False
+                return False, url
         content = bytes(content)
 
     except TimeoutError:
         log(f"Error Total timeout exceeded {url}")
-        return False
+        return False, url
     except requests.exceptions.RequestException as e:
         log(f"Error HTTP error fetching: {url} : {e}")
-        return False
+        return False, url
     finally:
         if request is not None:
             request.close()
 
-    return content
+    return content, url
 
 def log(message):
     """
