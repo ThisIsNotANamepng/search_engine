@@ -404,7 +404,7 @@ tr.pushed td:first-child::before { content: ""; display: inline-block; width: 8p
         </div>
 
         <div class="card metric m-black col-3 row-1">
-            <div class="metric-label">URLs / Minute</div>
+            <div class="metric-label">Pages / Minute</div>
             <div class="metric-value" id="m-scrapes-per-minute">…</div>
         </div>
 
@@ -692,6 +692,7 @@ function renderNodes(nodes) {
     tbody.replaceChildren(...rows);
 
     const othersRate = (lastLive.other_scrapers || []).reduce((sum, o) => sum + (o.pages_per_min || 0), 0);
+    setText("m-scrapes-per-minute", fmtNum(Math.round(clusterRate + othersRate)));
     const summary = document.getElementById("node-summary");
     summary.replaceChildren(...[
         el("span", {}, el("b", { text: `${scraping} / ${nodes.length}` }), " nodes scraping"),
@@ -864,7 +865,6 @@ function renderDashboard(d) {
     setText("m-db-size", d.db_size);
     setText("m-url-count", fmtNum(d.url_count));
     setText("m-unique-domains", fmtNum(d.unique_domains));
-    setText("m-scrapes-per-minute", fmtNum(d.scrapes_per_minute));
 
     fillRows("last-scraped-body", d.last_10_scraped, [0, 1], { 0: "url" });
 
