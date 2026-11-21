@@ -51,9 +51,9 @@ parser.add_argument("-ndb", "--nodb", action='store_true', help="Don't use redis
 args = parser.parse_args()
 
 if args.nodb and not (args.url or args.file):
-    raise ("--nodb option must be used with --url or --file flags")
+    parser.error("--nodb option must be used with --url or --file flags")
 elif args.url and args.file:
-    raise ("Cannot use both --file and --url flags at the same time")
+    parser.error("Cannot use both --file and --url flags at the same time")
 
 # Communicates the nodb flag to utils.py for all of the log() functions because I'm lazy
 utils.NODB = args.nodb
