@@ -55,6 +55,8 @@ URL = ""
 WEB_STORAGE_CHUNK_SIZE = 64 * 1024
 
 # Postgres columns have length limits, we set them in creating the database and we only send data reduced to the maximum length so we don't crash on the postgres end
+# How long a scraper may hold a claimed url before another scraper can claim it. Also the retry delay for rate-limited urls
+CLAIM_TIMEOUT = "30 minutes"
 MAX_URL_LENGTH = 2048  # urls.url, url_queue.url, urls_references.*, icon_link
 MAX_TITLE_LENGTH = 128  # urls.title
 MAX_TOKEN_LENGTH = 64  # words.word, prefixes.prefix
@@ -344,8 +346,18 @@ def create_database():
     CREATE TABLE IF NOT EXISTS url_queue (
         id SERIAL PRIMARY KEY,
         url VARCHAR(2048) UNIQUE NOT NULL,
-        enqueued_at TIMESTAMP DEFAULT now()
+        enqueued_at TIMESTAMP DEFAULT now(),
+        claimed_at TIMESTAMP  -- set while a scraper holds the url, see get_next_urls()
     );
+    -- Older databases: add the column only if missing, since ALTER TABLE locks the whole queue even when there's nothing to do and every scraper runs this on startup
+    DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'url_queue' AND column_name = 'claimed_at') THEN
+            ALTER TABLE url_queue ADD COLUMN claimed_at TIMESTAMP;
+        END IF;
+    END $$;
+    -- Claiming skips the ~100k claimed rows at the front of the queue, releasing expired claims finds them without a scan
+    CREATE INDEX IF NOT EXISTS url_queue_unclaimed_idx ON url_queue (id) WHERE claimed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS url_queue_claimed_idx ON url_queue (claimed_at) WHERE claimed_at IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS logs (
         id SERIAL PRIMARY KEY,
@@ -815,6 +827,14 @@ def clean_links(raw_links):
         clean_link_length = len(clean_link)-1 #returns max index value of the link
         if slash_index == clean_link_length:
             clean_link = clean_link[:-1] #gets rid of the "/" if a link ends with it
+
+        # Scheme and host are case-insensitive, so HTTPS://Example.com/a and https://example.com/a are one url (the path is case-sensitive, left alone)
+        scheme_end = clean_link.find("://")
+        if scheme_end != -1:
+            host_end = clean_link.find("/", scheme_end + 3)
+            if host_end == -1:
+                host_end = len(clean_link)
+            clean_link = clean_link[:host_end].lower() + clean_link[host_end:]
             
         if clean_link not in seen:
             # Gets rid of links that aren't http(s) and are longer than the max url length (as dictated by the postgres length limits)
@@ -1000,26 +1020,27 @@ def mark_url_seen(url):
     conn.close()
 
 # Queue and logging helpers (Postgres-backed)
-def enqueue_url(url):
-    """Insert a URL into the queue if it's not already present."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO url_queue (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (url,))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
 def get_next_urls(num_urls):
-    # Returns a list of the next urls in the queue ([] if empty), deletes them from the db queue
-    # SKIP LOCKED in one statement so concurrent scrapers never claim the same rows
+    """
+    Claims the next urls in the queue ([] if empty) for this scraper
+
+    Claimed urls stay in url_queue with claimed_at set, so filter_new_urls() and enqueue's ON CONFLICT still see them and no other scraper queues or claims them again.
+    finish_claims() deletes or hands them back; a claim never finished (scraper killed) is handed back after CLAIM_TIMEOUT
+    """
 
     conn = get_conn()
     cur = conn.cursor()
 
+    # SKIP LOCKED: scrapers releasing the same expired rows don't wait on (or deadlock with) each other
     cur.execute("""
-        DELETE FROM url_queue WHERE id IN (
-            SELECT id FROM url_queue ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
+        UPDATE url_queue SET claimed_at = NULL WHERE id IN (
+            SELECT id FROM url_queue WHERE claimed_at < now() - %s::interval FOR UPDATE SKIP LOCKED
+        );
+    """, (CLAIM_TIMEOUT,))
+    # SKIP LOCKED in one statement so concurrent scrapers never claim the same rows
+    cur.execute("""
+        UPDATE url_queue SET claimed_at = now() WHERE id IN (
+            SELECT id FROM url_queue WHERE claimed_at IS NULL ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
         ) RETURNING url;
     """, (num_urls,))
     urls = [row[0] for row in cur.fetchall()]
@@ -1029,6 +1050,24 @@ def get_next_urls(num_urls):
     conn.close()
 
     return urls
+
+def finish_claims(done=(), release=()):
+    """
+    Ends this scraper's claims on urls from get_next_urls(): done urls leave the queue, released ones go back for any scraper to claim
+    """
+    if not done and not release:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    if done:
+        cur.execute("DELETE FROM url_queue WHERE url = ANY(%s);", (list(done),))
+    if release:
+        # An UPDATE, not a re-insert: re-inserting burns a SERIAL id per url, and cooldown skips hand back a lot of urls
+        cur.execute("UPDATE url_queue SET claimed_at = NULL WHERE url = ANY(%s);", (list(release),))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def get_host_ip():
     """Return the host machine IP address. Try local hostname first, then fallback to external lookup."""
