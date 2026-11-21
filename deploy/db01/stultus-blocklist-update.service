@@ -1,0 +1,14 @@
+# Rebuilds supporting_servers/blocklist.db from Steven Black's hosts file.
+# Run by stultus-blocklist-update.timer.
+[Unit]
+Description=Stultus blocklist refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+# Needs DATABASE_URL: the blocklist also includes the postgres blocked_domains (opt-out) table.
+EnvironmentFile=/etc/stultus/head.env
+WorkingDirectory=@REPO@/supporting_servers
+ExecStart=@PYTHON@ update_local_blocklist.py
