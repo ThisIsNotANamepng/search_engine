@@ -1,25 +1,25 @@
+# Virtual environments (no leading slash = matches in any folder)
 venv/
 env/
-.env
-*/venv/
-*/env/
-.env/
 .venv/
-*.pyc*
+
+# Secrets
+.env
+.env.*
+!.env.example
+reeds-secrets-he-doesnt-want-to-share.md
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local data and logs
 *.db
-*.pyc
-*/__pycache__/
+*.swp
 scraper.log
 timing.csv
-*.swp
 cleaned_hosts.txt
 hosts.txt
-blocklist.db
-supporting_servers/cleaned_hosts.txt
-supporting_servers/hosts.txt
-supporting_servers/blocklist.db
 supporting_servers/data/
-reeds-secrets-he-doesnt-want-to-share.md
 supporting_servers/stats.py
-supporting_servers/data/*
 setup_worker.sh
