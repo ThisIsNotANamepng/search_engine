@@ -55,6 +55,11 @@ Configuration (environment variables):
   CRAWLER_RUN_ARGS      extra flags for `ctr run` (e.g. "--memory-limit 1073741824")
   CRAWLER_CMD           optional command to override the image's default entrypoint
   INITIAL_DESIRED       desired crawlers before the head answers (default: 1)
+  RUN_BATCHER           "1" to also run this box's batcher (supporting_servers/batcher.py,
+                        from CRAWLER_IMAGE): the crawlers send their postgres writes
+                        to it and it sends them on together every few seconds. Needs
+                        --net-host (CRAWLER_NET_HOST=1)   (default: 0)
+  BATCHER_PORT          port the batcher listens on, on 127.0.0.1 (default: 8004)
   HEARTBEAT_INTERVAL    seconds between heartbeats        (default: 10)
   RECONCILE_INTERVAL    seconds between supervise ticks   (default: 1)
   TERM_GRACE            seconds to wait for a container to stop before SIGKILL (default: 10)
@@ -148,6 +153,12 @@ HEARTBEAT_INTERVAL = _float_env("HEARTBEAT_INTERVAL", 10.0)
 RECONCILE_INTERVAL = _float_env("RECONCILE_INTERVAL", 1.0)
 TERM_GRACE = _float_env("TERM_GRACE", 10.0)
 
+RUN_BATCHER = _flag("RUN_BATCHER", "0")
+BATCHER_PORT = _int_env("BATCHER_PORT", 8004)
+BATCHER_SLOT = "batcher"  # its slot id; crawler slots are ints
+BATCHER_CMD = ["/env/bin/python3", "supporting_servers/batcher.py"]  # paths in the image (see Dockerfile)
+BATCHER_TERM_GRACE = 20.0  # it flushes its buffer on SIGTERM (giving up after 15 s)
+
 # Crash backoff: a slot that dies waits BASE * 2**(consecutive restarts), capped.
 # A slot that stayed up longer than HEALTHY_UPTIME has its restart count reset,
 # so an occasional crash after hours of work doesn't accumulate backoff.
@@ -234,10 +245,14 @@ def run_command(slot_id):
             cmd += ["--env", f"{var}={val}"]  # ctr needs KEY=VALUE, not just NAME
     if CRAWLER_ENV_FILE:
         cmd += ["--env-file", CRAWLER_ENV_FILE]
+    if slot_id == BATCHER_SLOT:
+        cmd += ["--env", f"BATCHER_PORT={BATCHER_PORT}"]
+    elif RUN_BATCHER:
+        cmd += ["--env", f"BATCHER_ADDRESS=http://127.0.0.1:{BATCHER_PORT}"]
     cmd += CRAWLER_RUN_ARGS
     # `ctr run` positional args: IMAGE, container-id, then optional command.
     cmd += [CRAWLER_IMAGE, container_name(slot_id)]
-    cmd += CRAWLER_CMD  # empty => use the image's own entrypoint/cmd
+    cmd += BATCHER_CMD if slot_id == BATCHER_SLOT else CRAWLER_CMD  # empty CRAWLER_CMD => use the image's own entrypoint/cmd
     return cmd
 
 
@@ -323,6 +338,7 @@ class NodeAgent:
 
     def _stop(self, slot_id):
         """Gracefully stop a slot's container: SIGTERM the task, then force-rm."""
+        grace = BATCHER_TERM_GRACE if slot_id == BATCHER_SLOT else TERM_GRACE
         slot = self.slots.pop(slot_id, None)
         name = container_name(slot_id)
         if slot and slot["proc"] is not None and slot["proc"].poll() is None:
@@ -332,7 +348,7 @@ class NodeAgent:
             # exits once the task does.
             _quiet(_ctr("task", "kill", "--signal", "SIGTERM", name))
             try:
-                proc.wait(timeout=TERM_GRACE)
+                proc.wait(timeout=grace)
             except subprocess.TimeoutExpired:
                 log(f"slot {slot_id} didn't stop in time, killing")
                 _quiet(_ctr("task", "kill", "--signal", "SIGKILL", name))
@@ -362,12 +378,12 @@ class NodeAgent:
                 log(f"slot {slot_id} exited code={proc.returncode} "
                     f"uptime={uptime:.0f}s, respawning in {backoff:.0f}s")
 
-        # 2. Scale down: stop slots at or above the desired count.
-        for slot_id in [s for s in self.slots if s >= self.desired]:
+        # 2. Scale down: stop crawler slots at or above the desired count.
+        for slot_id in [s for s in self.slots if s != BATCHER_SLOT and s >= self.desired]:
             self._stop(slot_id)
 
-        # 3. Scale up / restart: ensure slots 0..desired-1 are running.
-        for slot_id in range(self.desired):
+        # 3. Scale up / restart: ensure the batcher (first, the crawlers write to it) and slots 0..desired-1 are running.
+        for slot_id in ([BATCHER_SLOT] if RUN_BATCHER else []) + list(range(self.desired)):
             slot = self.slots.get(slot_id)
             if slot is None:
                 self._spawn(slot_id, restarts=0)
@@ -379,7 +395,7 @@ class NodeAgent:
         procs = []
         alive = 0
         now = time.time()
-        for slot_id, slot in sorted(self.slots.items()):
+        for slot_id, slot in sorted((s, v) for s, v in self.slots.items() if s != BATCHER_SLOT):  # the dashboard counts crawlers
             proc = slot["proc"]
             if proc is not None and proc.poll() is None:
                 alive += 1
@@ -424,8 +440,12 @@ class NodeAgent:
 
     # ---- main loop --------------------------------------------------------- #
     def run(self):
+        global RUN_BATCHER
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+        if RUN_BATCHER and not CRAWLER_NET_HOST:
+            log("RUN_BATCHER needs CRAWLER_NET_HOST=1 (crawlers reach it on 127.0.0.1), not running it")
+            RUN_BATCHER = False
         log(f"starting: head={HEAD_URL or '(none)'} image={CRAWLER_IMAGE} "
             f"namespace={CTR_NAMESPACE} initial_desired={self.desired}")
         cleanup_stale_containers()
@@ -448,7 +468,8 @@ class NodeAgent:
 
     def shutdown(self):
         self.desired = 0
-        for slot_id in list(self.slots):
+        # The batcher last: crawlers send their final writes to it as they exit
+        for slot_id in sorted(self.slots, key=lambda s: s == BATCHER_SLOT):
             self._stop(slot_id)
         # Best-effort final heartbeat so the dashboard shows 0 alive immediately.
         try:

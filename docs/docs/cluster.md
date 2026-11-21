@@ -85,7 +85,12 @@ SCRAPER_PROXY=http://db01:8888
 SCRAPER_PROXY_PASSWORD=<scraper_password>
 WEB_TEXT_STORAGE_SERVER_ADDRESS=http://db01:8003
 INITIAL_DESIRED=1
+RUN_BATCHER=1
 ```
+
+`RUN_BATCHER=1` makes the agent also run `supporting_servers/batcher.py` (from the same image) on the box. The
+crawlers send their postgres writes to it on `127.0.0.1:8004`, and it sends them on together every 5 seconds
+instead of every crawler sending its own small transactions. Leave it out to have the crawlers write directly.
 
 The number of crawlers per worker is set from the dashboard; the agent picks it up on its next heartbeat. If the
 head is down, workers keep running at the last count they were given.

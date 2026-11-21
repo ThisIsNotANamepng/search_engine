@@ -13,6 +13,8 @@ import ipaddress
 import weakref
 import functools
 import queue
+import io
+import collections
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
@@ -370,9 +372,10 @@ def load_static_token_maps():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT bigram, id FROM bigrams;")
-    _BIGRAM_ID_MAP = {row[0].strip(): row[1] for row in cur.fetchall()}
+    bigram_map = {row[0].strip(): row[1] for row in cur.fetchall()}
     cur.execute("SELECT trigram, id FROM trigrams;")
     _TRIGRAM_ID_MAP = {row[0].strip(): row[1] for row in cur.fetchall()}
+    _BIGRAM_ID_MAP = bigram_map  # set last: it's what the check above looks at, so another thread never sees half the maps
     cur.close()
     conn.close()
 
@@ -773,6 +776,8 @@ def clean_links(raw_links):
 def store(content, url):
     """
     Stores the data (text, links, title, icon_link) of a given page in the index database
+
+    The page is tokenized here; the database work is write_pages(), now or in this box's batcher (see _write())
     """
     global URL
     URL = url
@@ -787,54 +792,22 @@ def store(content, url):
         info_print(f"URL longer than {MAX_URL_LENGTH} chars, not storing {url[:80]}...")
         return
 
-    load_static_token_maps()
-
     debug_print("Visited site, got main text and links")
 
     text, links, title, icon_link = content[:4]
-    
+
     # Making sure there is text at all. I chose 4 arbitrarily
     if text != None and len(text) < 4:
         mark_url_seen(url)  # so other pages linking here don't queue it again
-        return [links, False]
-    
-    """
-    # MOVED THIS TO SCRAPE.PY  
-    # Check for english language
-    if detect(text) != 'en':
-        # TODO: Add something here to the logs logging which pages are in what language so we can measure how much of the web is in what language
-        log(f"Language Not in English {url}")
-        info_print("Language not in English, skipping")
-
-        return [links, False]
-
-    debug_print("Detected language")
-    """
+        return
 
     # Tokenize the text of the page, counting how many times each token appears
+    # tokens: [word_counts, bigram_counts, trigram_counts, prefix_counts], each a Counter of token -> times it appears on the page
     tokens = tokenizer.tokenize_all_counts(text)
     debug_print("Tokenized")
 
     # A clean list of the links in the scraped page
     links = clean_links(links)
-
-    # tokens: [word_counts, bigram_counts, trigram_counts, prefix_counts], each a Counter of token -> times it appears on the page
-    word_counts = {w: n for w, n in tokens[0].items() if 0 < len(w) <= MAX_TOKEN_LENGTH}
-    bigram_counts = tokens[1]
-    trigram_counts = tokens[2]
-    prefix_counts = {p: n for p, n in tokens[3].items() if 0 < len(p) <= MAX_TOKEN_LENGTH}
-
-    words = set(word_counts)
-    bigrams = set(bigram_counts)
-    trigrams = set(trigram_counts)
-    prefixes = set(prefix_counts)
-    debug_print("Cleaned links and split tokens into words, bigrams, trigrams, prefixes")
-
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    #debug_print("Getting SQL connection and cursor:")
 
     # Cut down to title and url lengths. Probably shouldn't store the icon link if it's concatenated and thus doesn't work but it's 11:44pm and I'm tired
     if title:
@@ -842,29 +815,97 @@ def store(content, url):
     if icon_link and len(icon_link) > MAX_URL_LENGTH:
         icon_link = None
 
-    # Every word, bigram, trigram and prefix occurrence stored for this page (only tokens that get a row below are counted)
-    total_tokens = (sum(word_counts.values())
-                    + sum(n for b, n in bigram_counts.items() if b in _BIGRAM_ID_MAP)
-                    + sum(n for t, n in trigram_counts.items() if t in _TRIGRAM_ID_MAP)
-                    + sum(prefix_counts.values()))
+    page = {
+        "url": url,
+        "title": title,
+        "icon_link": icon_link,
+        "words": {w: n for w, n in tokens[0].items() if 0 < len(w) <= MAX_TOKEN_LENGTH},
+        "bigrams": dict(tokens[1]),
+        "trigrams": dict(tokens[2]),
+        "prefixes": {p: n for p, n in tokens[3].items() if 0 < len(p) <= MAX_TOKEN_LENGTH},
+        "links": links,
+    }
+    debug_print("Cleaned links and split tokens into words, bigrams, trigrams, prefixes")
 
-    # Upsert the URL and get its id. Use RETURNING id when inserting; else SELECT.
-    cur.execute("INSERT INTO urls (url, title, icon_link, total_tokens) VALUES (%s, %s, %s, %s) ON CONFLICT (url) DO NOTHING RETURNING id;", (url, title, icon_link, total_tokens))
-    row = cur.fetchone()
-    if row:
-        url_id = row[0]
+    _write("pages", [page])
+
+    debug_print("Committed and closed sql connection")
+
+    return links
+
+def mark_url_seen(url):
+    """Record a url without indexing its text (no tokens, so it never shows up in search), so filter_new_urls() won't queue it again"""
+    if NODB or len(url) > MAX_URL_LENGTH:
+        return
+    _write("seen", [url])
+
+def add_references(urls):
+    """Count one more reference (a link from another site) for each of these urls that's stored"""
+    if urls:
+        _write("references", urls)
+
+# ------------ Writing to the index, now or through the batcher
+
+# Set on the crawler boxes (by node_agent.py) to the box's batcher, e.g. http://127.0.0.1:8004
+BATCHER_ADDRESS = os.getenv("BATCHER_ADDRESS", "").rstrip("/")
+
+def _write(kind, items):
+    """
+    Writes items (a list) of one kind of WRITERS to postgres
+
+    With BATCHER_ADDRESS set they go to this box's batcher (supporting_servers/batcher.py), which writes everything every scraper on the box sent in the last few seconds at once.
+    A batcher that's down or full raises requests.RequestException, which scrape.py already treats as "retry the url later"
+    """
+    if BATCHER_ADDRESS:
+        requests.post(f"{BATCHER_ADDRESS}/{kind}", json=items, timeout=30).raise_for_status()
     else:
-        # Already stored (re-crawl or two scrapers on the same url): the UPDATE locks the row so
-        # concurrent stores of this url run one at a time, and refreshes total_tokens for the new scrape
-        cur.execute("UPDATE urls SET total_tokens = %s WHERE url = %s RETURNING id;", (total_tokens, url))
-        url_id = cur.fetchone()[0]
-        for table in ("word_urls", "bigram_urls", "trigram_urls", "prefix_urls"):
-            cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = %s;").format(sql.Identifier(table)), (url_id,))
+        write_now(kind, items)
 
-    
+def write_now(kind, items):
+    """Write items of one kind of WRITERS in one transaction"""
+    conn = get_conn()
+    try:
+        WRITERS[kind](conn.cursor(), items)
+        conn.commit()
+    finally:
+        conn.close()  # rolls back if the write failed
+
+POSTING_TABLES = (("word_urls", "word_id"), ("bigram_urls", "bigram_id"), ("trigram_urls", "trigram_id"), ("prefix_urls", "prefix_id"))
+
+def write_pages(cur, pages):
+    """
+    Stores pages made by store() with a handful of statements for the whole batch
+
+    Every statement locks rows in sorted order (urls, then words, then prefixes), otherwise two batches storing the same url or new word deadlock
+    """
+    load_static_token_maps()
+
+    # A url scraped twice in one batch: the newest scrape wins (an upsert also can't touch the same row twice)
+    pages = sorted({p["url"]: p for p in pages}.values(), key=lambda p: p["url"])
+
+    # Only bigrams/trigrams with a row in the static tables are stored (and counted in total_tokens)
+    bigrams = [{b: n for b, n in p["bigrams"].items() if b in _BIGRAM_ID_MAP} for p in pages]
+    trigrams = [{t: n for t, n in p["trigrams"].items() if t in _TRIGRAM_ID_MAP} for p in pages]
+    # Every word, bigram, trigram and prefix occurrence stored for the page
+    total_tokens = [sum(p["words"].values()) + sum(b.values()) + sum(t.values()) + sum(p["prefixes"].values())
+                    for p, b, t in zip(pages, bigrams, trigrams)]
+
+    # A url already stored (re-crawl, or marked seen) keeps its title and gets its postings replaced
+    cur.execute("""
+        INSERT INTO urls (url, title, icon_link, total_tokens)
+        SELECT * FROM unnest(%s::varchar[], %s::varchar[], %s::varchar[], %s::int[]) ORDER BY 1
+        ON CONFLICT (url) DO UPDATE SET total_tokens = EXCLUDED.total_tokens
+        RETURNING url, id;
+    """, ([p["url"] for p in pages], [p["title"] for p in pages], [p["icon_link"] for p in pages], total_tokens))
+    url_ids = dict(cur.fetchall())
+    ids = list(url_ids.values())
+    for table, _ in POSTING_TABLES:
+        cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = ANY(%s);").format(sql.Identifier(table)), (ids,))
+
     # Bulk insert new words/prefixes (bigrams/trigrams are pre-populated).
     # Only rows that don't exist yet: postgres burns an id for every attempted row even when ON CONFLICT skips it, which overflows the INT ids.
-    # ORDER BY: every scraper locks new tokens in the same order, otherwise two scrapers inserting the same new words deadlock.
+    words = set().union(*(p["words"] for p in pages))
+    prefixes = set().union(*(p["prefixes"] for p in pages))
     for column, table, tokens in (("word", "words", words), ("prefix", "prefixes", prefixes)):
         if tokens:
             cur.execute(sql.SQL("""
@@ -875,78 +916,66 @@ def store(content, url):
                 ON CONFLICT ({col}) DO NOTHING;
             """).format(col=sql.Identifier(column), tbl=sql.Identifier(table)), (list(tokens),))
 
-    if links:
-        extra_vals = [(url, l) for l in links]
-        extras.execute_values(cur, "INSERT INTO urls_references (url, referenced_domain) VALUES %s ON CONFLICT DO NOTHING;", extra_vals, template=None)
+    references = [(p["url"], link) for p in pages for link in p["links"]]
+    if references:
+        execute_values(cur, "INSERT INTO urls_references (url, referenced_domain) VALUES %s ON CONFLICT DO NOTHING;", references)
 
+    debug_print("Added new, unseen tokens to the database")
 
-    # Fetch ids for all tokens in bulk
     def fetch_id_map(column, table, items):
         if not items:
             return {}
-        cur.execute(sql.SQL("SELECT id, {col} FROM {tbl} WHERE {col} = ANY(%s);").format(
+        cur.execute(sql.SQL("SELECT {col}, id FROM {tbl} WHERE {col} = ANY(%s);").format(
             col=sql.Identifier(column), tbl=sql.Identifier(table)
         ), (list(items),))
-        rows = cur.fetchall()
-        return {val: id for (id, val) in rows}
-    
-    debug_print("Added new, unseen tokens to the database")
+        return dict(cur.fetchall())
 
-    word_map = fetch_id_map('word', 'words', list(words))
-    bigram_map = _BIGRAM_ID_MAP
-    trigram_map = _TRIGRAM_ID_MAP
-    prefix_map = fetch_id_map('prefix', 'prefixes', list(prefixes))
+    token_maps = (fetch_id_map("word", "words", words), _BIGRAM_ID_MAP, _TRIGRAM_ID_MAP, fetch_id_map("prefix", "prefixes", prefixes))
+    token_counts = ([p["words"] for p in pages], bigrams, trigrams, [p["prefixes"] for p in pages])
 
     debug_print("Made token maps")
 
-    # Prepare mapping inserts (token id, url id, times the token appears on the page) and bulk insert them
-    word_url_pairs = [(word_map[w], url_id, n) for w, n in word_counts.items() if w in word_map]
-    bigram_url_pairs = [(bigram_map[b], url_id, n) for b, n in bigram_counts.items() if b in bigram_map]
-    trigram_url_pairs = [(trigram_map[t], url_id, n) for t, n in trigram_counts.items() if t in trigram_map]
-    prefix_url_pairs = [(prefix_map[p], url_id, n) for p, n in prefix_counts.items() if p in prefix_map]
+    # (token id, url id, times the token appears on the page), all ints, as COPY's tab separated text: much faster than INSERTs at this size
+    copies = []
+    for (table, column), id_map, counts in zip(POSTING_TABLES, token_maps, token_counts):
+        rows = "".join(f"{id_map[tok]}\t{url_ids[p['url']]}\t{n}\n"
+                       for p, page_counts in zip(pages, counts) for tok, n in page_counts.items() if tok in id_map)
+        copies.append((table, column, rows))
 
     debug_print("Made insert stementes for <token>_url tables")
 
-    if word_url_pairs:
-        extras.execute_values(cur,
-            "INSERT INTO word_urls (word_id, url_id, count) VALUES %s;",
-            word_url_pairs)
-
-    if bigram_url_pairs:
-        extras.execute_values(cur,
-            "INSERT INTO bigram_urls (bigram_id, url_id, count) VALUES %s;",
-            bigram_url_pairs)
-
-    if trigram_url_pairs:
-        extras.execute_values(cur,
-            "INSERT INTO trigram_urls (trigram_id, url_id, count) VALUES %s;",
-            trigram_url_pairs)
-
-    if prefix_url_pairs:
-        extras.execute_values(cur,
-            "INSERT INTO prefix_urls (prefix_id, url_id, count) VALUES %s;",
-            prefix_url_pairs)
+    for table, column, rows in copies:
+        if rows:
+            cur.copy_expert(f"COPY {table} ({column}, url_id, count) FROM STDIN;", io.StringIO(rows))
 
     debug_print("Executed insert statements, stored url.id_token.id pairs")
 
-    conn.commit()
-    cur.close()
-    conn.close()
+def write_seen(cur, urls):
+    cur.execute("INSERT INTO urls (url) SELECT unnest(%s::varchar[]) ORDER BY 1 ON CONFLICT (url) DO NOTHING;", (sorted(set(urls)),))
 
-    debug_print("Committed and closed sql connection")
+def write_references(cur, urls):
+    # Locks the rows in url order (FOR UPDATE in the sorted subquery), like write_pages, so the two can't deadlock
+    counts = collections.Counter(urls)
+    cur.execute("""
+        UPDATE urls SET reference_count = urls.reference_count + r.n
+        FROM (SELECT u.id, t.n FROM urls u JOIN unnest(%s::varchar[], %s::int[]) AS t(url, n) ON u.url = t.url
+              ORDER BY u.url FOR UPDATE OF u) AS r
+        WHERE urls.id = r.id;
+    """, (list(counts), list(counts.values())))
 
-    return links
+def write_queue(cur, urls):
+    # Sorted so two batches queueing the same new urls don't deadlock
+    execute_values(cur, "INSERT INTO url_queue (url) VALUES %s ON CONFLICT (url) DO NOTHING;", [(u,) for u in sorted(set(urls))])
 
-def mark_url_seen(url):
-    """Record a url without indexing its text (no tokens, so it never shows up in search), so filter_new_urls() won't queue it again"""
-    if NODB or len(url) > MAX_URL_LENGTH:
-        return
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO urls (url) VALUES (%s) ON CONFLICT (url) DO NOTHING;", (url,))
-    conn.commit()
-    cur.close()
-    conn.close()
+def write_logs(cur, rows):
+    # rows: [ip, message, unix time it was logged]. Stored as db01's now() minus its age: this box's clock may not match db01's, and the dashboard compares ts to db01's now()
+    now = time.time()
+    execute_values(cur, "INSERT INTO logs (ip, message, ts) VALUES %s;",
+                   [(ip, message, max(0.0, now - logged_at)) for ip, message, logged_at in rows],
+                   template="(%s, %s, now() - make_interval(secs => %s))")
+
+# The batcher writes these in this order, so a page stored and marked seen in one batch keeps its title, and its references are counted
+WRITERS = {"pages": write_pages, "seen": write_seen, "references": write_references, "queue": write_queue, "logs": write_logs}
 
 # Queue and logging helpers (Postgres-backed)
 def get_next_urls(num_urls):
@@ -1012,35 +1041,12 @@ def get_host_ip():
 
 def log_db(message):
     """Insert a log message into the `logs` table with timestamp and host IP."""
-    #start=time.time()
-    conn = get_conn()
-    cur = conn.cursor()
-    ip = get_host_ip()
-    cur.execute("INSERT INTO logs (ip, message) VALUES (%s, %s);", (ip, message))
-    conn.commit()
-    cur.close()
-    conn.close()
-    #print("DB Log time:", time.time()-start)
+    _write("logs", [[get_host_ip(), message, time.time()]])
 
 def enqueue_urls(urls):
     if not urls:
         return
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    query = """
-        INSERT INTO url_queue (url)
-        VALUES %s
-        ON CONFLICT (url) DO NOTHING;
-    """
-
-    # execute_values handles building the bulk values list efficiently
-    execute_values(cur, query, [(u,) for u in urls])
-
-    conn.commit()
-    cur.close()
-    conn.close()
+    _write("queue", urls)
 
 
 def filter_new_urls(urls):

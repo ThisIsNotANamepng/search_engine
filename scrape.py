@@ -109,6 +109,9 @@ def on_exit():
     try:
         if url and not (args.nodb or args.url or args.file):
             utils.enqueue_urls([url])  # the current url may be a same-host redirect target, which isn't in the db queue
+    except Exception as e:
+        utils.failure_print(f"Could not queue {url}: {e}")  # e.g. the batcher is down: still hand back the claims below
+    try:
         finish_claims(release)
     except Exception as e:
         utils.failure_print(f"Could not hand back {len(release)} urls: {e}")
@@ -308,21 +311,7 @@ while True:
 
             external_links = [link for link in cleaned if utils.get_base_domain(link) != current_domain]
 
-            if external_links:
-
-                # TODO: Move this to utils
-                conn = utils.get_conn()
-                cur = conn.cursor()
-
-                cur.execute("""
-                    UPDATE urls
-                    SET reference_count = reference_count + 1
-                    WHERE url = ANY(%s);
-                """, (external_links,))
-
-                conn.commit()
-                cur.close()
-                conn.close()
+            utils.add_references(external_links)
 
         if not args.nodb:
             # filter_new_urls checks both the queue and stored urls in one go
