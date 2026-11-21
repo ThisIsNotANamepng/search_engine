@@ -92,6 +92,8 @@ Wants=network-online.target
 
 [Service]
 User=stultus-proxy
+# Lets it listen on a port below 1024 (443) without running as root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 EnvironmentFile=/etc/stultus/proxy.env
 ExecStart=/usr/local/bin/stultus-proxy
 Restart=always

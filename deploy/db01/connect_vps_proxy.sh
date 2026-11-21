@@ -33,12 +33,22 @@ fi
 host=$VPS; [[ $VPS == *:* ]] && host="[$VPS]"  # an IPv6 address needs brackets in a URL
 
 echo "== checking the VPS proxy directly"
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --cacert "$CERT_IN" \
-    -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$host:$PORT/fetch?url=https://example.com/" || true)"
+rc=0
+code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 --cacert "$CERT_IN" \
+    -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$host:$PORT/fetch?url=https://example.com/")" || rc=$?
 case $code in
     200) echo "ok" ;;
     401) echo "the VPS rejected the password: use the one in the VPS's /etc/stultus/proxy.env" >&2; exit 1 ;;
-    000) echo "can't reach https://$host:$PORT (VPS firewall / cloud security group / wrong address or cert?)" >&2; exit 1 ;;
+    000)
+        case $rc in
+            35|51|58|60|77|83|90|91)
+                echo "TLS failed (curl error $rc): $CERT_IN isn't the certificate the VPS serves. Copy /etc/stultus/proxy.crt from the VPS again." >&2
+                echo "  this file: $(openssl x509 -in "$CERT_IN" -noout -fingerprint -sha256)" >&2 ;;
+            28) echo "timed out connecting to $host:$PORT: something between here and the VPS drops it (often this network allows only ports 80/443 out: rerun install_proxy.sh with port 443, then this script with 443)" >&2 ;;
+            7)  echo "connection to $host:$PORT refused or no route (is stultus-proxy running on the VPS, on port $PORT? is the cloud firewall open?)" >&2 ;;
+            *)  echo "can't reach https://$host:$PORT (curl error $rc, see 'man curl' EXIT CODES)" >&2 ;;
+        esac
+        exit 1 ;;
     *)   echo "the VPS answered HTTP $code: check journalctl -u stultus-proxy on the VPS" >&2; exit 1 ;;
 esac
 # Crawlers going through the proxy leave the "public address only" check to the VPS, so it must have it
