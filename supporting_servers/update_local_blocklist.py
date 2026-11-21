@@ -3,7 +3,7 @@ This script builds blocklist.db, the sqlite database of domains the scrapers mus
 
 It holds two lists:
   - Steven Black's hosts file of unpalatable domains (fake news/gambling scams/adware/malware sites)
-  - The postgres blocked_domains table (opt-outs and hosts the scrapers blocked with block_domain), so scrapers don't query postgres for it on every url
+  - The postgres blocked_domains table (opt-outs), so scrapers don't query postgres for it on every url
 
 Needs DATABASE_URL set. If the hosts download or postgres fails, the script crashes and leaves the old blocklist.db in place, so opt-outs are never dropped
 

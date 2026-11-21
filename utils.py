@@ -41,8 +41,6 @@ _PROXY_HEADERS = {"X-Proxy-Auth": SCRAPER_PROXY_PASSWORD} if SCRAPER_PROXY_PASSW
 
 _BIGRAM_ID_MAP = None
 _TRIGRAM_ID_MAP = None
-# Hosts this scraper blocked with block_domain() that may not be in its downloaded blocklist.db yet
-_BLOCKED_HERE = set()
 DEBUG_BREAKPOINT_TIMER = time.time()
 # Look for the DEBUG shell varialbe and set a global variable to True or false base don whether it was passed
 DEBUG = "DEBUG" in os.environ
@@ -649,8 +647,9 @@ def get_page_html(url):
 
         content_type = request.headers.get("Content-Type", "").lower()
 
+        # Skip just this page: one protected url (/admin, a bot challenge) shouldn't block the whole host
         if request.status_code in (401, 403):
-            block_domain(url, f"HTTP {request.status_code}")
+            log(f"Error HTTP {request.status_code} {url}")
             return False
 
         if request.status_code == 429:
@@ -744,43 +743,6 @@ def get_base_domain(url):
     if ext.top_domain_under_public_suffix:
         return ext.top_domain_under_public_suffix
     return host
-
-def block_domain(url, reason=""):
-    """
-    Add the url's host to the list (in the database) of hosts we don't scrape
-
-    Blocks the exact host (spammy.blogspot.com), not the registrable domain, so one 401/403 doesn't block every site on blogspot.com or github.io.
-    Queued urls of the host aren't deleted here; the scraper checks check_url_in_blocklist() before every url
-    
-    Args:
-        url : string
-            The url which we aren't allowed to scrape
-        reason : string
-            The reason for not being allowed
-    
-    Returns:
-        Nothing
-
-    Notes:
-        We don't use the reason variable at all, but we totally couple if we wanted
-    """
-    domain = urlparse(url).hostname
-    if not domain:
-        return
-
-    # blocklist.db only picks this up on the next rebuild + download, so block it locally right away
-    _BLOCKED_HERE.add(domain)
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("INSERT INTO blocked_domains (domain, reason) VALUES (%s, %s) ON CONFLICT (domain) DO NOTHING;", (domain, reason))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    log(f"Blocked domain {domain} reason={reason}")
 
 def clean_links(raw_links):
     """
@@ -1156,16 +1118,14 @@ def _refresh_blocklist_if_stale():
 
 def check_url_in_blocklist(url):
     """
-    Takes url, checks if its exact host or base domain is in blocklist.db (Steven Black's hosts + postgres blocked_domains), or was blocked by this scraper since the last download
+    Takes url, checks if its exact host or base domain is in blocklist.db (Steven Black's hosts + postgres blocked_domains)
 
-    Exact host catches the hosts file's subdomain entries and block_domain's per-host blocks, base domain catches opt-outs (example.com also covers www.example.com)
+    Exact host catches the hosts file's subdomain entries, base domain catches opt-outs (example.com also covers www.example.com)
 
     Returns True if blocked (cannot scrape), False if not
     """
 
     domains = (urlparse(url).hostname, get_base_domain(url))
-    if _BLOCKED_HERE.intersection(domains):
-        return True
 
     _refresh_blocklist_if_stale()
 

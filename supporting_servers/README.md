@@ -6,7 +6,7 @@ Scrapers need three additional servers running on the head node besides the data
 
 Flask server `serve_blocklist.py` serves up a file `blocklist.db` for scrapers to download and cache. 
 
-The script `update_local_blocklist.py` downloads Steven Black's host file and the postgres `blocked_domains` table (opt-outs and hosts scrapers blocked) into one sqlite3 database for use by scrapers, so they never ask postgres whether a domain is blocked. It needs `DATABASE_URL` set. This should be run every 10 minutes or so; a new opt-out reaches scrapers within about an hour plus that interval
+The script `update_local_blocklist.py` downloads Steven Black's host file and the postgres `blocked_domains` table (opt-outs) into one sqlite3 database for use by scrapers, so they never ask postgres whether a domain is blocked. It needs `DATABASE_URL` set. This should be run every 10 minutes or so; a new opt-out reaches scrapers within about an hour plus that interval
 
 ## Proxy
 
