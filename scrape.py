@@ -26,9 +26,11 @@ Environment variables:
 
 import utils
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 import os
 import redis
+import psycopg2
+import requests
 import argparse
 import atexit
 import signal
@@ -49,9 +51,9 @@ parser.add_argument("-ndb", "--nodb", action='store_true', help="Don't use redis
 args = parser.parse_args()
 
 if args.nodb and not (args.url or args.file):
-    raise ("--nodb option must be used with --url or --file flags")
+    parser.error("--nodb option must be used with --url or --file flags")
 elif args.url and args.file:
-    raise ("Cannot use both --file and --url flags at the same time")
+    parser.error("Cannot use both --file and --url flags at the same time")
 
 # Communicates the nodb flag to utils.py for all of the log() functions because I'm lazy
 utils.NODB = args.nodb
@@ -62,19 +64,14 @@ if not args.nodb: utils.create_database()
 utils.log("Started scraping")
 
 if not args.nodb:
-    redis_address = os.getenv("DATABASE_URL")
-    redis_address = redis_address[redis_address.index("@")+1:] # Get the IP of the DB server, the redis server will be on the same machine
-    redis_address = redis_address[0:redis_address.index(":")]
-
-    redis_password = os.getenv("DATABASE_URL")[::-1]
-    redis_password = redis_password[redis_password.index("@")+1:]
-    redis_password = redis_password[0:redis_password.index(":")][::-1]
+    # Redis runs on the DB server with the same password
+    database_url = urlparse(os.getenv("DATABASE_URL"))
 
     redis_client = redis.Redis(
-        host=redis_address,
+        host=database_url.hostname,
         port=6379,
         db=0,
-        password=redis_password,
+        password=unquote(database_url.password or ""),
         decode_responses=True  # makes strings instead of bytes
     )
 
@@ -84,7 +81,7 @@ if not args.nodb:
 local_queue = []
 queue_return_to_db = []
 claimed = []  # urls this scraper claimed with get_next_urls, still marked claimed in the db queue
-rate_limited = []  # claimed urls left claimed on purpose: the claim timing out is their retry delay
+retry_later = []  # claimed urls left claimed on purpose (rate limited, or one of our own servers was down): the claim timing out is their retry delay
 url = ""
 prev_base_domain = ""
 page_not_in_english = False
@@ -92,11 +89,11 @@ first_run = True
 
 def finish_claims(release):
     # End our claims: urls in release go back to the db queue, the rest of what we claimed is done and leaves it
-    global claimed, rate_limited
+    global claimed, retry_later
     if args.nodb or args.url or args.file:
         return  # these urls didn't come from the db queue, so there are no claims (and the rows may be another scraper's)
-    utils.finish_claims(done=set(claimed) - set(release) - set(rate_limited), release=release)
-    claimed, rate_limited = [], []
+    utils.finish_claims(done=set(claimed) - set(release) - set(retry_later), release=release)
+    claimed, retry_later = [], []
 
 def send_page_text(url, page_data):
     # The text archive is a copy for research; if it's down, keep crawling
@@ -219,6 +216,7 @@ while True:
         if not args.nodb:
             if utils.check_url_in_blocklist(url):
                 utils.log(f"Misc URL found in domain blocklist, skipping {url}")
+                utils.mark_url_seen(url)  # so other pages linking here don't queue it again
                 continue
 
 
@@ -241,13 +239,18 @@ while True:
 
         if raw_html == utils.RATE_LIMITED:
             if not args.nodb:
-                rate_limited.append(url)  # stays claimed, so it's retried once the claim times out
+                retry_later.append(url)  # stays claimed, so it's retried once the claim times out
                 redis_client.set(f"domain:{base_domain}", 1, ex=600)  # 10 minute cooldown
             utils.info_print(f"Rate limited, retrying after {utils.CLAIM_TIMEOUT} with 10 minute domain cooldown {url}")
             continue
 
+        if raw_html == utils.NOT_SCRAPABLE:
+            utils.mark_url_seen(url)  # the answer won't change, so other pages linking here don't queue it again
+            utils.info_print(f"Not scrapable (robots.txt/non-HTML/too large), skipping {url}")
+            continue
+
         if raw_html is False:
-            utils.info_print(f"Fetch failed (blocked/timeout/non-HTML), skipping {url}")
+            utils.info_print(f"Fetch failed (error status/timeout), skipping {url}")
             continue
 
         # A same-host redirect was followed: index the page under where it actually lives, cleaned like every stored url
@@ -294,6 +297,7 @@ while True:
 
         else:
             utils.info_print(f"No text found, keeping links only {url}")
+            utils.mark_url_seen(url)  # so other pages linking here don't queue it again
 
         # Clean first: stored and queued urls are in cleaned form (no ?query, #fragment or trailing /), so raw links wouldn't match them
         cleaned = utils.clean_links(page_data[1])
@@ -343,6 +347,9 @@ while True:
         # One bad page must not kill the scraper (and lose its local queue); log it, skip that url (not requeued, so a page that always fails can't loop forever), keep going
         utils.failure_print(f"Error scraping {url}: {e!r}")
         utils.log(f"Error Unhandled exception {e!r} {url}")
+        # Page errors are caught inside utils, so these mean our own postgres, blocklist server or proxy is down: not the page's fault, retry it later
+        if url and isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError, requests.RequestException)):
+            retry_later.append(url)
         time.sleep(1)  # don't spin if a dependency (db, redis) is down
 
 utils.log("Finished scraping")

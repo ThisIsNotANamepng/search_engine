@@ -27,6 +27,7 @@ sys.path.insert(0, str(LAB.parent.parent))  # utils.py, search.py, tokenizer.py
 import psycopg2
 from psycopg2 import sql
 
+import add_search_indexes
 import tokenizer
 import utils
 
@@ -87,6 +88,9 @@ def build(name):
 
     if not stored:
         sys.exit(f"Stored nothing: no file under {DATA} is named after an id in {index_db.name}'s pages table")
+    # The token indexes production search runs on; create_database() doesn't make them
+    for table in add_search_indexes.INDEXES:
+        add_search_indexes.build(table)
     print(f"Built lab_{name} from {stored} pages")
 
 

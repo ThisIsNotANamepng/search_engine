@@ -1,0 +1,16 @@
+# Page-text storage server (WEB_TEXT_STORAGE_SERVER_ADDRESS=http://db01:8003).
+# Data lives in supporting_servers/data/ next to the script.
+[Unit]
+Description=Stultus web text storage server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@REPO@/supporting_servers
+ExecStart=@PYTHON@ -m gunicorn --workers 4 --timeout 120 --bind 0.0.0.0:8003 web_storage_server:app
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

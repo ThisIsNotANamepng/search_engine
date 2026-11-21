@@ -12,17 +12,18 @@ Graphs:
 - 
 """
 
-import os, sys, time, threading
+import os, sys, time, threading, socket, collections
+import urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
 # search.py lives in the directory above this one
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify
 import search
 import psycopg2
 import psycopg2.extras
 import json
-import hmac
 
 app = Flask(__name__)
 
@@ -31,20 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-# The dashboard and the crawler control endpoints need HTTP basic auth with this password (any username).
-# Node agents send it from their own ADMIN_PASSWORD. Unset = those routes are refused for everyone.
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-ADMIN_PATHS = ("/dashboard", "/nodes/", "/agent/")
 MAX_DESIRED = 64  # crawlers per node; a typo shouldn't spawn thousands of containers
-
-@app.before_request
-def require_admin_password():
-    if not request.path.startswith(ADMIN_PATHS):
-        return None
-    auth = request.authorization
-    if ADMIN_PASSWORD and auth and auth.password is not None and hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
-        return None
-    return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Stultus admin"'})
 
 def get_db():
     return psycopg2.connect(
@@ -386,35 +374,158 @@ if os.getenv("DASHBOARD_PREWARM", "1") != "0":
 
 @app.route("/dashboard")
 def dashboard():
-    """Page shell only: no slow queries, so it renders immediately. Stats arrive via /dashboard/data."""
+    """Page shell only: no queries at all, so it renders immediately. The page's JavaScript
+    polls /dashboard/live (cheap, every few seconds) and /dashboard/data (slow, cached)."""
+    return render_template("dashboard.html", node_stale_seconds=NODE_STALE_SECONDS)
+
+
+# ---- Live dashboard data: nodes, service health, search timings ---------------
+# Everything here is cheap, so the page polls it every few seconds.
+
+# Timings of real /search requests. Kept in memory: the head runs a single gunicorn
+# process (see deploy/db01/stultus-head.service), so every request lands here.
+_search_timings = collections.deque(maxlen=2000)  # (unix_time, seconds, result_count)
+_search_timings_lock = threading.Lock()
+SEARCH_STATS_WINDOW_SECONDS = 3600
+
+
+def _search_stats():
+    now = time.time()
+    with _search_timings_lock:
+        recent = [t for t in _search_timings if now - t[0] <= SEARCH_STATS_WINDOW_SECONDS]
+    durations = sorted(t[1] for t in recent)
+
+    def pct_ms(p):
+        if not durations:
+            return None
+        return round(1000 * durations[min(len(durations) - 1, int(p * len(durations)))])
+
+    return {
+        "window_s": SEARCH_STATS_WINDOW_SECONDS,
+        "count": len(recent),
+        "p50_ms": pct_ms(0.50),
+        "p95_ms": pct_ms(0.95),
+        "max_ms": round(1000 * durations[-1]) if durations else None,
+        # Timings only, never the query text: this page shouldn't expose what people search for.
+        "recent": [{"at": at, "ms": round(1000 * s), "results": n}
+                   for at, s, n in reversed(recent[-10:])],
+    }
+
+
+# Services the crawlers depend on. They all run on db01 next to the head, so they're
+# checked on localhost; DASHBOARD_HEALTH_HOST overrides that.
+HEALTH_HOST = os.getenv("DASHBOARD_HEALTH_HOST", "127.0.0.1")
+HEALTH_TIMEOUT_SECONDS = 2.0
+HEALTH_CACHE_SECONDS = 5.0
+
+
+def _check_tcp(port, send=None, ok_replies=()):
+    with socket.create_connection((HEALTH_HOST, port), timeout=HEALTH_TIMEOUT_SECONDS) as s:
+        if send:
+            s.sendall(send)
+            reply = s.recv(64)
+            if not reply.startswith(tuple(ok_replies)):
+                raise RuntimeError(f"unexpected reply {reply[:24]!r}")
+    return None
+
+
+def _check_http(port, path, method="GET"):
+    req = urllib.request.Request(f"http://{HEALTH_HOST}:{port}{path}", method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=HEALTH_TIMEOUT_SECONDS):
+            return None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "warn", "up, but returned 404"
+        raise
+
+
+def _check_postgres():
+    conn = psycopg2.connect(DATABASE_URL, sslmode="disable", connect_timeout=HEALTH_TIMEOUT_SECONDS)
+    try:
+        conn.cursor().execute("SELECT 1;")
+    finally:
+        conn.close()
+    return None
+
+
+HEALTH_CHECKS = [
+    # (name, what the crawlers use it for, check)
+    ("Postgres", "index + URL queue", _check_postgres),
+    # Redis answers PING with +PONG, or -NOAUTH if it wants a password (still up).
+    ("Redis", "domain politeness locks", lambda: _check_tcp(6379, b"PING\r\n", (b"+PONG", b"-NOAUTH"))),
+    ("Proxy", "all page fetches", lambda: _check_tcp(8888)),
+    ("Text storage", "page text archive", lambda: _check_tcp(8003)),
+    ("Blocklist", "blocked-domain list", lambda: _check_http(8002, "/blocklist.db", "HEAD")),
+    ("Registry", "crawler images", lambda: _check_http(5000, "/v2/")),
+    ("Registry cache", "image pull cache", lambda: _check_http(5001, "/v2/")),
+]
+_health_executor = ThreadPoolExecutor(max_workers=len(HEALTH_CHECKS), thread_name_prefix="health")
+_health_cache = {"at": 0.0, "results": None}
+_health_lock = threading.Lock()
+
+
+def _run_check(name, purpose, check):
+    started = time.perf_counter()
+    try:
+        outcome = check()
+        status, detail = outcome if outcome else ("ok", "")
+    except Exception as e:  # any failure to connect/answer means the service is down
+        if isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError):
+            e = e.reason if isinstance(e.reason, Exception) else e
+        # "[Errno 111] Connection refused" -> "Connection refused"
+        detail = (getattr(e, "strerror", None) or str(e) or type(e).__name__)
+        status = "down"
+    return {"name": name, "purpose": purpose, "status": status, "detail": detail,
+            "ms": round(1000 * (time.perf_counter() - started))}
+
+
+def _service_health():
+    """All checks run in parallel; results are shared for a few seconds so several open
+    dashboards don't multiply the probing."""
+    with _health_lock:
+        if _health_cache["results"] is not None and time.time() - _health_cache["at"] < HEALTH_CACHE_SECONDS:
+            return _health_cache["results"]
+        futures = [_health_executor.submit(_run_check, *c) for c in HEALTH_CHECKS]
+        results = [f.result() for f in futures]
+        _health_cache.update(at=time.time(), results=results)
+        return results
+
+
+def _crawler_nodes():
     conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # `procs` is the agent's list of running crawler containers (slot, container,
+        # pid, uptime_s, restarts); `age_s` flags a node whose agent has gone silent.
+        cur.execute("""
+            SELECT node_id, hostname, desired_count, alive_count, cpu_percent, mem_percent,
+                   procs, first_seen, last_seen,
+                   EXTRACT(EPOCH FROM (now() - last_seen))::float AS age_s
+            FROM crawler_nodes
+            ORDER BY node_id;
+        """)
+        return cur.fetchall()
+    finally:
+        conn.close()
 
-    # Crawler nodes (from the node agents' heartbeats). `age_s` lets the
-    # template flag a node whose agent has gone silent.
-    cur.execute("""
-        SELECT
-            node_id,
-            hostname,
-            desired_count,
-            alive_count,
-            cpu_percent,
-            mem_percent,
-            last_seen,
-            EXTRACT(EPOCH FROM (now() - last_seen)) AS age_s
-        FROM crawler_nodes
-        ORDER BY node_id;
-    """)
-    nodes = cur.fetchall()
 
-    cur.close()
-    conn.close()
-
-    return render_template(
-        "dashboard.html",
-        nodes=nodes,
-        node_stale_seconds=NODE_STALE_SECONDS,
-    )
+@app.route("/dashboard/live")
+def dashboard_live():
+    """Cheap, frequently polled dashboard state."""
+    try:
+        nodes, nodes_error = _crawler_nodes(), None
+    except psycopg2.Error as e:
+        nodes, nodes_error = [], str(e)
+    payload = {
+        "nodes": nodes,
+        "nodes_error": nodes_error,
+        "node_stale_seconds": NODE_STALE_SECONDS,
+        "health": _service_health(),
+        "search": _search_stats(),
+        "server_time": time.time(),
+    }
+    return app.response_class(json.dumps(payload, default=str), mimetype="application/json")
 
 
 @app.route("/dashboard/data")
@@ -451,7 +562,13 @@ def index():
 @app.route("/search")
 def perform_search():
     query_string = request.args.get("q")
+    started = time.perf_counter()
     search_results = search.search(query_string or "")  # a missing/empty q used to crash the tokenizer (500)
+    if query_string:
+        elapsed = time.perf_counter() - started
+        count = len(search_results) if hasattr(search_results, "__len__") else None
+        with _search_timings_lock:
+            _search_timings.append((time.time(), elapsed, count))
     return render_template("search.html", search_results=search_results, query_string=query_string)
 
 

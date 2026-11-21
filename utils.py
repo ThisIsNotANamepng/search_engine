@@ -25,7 +25,6 @@ from psycopg2.extras import execute_values
 from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
 import csv
-from typing import Optional
 import sqlite3
 import zlib
 import trafilatura
@@ -33,6 +32,7 @@ import trafilatura
 USER_AGENT = "StultusSearchEngine/1.0 (+https://stultus.rip; crawler@stultus.rip)"
 RATE_LIMITED = "rate_limited"
 REDIRECTED = "redirected"
+NOT_SCRAPABLE = "not_scrapable"
 # Entry point of the proxy chain (proxy A). Proxy A forwards to proxy B
 # (configured on A via PROXY_UPSTREAM), which then makes the real outbound
 # request. Unset to fetch directly without a proxy.
@@ -63,94 +63,20 @@ MAX_TOKEN_LENGTH = 64  # words.word, prefixes.prefix
 
 MAX_PAGE_BYTES = 5 * 1024 * 1024  # pages bigger than this (after decompression) are skipped
 
-class CSVTracker:
-    def __init__(self, filename: str = "timing.csv"):
-        self.filename = filename
-        self.columns = [
-            "url",
-            "downloaded_text",
-            "detected_language",
-            "tokenized",
-            "cleaned_and_split",
-            "added_new_tokens",
-            "made_token_maps",
-            "made_insert_statements",
-            "execute_insert_statements",
-            "committed_and_closed",
-            "total"
-        ]
-        self._ensure_file_exists()
+# DEBUG=3 timing data, one row per stored url, read by tests/utils/browse_debug_timing_data.ipynb
+TIMING_FILE = "timing.csv"
+TIMING_COLUMNS = ["url", "downloaded_text", "detected_language", "tokenized", "cleaned_and_split", "added_new_tokens",
+                  "made_token_maps", "made_insert_statements", "execute_insert_statements", "committed_and_closed", "total"]
+_timing_row = {}  # timed steps of the url store() is working on, appended to TIMING_FILE when it commits
 
-    def _ensure_file_exists(self):
-        """Create CSV with headers if it doesn't exist."""
-        if not os.path.exists(self.filename):
-            with open(self.filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.columns)
-                writer.writeheader()
-
-    def _read_all(self) -> list[dict]:
-        """Read all rows from CSV."""
-        with open(self.filename, 'r', newline='', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            return list(reader)
-
-    def _write_all(self, rows: list[dict]):
-        """Write all rows to CSV."""
-        with open(self.filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=self.columns)
+def _write_timing_row():
+    new_file = not os.path.exists(TIMING_FILE)
+    with open(TIMING_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TIMING_COLUMNS)
+        if new_file:
             writer.writeheader()
-            writer.writerows(rows)
-
-    def update(self, url: str, column: str, value) -> bool:
-        """
-        Update a specific column for a given URL.
-        Creates new row if URL doesn't exist.
-
-        Args:
-            url: The URL to update (primary key)
-            column: Column name to update
-            value: Value to set
-
-        Returns:
-            True if successful, False if column invalid
-        """
-        if column not in self.columns:
-            print(f"Error: Invalid column '{column}'. Valid columns: {self.columns}")
-            return False
-
-        rows = self._read_all()
-
-        # Find existing row or create new one
-        row_found = False
-        for row in rows:
-            if row.get("url") == url:
-                row[column] = value
-                row_found = True
-                break
-
-        if not row_found:
-            # Create new row with URL and empty values
-            new_row = {col: "" for col in self.columns}
-            new_row["url"] = url
-            new_row[column] = value
-            rows.append(new_row)
-
-        self._write_all(rows)
-        return True
-
-    def get(self, url: str) -> Optional[dict]:
-        """Get a row by URL."""
-        rows = self._read_all()
-        for row in rows:
-            if row.get("url") == url:
-                return row
-        return None
-
-    def get_all(self) -> list[dict]:
-        """Get all rows."""
-        return self._read_all()
-
-TIMING_TRACKER = CSVTracker("timing.csv") if LEVEL == "3" else ""
+        writer.writerow({"url": URL, **_timing_row})
+    _timing_row.clear()
 
 def debug_print(text):
     """
@@ -188,9 +114,6 @@ def debug_print(text):
             DEBUG_BREAKPOINT_TIMER = time.time()
 
         elif LEVEL == "3":
-            global TIMING_TRACKER
-            global URL
-
             print(format_time(time.time()-DEBUG_BREAKPOINT_TIMER), text)
             timing = format_time(time.time()-DEBUG_BREAKPOINT_TIMER)
 
@@ -227,7 +150,9 @@ def debug_print(text):
                 code = None
 
             if code:
-                TIMING_TRACKER.update(URL, code, timing)
+                _timing_row[code] = timing
+                if code == "committed_and_closed":  # store()'s last step
+                    _write_timing_row()
 
             DEBUG_BREAKPOINT_TIMER = time.time()
 
@@ -337,8 +262,9 @@ def create_database():
         PRIMARY KEY (url, referenced_domain)
     );
                 
+    -- BIGSERIAL: every url ever queued takes a new id and ids are never reused, so INT runs out. Older databases get it from widen_url_queue_id.py
     CREATE TABLE IF NOT EXISTS url_queue (
-        id SERIAL PRIMARY KEY,
+        id BIGSERIAL PRIMARY KEY,
         url VARCHAR(2048) UNIQUE NOT NULL,
         enqueued_at TIMESTAMP DEFAULT now(),
         claimed_at TIMESTAMP  -- set while a scraper holds the url, see get_next_urls()
@@ -390,14 +316,13 @@ def create_database():
     CREATE INDEX IF NOT EXISTS urls_domain_idx
         ON urls ((SUBSTRING(url FROM '^(?:https?://)?([^/]+)')));
 
-    -- Token -> page lookups (search) and page -> tokens (store() replacing a re-crawled page's postings)
-    CREATE INDEX IF NOT EXISTS idx_word_urls_word_id ON word_urls(word_id);
+    -- Page -> tokens (store() replacing a re-crawled page's postings)
+    -- Token -> page lookups (search) use the (token_id, url_id) INCLUDE (count) indexes from add_search_indexes.py, built CONCURRENTLY.
+    -- Don't add single-column token_id indexes here: search's re-score step picks them and reads every posting of each query word (~45x slower on 5M test rows),
+    -- and on a big table a missing one would be built with a write lock on every scraper start
     CREATE INDEX IF NOT EXISTS idx_word_urls_url_id ON word_urls(url_id);
-    CREATE INDEX IF NOT EXISTS idx_bigram_urls_bigram_id ON bigram_urls(bigram_id);
     CREATE INDEX IF NOT EXISTS idx_bigram_urls_url_id ON bigram_urls(url_id);
-    CREATE INDEX IF NOT EXISTS idx_trigram_urls_trigram_id ON trigram_urls(trigram_id);
     CREATE INDEX IF NOT EXISTS idx_trigram_urls_url_id ON trigram_urls(url_id);
-    CREATE INDEX IF NOT EXISTS idx_prefix_urls_prefix_id ON prefix_urls(prefix_id);
     CREATE INDEX IF NOT EXISTS idx_prefix_urls_url_id ON prefix_urls(url_id);
     """)
 
@@ -649,7 +574,8 @@ def get_page_html(url):
                 bytes         the raw html of the page
                 RATE_LIMITED  the site answered 429
                 REDIRECTED    the page redirects to another host, final_url is the target
-                False         the page can't or mustn't be scraped (robots.txt, not html, too large, error status, network error)
+                NOT_SCRAPABLE the site's answer won't change on a retry (robots.txt, not html, too large, redirect loop), so the scraper records the url as seen
+                False         the page can't be scraped right now (error status, network error, not a public address)
             final_url is the url the result came from, after any redirects (not cleaned, so relative links resolve against it)
             x_robots_tag is the page's X-Robots-Tag header ("" if none), for extract_data_from_html
     """
@@ -661,7 +587,7 @@ def get_page_html(url):
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
         info_print("Not allowed by robots.txt")
-        return False, url, ""
+        return NOT_SCRAPABLE, url, ""
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -683,7 +609,7 @@ def get_page_html(url):
             location = request.headers.get("Location", "")
             if not location or redirect_hops >= 5:
                 log(f"Error Empty redirect or too many redirects {url}")
-                return False, url, ""
+                return NOT_SCRAPABLE, url, ""
             target = urljoin(url, location)  # relative Location -> absolute target url
             if urlparse(target).hostname != urlparse(url).hostname:
                 return REDIRECTED, target, ""
@@ -694,7 +620,7 @@ def get_page_html(url):
                 return False, url, ""
             if not allowed_by_robots(url, USER_AGENT):
                 log(f"Blocked by robots.txt {url}")
-                return False, url, ""
+                return NOT_SCRAPABLE, url, ""
             request = fetch(url)
             redirect_hops += 1
 
@@ -714,7 +640,8 @@ def get_page_html(url):
             content_type.startswith("text/html")
         ):
             log(f"Error Invalid data type {url}")
-            return False, url, ""
+            # An error status isn't final: our proxy's own 502s look like this too
+            return (NOT_SCRAPABLE if request.status_code < 400 else False), url, ""
 
         # Read at most MAX_PAGE_BYTES; a huge page would otherwise be loaded into memory whole
         content = bytearray()
@@ -722,13 +649,15 @@ def get_page_html(url):
             content += chunk
             if len(content) > MAX_PAGE_BYTES:
                 log(f"Error Page too large {url}")
-                return False, url, ""
+                return NOT_SCRAPABLE, url, ""
         content = bytes(content)
 
     except TimeoutError:
         log(f"Error Total timeout exceeded {url}")
         return False, url, ""
     except requests.exceptions.RequestException as e:
+        if SCRAPER_PROXY and isinstance(e, requests.exceptions.ConnectionError):
+            raise  # couldn't reach our own proxy, not the page: scrape.py retries the url later
         log(f"Error HTTP error fetching: {url} : {e}")
         return False, url, ""
     finally:
@@ -847,6 +776,7 @@ def store(content, url):
     """
     global URL
     URL = url
+    _timing_row.clear()  # DEBUG=3: steps timed before this url (e.g. a non-English page) aren't this url's
 
     # No database available (e.g. --nodb debugging run): nothing below this point can run
     # without a connection, so bail out before any DB access.
@@ -865,6 +795,7 @@ def store(content, url):
     
     # Making sure there is text at all. I chose 4 arbitrarily
     if text != None and len(text) < 4:
+        mark_url_seen(url)  # so other pages linking here don't queue it again
         return [links, False]
     
     """
@@ -1067,6 +998,7 @@ def finish_claims(done=(), release=()):
     cur.close()
     conn.close()
 
+@functools.cache  # a DNS lookup, and it doesn't change while the scraper runs; log_db() calls this for every log
 def get_host_ip():
     """Return the host machine IP address. Try local hostname first, then fallback to external lookup."""
     try:
@@ -1159,25 +1091,18 @@ def claim_domain(domain, redis_client):
 
 def _refresh_blocklist_if_stale():
     """
-    If the local blocklist.db is missing or its last_updated row is older
-    than an hour, re-download it from db01 (port 8002/blocklist.db)
+    If the local blocklist.db is missing or was downloaded more than an hour
+    ago, re-download it from db01 (port 8002/blocklist.db)
+
+    The age is the local file's, not its last_updated row: if update_local_blocklist.py
+    stops running, a fresh download would still look stale and be fetched again for every url
     """
 
-    needs_refresh = True
-    if os.path.exists("blocklist.db"):
-        try:
-            conn = sqlite3.connect("blocklist.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT last_updated FROM last_updated LIMIT 1")
-            row = cursor.fetchone()
-            conn.close()
-            if row is not None:
-                needs_refresh = (time.time() - float(row[0])) > 3600
-        except (sqlite3.Error, ValueError, TypeError):
-            needs_refresh = True
-
-    if not needs_refresh:
-        return
+    try:
+        if time.time() - os.path.getmtime("blocklist.db") < 3600:
+            return
+    except OSError:
+        pass  # no copy yet
 
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
@@ -1190,12 +1115,19 @@ def _refresh_blocklist_if_stale():
 
     download_url = f"http://{host}:8002/blocklist.db"
     tmp_path = "blocklist.db.tmp"
-    with requests.get(download_url, stream=True, timeout=30) as resp:
-        resp.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
+    try:
+        with requests.get(download_url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+    except requests.RequestException as e:
+        if not os.path.exists("blocklist.db"):
+            raise  # no copy at all: scraping unchecked isn't allowed, scrape.py retries the url later
+        failure_print(f"Could not refresh blocklist, using the old copy: {e!r}")
+        os.utime("blocklist.db", (time.time() - 3300,) * 2)  # try again in 5 minutes, not on every url
+        return
     os.replace(tmp_path, "blocklist.db")
 
 def check_url_in_blocklist(url):

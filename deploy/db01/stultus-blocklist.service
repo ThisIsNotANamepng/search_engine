@@ -1,0 +1,15 @@
+# Serves supporting_servers/blocklist.db to the crawlers on port 8002.
+[Unit]
+Description=Stultus blocklist server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@REPO@/supporting_servers
+ExecStart=@PYTHON@ -m gunicorn --workers 2 --bind 0.0.0.0:8002 serve_blocklist:app
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
