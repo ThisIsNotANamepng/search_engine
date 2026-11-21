@@ -23,15 +23,16 @@ If the VPS loses power, the head notices within about 3 seconds per connection, 
 
 ## Setting it up
 
-On a new VPS (Debian, Ubuntu, Rocky or anything with apt or dnf), copy the setup script and the proxy source, then run the script:
+On a new VPS (Debian 12, Ubuntu 22.04, Rocky 9 or newer: anything with apt or dnf and Go 1.18+ in its packages), run:
 
 ```bash
-scp deploy/vps/install_proxy.sh supporting_servers/proxy.go <you>@<vps>:
-ssh <you>@<vps>
-sudo PROXY_PASSWORD=<PROXY_PASSWORD from db01:/etc/stultus/proxy.env> ./install_proxy.sh <vps_public_ip_or_name> <head_public_ip>
+curl -fsSL https://raw.githubusercontent.com/ThisIsNotANamepng/search_engine/ai-supported/deploy/vps/install_proxy.sh \
+  | sudo PROXY_PASSWORD=<PROXY_PASSWORD from db01:/etc/stultus/proxy.env> bash -s -- <vps_public_ip_or_name>
 ```
 
-It installs Go, builds the proxy, makes a self-signed certificate, runs the proxy as the `stultus-proxy` systemd service on port 8443, and sets the firewall so only the head can reach that port (SSH stays open). The cloud provider's own firewall must allow 8443 from the head too. At the end it prints the next commands.
+It installs Go and git, clones `supporting_servers/` of the `ai-supported` branch into `/opt/stultus/search_engine`, tests and builds the proxy, makes a self-signed certificate and runs the proxy as the `stultus-proxy` systemd service on port 8443. It turns on no firewall: the password guards the port (if a firewall is already running, it opens 8443 in it). A cloud provider firewall (security group) must allow 8443. At the end it prints the next commands. Run the same command again to update the VPS to the branch's latest commit.
+
+You don't need a real (Let's Encrypt) certificate or a domain: the head is the only client and trusts exactly this self-signed one.
 
 Then on db01, from the repo:
 

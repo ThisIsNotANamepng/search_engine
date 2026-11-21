@@ -44,7 +44,7 @@ esac
 # Crawlers going through the proxy leave the "public address only" check to the VPS, so it must have it
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --cacert "$CERT_IN" \
     -H @<(printf 'X-Proxy-Auth: %s\n' "$PROXY_PASSWORD") "https://$host:$PORT/fetch?url=http://127.0.0.1:22/" || true)"
-[[ $code == 403 ]] || { echo "the VPS runs an old proxy.go (an internal address got HTTP $code, want 403): rerun install_proxy.sh there with the current proxy.go" >&2; exit 1; }
+[[ $code == 403 ]] || { echo "the VPS runs an old proxy.go (an internal address got HTTP $code, want 403): rerun install_proxy.sh on the VPS, it pulls the latest code" >&2; exit 1; }
 
 echo "== testing and building proxy -> /usr/local/bin/stultus-proxy"
 tmp="$(mktemp -d)"
