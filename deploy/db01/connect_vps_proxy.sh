@@ -25,7 +25,8 @@ go_minor="$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')"
 openssl x509 -in "$CERT_IN" -noout 2>/dev/null || { echo "$CERT_IN is not a PEM certificate" >&2; exit 1; }
 
 if [[ -z ${PROXY_PASSWORD:-} && -f $ENV_FILE ]]; then
-    PROXY_PASSWORD="$(sed -n 's/^PROXY_PASSWORD=//p' "$ENV_FILE" | tail -1)"
+    # strip the quotes systemd allows around a value (PROXY_PASSWORD='...')
+    PROXY_PASSWORD="$(sed -nE "s/^PROXY_PASSWORD=['\"]?([^'\"]*)['\"]?\$/\1/p" "$ENV_FILE" | tail -1)"
 fi
 [[ -n ${PROXY_PASSWORD:-} && $PROXY_PASSWORD != CHANGE_ME ]] \
     || { echo "no PROXY_PASSWORD in $ENV_FILE: pass PROXY_PASSWORD=... (the VPS's password)" >&2; exit 1; }
