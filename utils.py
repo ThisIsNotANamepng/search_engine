@@ -41,6 +41,8 @@ _PROXY_HEADERS = {"X-Proxy-Auth": SCRAPER_PROXY_PASSWORD} if SCRAPER_PROXY_PASSW
 
 _BIGRAM_ID_MAP = None
 _TRIGRAM_ID_MAP = None
+# Hosts this scraper blocked with block_domain() that may not be in its downloaded blocklist.db yet
+_BLOCKED_HERE = set()
 DEBUG_BREAKPOINT_TIMER = time.time()
 # Look for the DEBUG shell varialbe and set a global variable to True or false base don whether it was passed
 DEBUG = "DEBUG" in os.environ
@@ -748,7 +750,7 @@ def block_domain(url, reason=""):
     Add the url's host to the list (in the database) of hosts we don't scrape
 
     Blocks the exact host (spammy.blogspot.com), not the registrable domain, so one 401/403 doesn't block every site on blogspot.com or github.io.
-    Queued urls of the host aren't deleted here; the scraper checks is_domain_blocked() before every url
+    Queued urls of the host aren't deleted here; the scraper checks check_url_in_blocklist() before every url
     
     Args:
         url : string
@@ -765,7 +767,10 @@ def block_domain(url, reason=""):
     domain = urlparse(url).hostname
     if not domain:
         return
-    
+
+    # blocklist.db only picks this up on the next rebuild + download, so block it locally right away
+    _BLOCKED_HERE.add(domain)
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -776,35 +781,6 @@ def block_domain(url, reason=""):
     conn.close()
 
     log(f"Blocked domain {domain} reason={reason}")
-
-def is_domain_blocked(url):
-    """
-    Checks the db table to determine whether a url's host is allowed to be scraped
-
-    Matches either the exact host (automatic blocks from block_domain) or the registrable domain (e.g. a manual opt-out of example.com also covers www.example.com)
-    
-    Args:
-        url : string
-            The url to check
-    
-    Return:
-        boolean
-            True if the domain is blocked, False if not
-
-    TODO:
-        - This only checks the table in the big db for when we hit a domain which returns an error code that indicates we should stop scraping. We check the local distributed sqlite3 dbs which are created from malware blocklists in a different spot in the code, we should combine those two functions into one
-    """
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT 1 FROM blocked_domains WHERE domain = ANY(%s);", ([urlparse(url).hostname, get_base_domain(url)],))
-
-    blocked = cur.fetchone() is not None
-    cur.close()
-    conn.close()
-
-    return blocked
 
 def clean_links(raw_links):
     """
@@ -1180,18 +1156,22 @@ def _refresh_blocklist_if_stale():
 
 def check_url_in_blocklist(url):
     """
-    Takes url, checks if base domain in the blocklist.db
+    Takes url, checks if its exact host or base domain is in blocklist.db (Steven Black's hosts + postgres blocked_domains), or was blocked by this scraper since the last download
 
-    Returns True if the domain is in the blocklist (cannot scrape), False if not
+    Exact host catches the hosts file's subdomain entries and block_domain's per-host blocks, base domain catches opt-outs (example.com also covers www.example.com)
+
+    Returns True if blocked (cannot scrape), False if not
     """
+
+    domains = (urlparse(url).hostname, get_base_domain(url))
+    if _BLOCKED_HERE.intersection(domains):
+        return True
 
     _refresh_blocklist_if_stale()
 
-    domain = get_base_domain(url)
-
     conn = sqlite3.connect("blocklist.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * from blocklist where domain=(?)", (domain,))
+    cursor.execute("SELECT 1 FROM blocklist WHERE domain IN (?, ?)", domains)
     result = cursor.fetchone()
     conn.close()
 

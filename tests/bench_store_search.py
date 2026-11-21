@@ -25,6 +25,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 import utils
+os.environ["SEARCH_CACHE_SIZE"] = "0"  # search.py caches results, so repeats would time the cache instead of Postgres. Read at import
 import search
 
 BENCH_URL = "https://bench.invalid/"
