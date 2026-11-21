@@ -221,7 +221,7 @@ while True:
         url_scraping_timer = time.time()
         page_not_in_english = False
 
-        raw_html, final_url = utils.get_page_html(url)
+        raw_html, final_url, x_robots_tag = utils.get_page_html(url)
 
         if raw_html == utils.REDIRECTED:
             # Redirect to another host: queue the target so it goes through that host's checks, and stop re-queueing this url
@@ -249,7 +249,9 @@ while True:
                 utils.mark_url_seen(url)
             url = page_url
 
-        page_data = utils.extract_data_from_html(raw_html, final_url) #[combined_text, links, title, icon_link]
+        page_data = utils.extract_data_from_html(raw_html, final_url, x_robots_tag) #[combined_text, links, title, icon_link, directives], links already empty for nofollow
+        # The site's robots meta tags / X-Robots-Tag: noindex = keep it out of the index, noarchive = don't keep a copy of its text
+        directives = page_data[4]
 
         if page_data[0]:
             # Check for english language
@@ -265,15 +267,22 @@ while True:
                 page_not_in_english = True
                 utils.debug_print("Detected language")
 
-                utils.debug_print("Sending to web text storage server")
-                send_page_text(url, page_data)
+                if "noarchive" not in directives:
+                    utils.debug_print("Sending to web text storage server")
+                    send_page_text(url, page_data)
 
 
             else:
 
-                utils.debug_print("Sending to web text storage server")
-                utils.store(page_data, url)
-                send_page_text(url, page_data)
+                if "noindex" in directives:
+                    utils.info_print(f"Page asks not to be indexed (noindex), not storing {url}")
+                    if not args.nodb:
+                        utils.mark_url_seen(url)  # so other pages linking here don't queue it again
+                else:
+                    utils.store(page_data, url)
+                if "noarchive" not in directives:
+                    utils.debug_print("Sending to web text storage server")
+                    send_page_text(url, page_data)
 
         else:
             utils.info_print(f"No text found, keeping links only {url}")

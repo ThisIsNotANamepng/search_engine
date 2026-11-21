@@ -444,7 +444,33 @@ def load_static_token_maps():
     conn.close()
 
 # ----- HTML text extraction utilities
-def extract_data_from_html(body, url):
+# Robots meta / X-Robots-Tag directives aimed at us by name (<meta name="stultussearchengine">, "stultussearchengine: noindex")
+ROBOTS_NAME = USER_AGENT.split("/")[0].lower()
+# Directives that carry a "name: value" themselves, so their colon isn't a crawler name prefix
+_VALUED_DIRECTIVES = ("unavailable_after", "max-snippet", "max-image-preview", "max-video-preview")
+# Links marked with any of these aren't followed or counted as references
+_SKIP_LINK_RELS = {"nofollow", "sponsored", "ugc"}
+
+def robots_directives(values):
+    """
+    Returns the set of directives (noindex, nofollow, noarchive, ...) in robots meta contents / X-Robots-Tag values that apply to us
+
+    In "googlebot: noindex, nofollow" both directives are for googlebot only: a "name:" prefix applies until the next one
+    """
+    directives = set()
+    for value in values:
+        target = None  # None = every crawler
+        for part in value.lower().split(","):
+            name, colon, rest = part.partition(":")
+            if colon and name.strip() not in _VALUED_DIRECTIVES:
+                target, part = name.strip(), rest
+            if part.strip() and target in (None, ROBOTS_NAME):
+                directives.add(part.strip())
+    if "none" in directives:
+        directives |= {"noindex", "nofollow"}
+    return directives
+
+def extract_data_from_html(body, url, x_robots_tag=""):
     """
     Takes in the bs4 soup and returns the text, links, title, and favicon link from the page
 
@@ -453,10 +479,12 @@ def extract_data_from_html(body, url):
             The html of a page
         url : string
             The url of the page
+        x_robots_tag : string
+            The page's X-Robots-Tag header, combined with its robots meta tags
 
     Returns:
         list
-            [combined_text, links, title, icon_link]
+            [combined_text, links, title, icon_link, directives]
             combined_text : string
                 The main text of the page (menus, footers etc. left out by trafilatura), None if there is none
             links : list
@@ -465,6 +493,9 @@ def extract_data_from_html(body, url):
                 The title of the page, as defined by the <title> tag
             icon_link : string
                 The url to the favicon of the page
+            directives : set
+                The robots directives that apply to us (noindex, nofollow, noarchive, ...), see robots_directives()
+            Links are [] for a nofollow page and leave out rel="nofollow"/"sponsored"/"ugc" links
     """
 
     # Use lxml parser for speed
@@ -494,16 +525,23 @@ def extract_data_from_html(body, url):
             # If there's no link we still send a None variables to the database
             icon_link = None
 
+    # Read before <head> and <meta> are dropped below
+    meta_robots = [m.get("content") or "" for m in soup.find_all("meta") if (m.get("name") or "").lower() in ("robots", ROBOTS_NAME)]
+    directives = robots_directives([x_robots_tag, *meta_robots])
+
     # Links inside these aren't followed
     for tag in soup(["script", "style", "head", "meta", "noscript"]):
         tag.decompose()
 
     # Relative to the page itself, so href="page2" on /blog/post resolves to /blog/page2, not /page2
-    links = [urljoin(url, a["href"]) for a in soup.find_all("a", href=True)]
+    links = [] if "nofollow" in directives else [
+        urljoin(url, a["href"]) for a in soup.find_all("a", href=True)
+        if not _SKIP_LINK_RELS & {r.lower() for r in a.get("rel", [])}
+    ]
 
     combined_text = trafilatura.extract(body)
 
-    return [combined_text, links, title, icon_link]
+    return [combined_text, links, title, icon_link, directives]
 
 def determine_language(text):
     """
@@ -598,23 +636,24 @@ def get_page_html(url):
             The url of the page you are scraping
 
     Returns:
-        (result, final_url)
+        (result, final_url, x_robots_tag)
             result is one of:
                 bytes         the raw html of the page
                 RATE_LIMITED  the site answered 429
                 REDIRECTED    the page redirects to another host, final_url is the target
                 False         the page can't or mustn't be scraped (robots.txt, not html, too large, error status, network error)
             final_url is the url the result came from, after any redirects (not cleaned, so relative links resolve against it)
+            x_robots_tag is the page's X-Robots-Tag header ("" if none), for extract_data_from_html
     """
 
     if not is_public_host(url):
         log(f"Error Not a public address {url}")
-        return False, url
+        return False, url, ""
 
     if not allowed_by_robots(url, USER_AGENT):
         log(f"Blocked by robots.txt {url}")
         info_print("Not allowed by robots.txt")
-        return False, url
+        return False, url, ""
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -636,18 +675,18 @@ def get_page_html(url):
             location = request.headers.get("Location", "")
             if not location or redirect_hops >= 5:
                 log(f"Error Empty redirect or too many redirects {url}")
-                return False, url
+                return False, url, ""
             target = urljoin(url, location)  # relative Location -> absolute target url
             if urlparse(target).hostname != urlparse(url).hostname:
-                return REDIRECTED, target
+                return REDIRECTED, target, ""
             url = target
             request.close()
             if not is_public_host(url):
                 log(f"Error Redirect to a non-public address {url}")
-                return False, url
+                return False, url, ""
             if not allowed_by_robots(url, USER_AGENT):
                 log(f"Blocked by robots.txt {url}")
-                return False, url
+                return False, url, ""
             request = fetch(url)
             redirect_hops += 1
 
@@ -656,18 +695,18 @@ def get_page_html(url):
         # Skip just this page: one protected url (/admin, a bot challenge) shouldn't block the whole host
         if request.status_code in (401, 403):
             log(f"Error HTTP {request.status_code} {url}")
-            return False, url
+            return False, url, ""
 
         if request.status_code == 429:
             log(f"Error Rate limited {url}")
-            return RATE_LIMITED, url
+            return RATE_LIMITED, url, ""
 
         # Only allow HTML content
         if not (
             content_type.startswith("text/html")
         ):
             log(f"Error Invalid data type {url}")
-            return False, url
+            return False, url, ""
 
         # Read at most MAX_PAGE_BYTES; a huge page would otherwise be loaded into memory whole
         content = bytearray()
@@ -675,20 +714,20 @@ def get_page_html(url):
             content += chunk
             if len(content) > MAX_PAGE_BYTES:
                 log(f"Error Page too large {url}")
-                return False, url
+                return False, url, ""
         content = bytes(content)
 
     except TimeoutError:
         log(f"Error Total timeout exceeded {url}")
-        return False, url
+        return False, url, ""
     except requests.exceptions.RequestException as e:
         log(f"Error HTTP error fetching: {url} : {e}")
-        return False, url
+        return False, url, ""
     finally:
         if request is not None:
             request.close()
 
-    return content, url
+    return content, url, request.headers.get("X-Robots-Tag", "")
 
 def log(message):
     """
@@ -806,7 +845,7 @@ def store(content, url):
 
     debug_print("Visited site, got main text and links")
 
-    text, links, title, icon_link = content
+    text, links, title, icon_link = content[:4]
     
     # Making sure there is text at all. I chose 4 arbitrarily
     if text != None and len(text) < 4:
