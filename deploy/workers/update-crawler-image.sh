@@ -12,6 +12,12 @@
 # If the proxy changed too, update it first (docs/docs/proxy.md: VPS, then db01).
 set -uo pipefail
 
+if [[ $EUID -eq 0 ]]; then
+    echo "Run this as your normal user, without sudo: it uses sudo itself where needed." >&2
+    echo "As root, ssh has none of your keys, so every worker looks unreachable." >&2
+    exit 1
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 REGISTRY="${REGISTRY:-db01:5000}"
