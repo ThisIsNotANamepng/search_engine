@@ -4,6 +4,7 @@ Functions for scraping
 """
 
 import os
+import re
 import time
 import requests
 import http.cookiejar
@@ -225,8 +226,23 @@ def create_database():
     conn = get_conn()
     cur = conn.cursor()
 
-    # create sequences for stable id generation and tables with id defaults
-    cur.execute("""
+    # Every scraper runs this on startup. CREATE INDEX IF NOT EXISTS takes a SHARE lock on its table even when the
+    # index exists, held until commit, so a scraper starting while others write blocks every write behind it (and
+    # several starting at once deadlock). So skip it all when everything already exists, and otherwise let only one
+    # scraper at a time build the schema.
+    names = re.findall(r"CREATE (?:SEQUENCE|TABLE|INDEX) IF NOT EXISTS (\w+)", _SCHEMA_SQL)
+    cur.execute("SELECT bool_and(to_regclass(n) IS NOT NULL) FROM unnest(%s::text[]) AS n;", (names,))
+    if not cur.fetchone()[0]:
+        cur.execute("SELECT pg_advisory_xact_lock(727274);")
+        cur.execute(_SCHEMA_SQL)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    populate_static_ngrams()
+
+# create sequences for stable id generation and tables with id defaults
+_SCHEMA_SQL = """
     CREATE SEQUENCE IF NOT EXISTS words_id_seq;
     CREATE SEQUENCE IF NOT EXISTS bigrams_id_seq;
     CREATE SEQUENCE IF NOT EXISTS trigrams_id_seq;
@@ -327,14 +343,7 @@ def create_database():
     CREATE INDEX IF NOT EXISTS idx_bigram_urls_url_id ON bigram_urls(url_id);
     CREATE INDEX IF NOT EXISTS idx_trigram_urls_url_id ON trigram_urls(url_id);
     CREATE INDEX IF NOT EXISTS idx_prefix_urls_url_id ON prefix_urls(url_id);
-    """)
-
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    populate_static_ngrams()
+    """
 
 def populate_static_ngrams():
     """Pre-populate all the bigrams/trigrams so store() doesn't have to re-insert every time"""
