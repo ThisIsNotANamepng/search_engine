@@ -347,8 +347,9 @@ def create_database():
     );
                 
 
+    -- BIGSERIAL: every url ever queued takes a new id and ids are never reused, so INT runs out. Older databases get it from widen_url_queue_id.py
     CREATE TABLE IF NOT EXISTS url_queue (
-        id SERIAL PRIMARY KEY,
+        id BIGSERIAL PRIMARY KEY,
         url VARCHAR(2048) UNIQUE NOT NULL,
         enqueued_at TIMESTAMP DEFAULT now(),
         claimed_at TIMESTAMP  -- set while a scraper holds the url, see get_next_urls()
