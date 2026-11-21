@@ -531,12 +531,12 @@ function renderNodes(nodes) {
     tbody.replaceChildren(...rows);
 
     const summary = document.getElementById("node-summary");
-    summary.replaceChildren(
+    summary.replaceChildren(...[
         el("span", {}, el("b", { text: String(nodes.length - offline) }), ` of ${nodes.length} nodes reporting`),
         el("span", {}, el("b", { text: `${alive} / ${desired}` }), " crawlers running"),
         degraded ? el("span", {}, el("b", { text: String(degraded) }), " degraded") : null,
         offline ? el("span", {}, el("b", { text: String(offline) }), " offline") : null,
-    );
+    ].filter(Boolean));  // replaceChildren would render a null as the text "null"
 }
 
 function setScale(nodeId, input, btn) {

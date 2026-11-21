@@ -441,7 +441,7 @@ def _check_http(port, path, method="GET"):
 
 
 def _check_postgres():
-    conn = psycopg2.connect(DATABASE_URL, sslmode="disable", connect_timeout=HEALTH_TIMEOUT_SECONDS)
+    conn = psycopg2.connect(DATABASE_URL, sslmode="disable", connect_timeout=max(1, int(HEALTH_TIMEOUT_SECONDS)))  # libpq wants a whole number
     try:
         conn.cursor().execute("SELECT 1;")
     finally:
