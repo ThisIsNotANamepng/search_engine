@@ -80,22 +80,23 @@ if not args.nodb:
 
 
 # It iterates through the local_queue, scraping when the url is free to be scraped
-# If a url is in the local_queue and cannot be scraped, it is added to queue_return_to_db, which is sent back to be added to the db queue when local_queue is spent (empty)
+# If a url is in the local_queue and cannot be scraped, it is added to queue_return_to_db, which is handed back to the db queue when local_queue is spent (empty)
 local_queue = []
 queue_return_to_db = []
+claimed = []  # urls this scraper claimed with get_next_urls, still marked claimed in the db queue
+rate_limited = []  # claimed urls left claimed on purpose: the claim timing out is their retry delay
 url = ""
 prev_base_domain = ""
 page_not_in_english = False
 first_run = True
 
-def requeue(urls):
-    # Hand unscraped urls back to the db queue so a crash or shutdown doesn't lose them
-    if args.nodb or args.url or args.file or not urls:
-        return
-    try:
-        utils.enqueue_urls(urls)
-    except Exception as e:
-        utils.failure_print(f"Could not requeue {len(urls)} urls: {e}")
+def finish_claims(release):
+    # End our claims: urls in release go back to the db queue, the rest of what we claimed is done and leaves it
+    global claimed, rate_limited
+    if args.nodb or args.url or args.file:
+        return  # these urls didn't come from the db queue, so there are no claims (and the rows may be another scraper's)
+    utils.finish_claims(done=set(claimed) - set(release) - set(rate_limited), release=release)
+    claimed, rate_limited = [], []
 
 def send_page_text(url, page_data):
     # The text archive is a copy for research; if it's down, keep crawling
@@ -104,14 +105,20 @@ def send_page_text(url, page_data):
     except Exception as e:
         utils.log(f"Error Web text storage failed {e!r} {url}")
 
-# On any exit, hand the urls we still hold back to the db queue
+# On any exit, hand the urls we still hold back to the db queue (if we're killed instead, the claims time out)
 def on_exit():
-    utils.close_all_connections()  # roll back anything SIGTERM cut off, otherwise its locks block requeueing the same urls
-    requeue(local_queue + queue_return_to_db + ([url] if url else []))
+    utils.close_all_connections()  # roll back anything SIGTERM cut off, otherwise its locks block handing back the same urls
+    release = local_queue + queue_return_to_db + ([url] if url else [])
+    try:
+        if url and not (args.nodb or args.url or args.file):
+            utils.enqueue_urls([url])  # the current url may be a same-host redirect target, which isn't in the db queue
+        finish_claims(release)
+    except Exception as e:
+        utils.failure_print(f"Could not hand back {len(release)} urls: {e}")
 
 atexit.register(on_exit)
 # Turn the node agent's SIGTERM into a normal exit so atexit runs (python is PID 1 in the container, which ignores SIGTERM without a handler)
-# While claiming urls from the db the exit is deferred: they're deleted from the db before they land in local_queue, so exiting in between would lose them
+# While claiming urls from the db the exit is deferred: they're claimed in the db before they land in local_queue, so exiting in between would leave them stuck until the claim times out
 claiming_urls = False
 stop_requested = False
 
@@ -147,12 +154,13 @@ while True:
                     break
 
             else:
-                utils.enqueue_urls(queue_return_to_db)
+                finish_claims(queue_return_to_db)
                 queue_return_to_db = []
 
                 claiming_urls = True
                 try:
                     local_queue = utils.get_next_urls(LOCAL_QUEUE_LENGTH)
+                    claimed = list(local_queue)
                 finally:
                     claiming_urls = False
                 if stop_requested:
@@ -233,9 +241,9 @@ while True:
 
         if raw_html == utils.RATE_LIMITED:
             if not args.nodb:
-                utils.enqueue_url(url)  # requeue for later
-                redis_client.set(f"domain:{base_domain}", 1, ex=600)  # 5-min cooldown
-            utils.info_print(f"Rate limited, re-queued with 10 minute cooldown {url}")
+                rate_limited.append(url)  # stays claimed, so it's retried once the claim times out
+                redis_client.set(f"domain:{base_domain}", 1, ex=600)  # 10 minute cooldown
+            utils.info_print(f"Rate limited, retrying after {utils.CLAIM_TIMEOUT} with 10 minute domain cooldown {url}")
             continue
 
         if raw_html is False:
