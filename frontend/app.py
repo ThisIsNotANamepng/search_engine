@@ -12,20 +12,26 @@ Graphs:
 - 
 """
 
-import os, sys, time, threading, socket, collections
+import os, sys, time, threading, socket, collections, gzip, logging
 import urllib.request, urllib.error
+from urllib.parse import urlsplit, urlencode
 from concurrent.futures import ThreadPoolExecutor
 
 # search.py lives in the directory above this one
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect
 import search
 import psycopg2
 import psycopg2.extras
 import json
 
+log = logging.getLogger("stultus.frontend")
+
 app = Flask(__name__)
+# /static files are served with a 1-year cache lifetime; templates add ?v=<mtime> to
+# every static link (see asset()) so a changed file gets a new URL.
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 31536000
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -44,13 +50,34 @@ def get_db():
 # heartbeat from it in this many seconds.
 NODE_STALE_SECONDS = 30
 
+def crawler_nodes_exists():
+    """Read-only check (no DDL) that the crawler_nodes table exists."""
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass('public.crawler_nodes') IS NOT NULL;")
+        return bool(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
 def init_control_schema():
     """
-    Create the crawler_nodes table used by the node agents' heartbeats. This is
+    The crawler_nodes table is used by the node agents' heartbeats. This is
     the whole 'control plane' state that replaced Kubernetes: one row per box,
     holding the desired crawler count (set from the dashboard) and the latest
     reported liveness/host stats.
+
+    By default this only CHECKS (read-only) that the table exists and logs a
+    warning if it doesn't. The CREATE TABLE only runs when STULTUS_ALLOW_DDL=1,
+    so merely starting the web app never changes the database schema.
     """
+    if crawler_nodes_exists():
+        return
+    if os.getenv("STULTUS_ALLOW_DDL") != "1":
+        log.warning("table crawler_nodes does not exist; heartbeat/scale endpoints will "
+                    "return 503 (set STULTUS_ALLOW_DDL=1 to let the app create it)")
+        return
     conn = get_db()
     try:
         cur = conn.cursor()
@@ -71,9 +98,24 @@ def init_control_schema():
     finally:
         conn.close()
 
-# Runs at import so it's created under gunicorn too. DATABASE_URL is required
-# above, so a failure here is a real, fail-fast configuration problem.
-init_control_schema()
+# Runs at import (so it also runs under gunicorn). It's read-only unless
+# STULTUS_ALLOW_DDL=1; an unreachable database must not stop the search pages.
+try:
+    init_control_schema()
+except Exception as e:
+    log.warning("could not check crawler_nodes at startup: %s", e)
+
+
+def _control_plane_unavailable():
+    """A 503 JSON response if crawler_nodes is missing/unreachable, else None."""
+    try:
+        if crawler_nodes_exists():
+            return None
+        reason = "crawler_nodes table does not exist (start with STULTUS_ALLOW_DDL=1 to create it)"
+    except Exception as e:
+        reason = f"database unavailable: {type(e).__name__}"
+    return jsonify({"error": "control plane unavailable", "detail": reason}), 503
+
 
 @app.route("/agent/heartbeat", methods=["POST"])
 def agent_heartbeat():
@@ -88,6 +130,9 @@ def agent_heartbeat():
     node_id = data.get("node_id")
     if not node_id:
         return jsonify({"error": "missing node_id"}), 400
+    unavailable = _control_plane_unavailable()
+    if unavailable:
+        return unavailable
 
     conn = get_db()
     try:
@@ -131,6 +176,9 @@ def scale_node(node_id):
         return jsonify({"error": "desired must be an integer"}), 400
     if not 0 <= desired <= MAX_DESIRED:
         return jsonify({"error": f"desired must be between 0 and {MAX_DESIRED}"}), 400
+    unavailable = _control_plane_unavailable()
+    if unavailable:
+        return unavailable
 
     conn = get_db()
     try:
@@ -559,17 +607,158 @@ def creators():
 def index():
     return render_template("index.html")
 
+
+# ---- Search pages + JSON API ------------------------------------------------
+
+MAX_QUERY_LEN = 200      # longer queries are truncated (they only make the tokenizer slower)
+DEFAULT_LIMIT = 10
+MAX_LIMIT = 50
+MAX_OFFSET = 1000        # fast mode only ranks a few hundred candidates anyway
+
+
+def _clean_query(raw):
+    return (raw or "").strip()[:MAX_QUERY_LEN].strip()
+
+
+def _int_arg(name, default, lo, hi):
+    try:
+        value = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
+
+
+def _run_search(query, limit, offset):
+    """Returns (rows, has_more, seconds). Asks for one extra row to learn whether a next page exists."""
+    started = time.perf_counter()
+    rows = list(search.search(query, limit + 1, offset))
+    elapsed = time.perf_counter() - started
+    page = rows[:limit]
+    with _search_timings_lock:
+        _search_timings.append((time.time(), elapsed, len(page)))
+    return page, len(rows) > limit, elapsed
+
+
+@app.template_filter("safe_href")
+def safe_href(url):
+    """Only http(s) URLs may become a link target (blocks javascript:, data:, ...)."""
+    url = (url or "").strip()
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "#"
+    if parts.scheme.lower() in ("http", "https") and parts.netloc:
+        return url
+    return "#"
+
+
 @app.route("/search")
 def perform_search():
-    query_string = request.args.get("q")
-    started = time.perf_counter()
-    search_results = search.search(query_string or "")  # a missing/empty q used to crash the tokenizer (500)
-    if query_string:
-        elapsed = time.perf_counter() - started
-        count = len(search_results) if hasattr(search_results, "__len__") else None
-        with _search_timings_lock:
-            _search_timings.append((time.time(), elapsed, count))
-    return render_template("search.html", search_results=search_results, query_string=query_string)
+    query = _clean_query(request.args.get("q"))
+    if not query:
+        return redirect("/", 302)
+    limit = _int_arg("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
+    offset = _int_arg("offset", 0, 0, MAX_OFFSET)
+
+    def page_url(off):
+        args = {"q": query, "limit": limit}
+        if off:
+            args["offset"] = off
+        return "/search?" + urlencode(args)
+
+    error = None
+    try:
+        results, has_more, elapsed = _run_search(query, limit, offset)
+    except Exception:
+        log.exception("search failed")
+        results, has_more, elapsed, error = [], False, 0.0, "Search is temporarily unavailable."
+    prev_url = page_url(max(0, offset - limit)) if offset > 0 else None
+    next_url = page_url(offset + limit) if has_more and offset + limit <= MAX_OFFSET else None
+    resp = app.make_response(render_template(
+        "search.html", search_results=results, query_string=query, error=error,
+        elapsed_ms=round(elapsed * 1000, 1), offset=offset, limit=limit,
+        prev_url=prev_url, next_url=next_url))
+    if error:
+        resp.status_code = 503
+    return resp
+
+
+@app.route("/api/search")
+def api_search():
+    query = _clean_query(request.args.get("q"))
+    if not query:
+        return jsonify({"error": "missing q"}), 400
+    limit = _int_arg("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
+    offset = _int_arg("offset", 0, 0, MAX_OFFSET)
+    try:
+        results, has_more, elapsed = _run_search(query, limit, offset)
+    except Exception:
+        log.exception("api search failed")
+        return jsonify({"error": "search unavailable"}), 503
+    return jsonify({
+        "query": query,
+        "limit": limit,
+        "offset": offset,
+        "count": len(results),
+        "has_more": has_more,
+        "took_ms": round(elapsed * 1000, 1),
+        "results": [
+            {"url": u, "title": t, "score": s, "relevance": r,
+             "ref_score": rs, "reference_count": rc}
+            for u, t, s, r, rs, rc in results
+        ],
+    })
+
+
+# ---- Static assets: cache-busting links + gzip --------------------------------
+
+@app.template_global("asset")
+def asset(path):
+    """/static/<path>?v=<mtime>: lets /static be cached for a year without serving stale files."""
+    try:
+        version = int(os.path.getmtime(os.path.join(app.static_folder, path)))
+    except OSError:
+        version = 0
+    return f"/static/{path}?v={version}"
+
+
+_GZIP_TYPES = ("text/", "application/json", "application/javascript", "image/svg+xml")
+_GZIP_MIN_BYTES = 500
+_gzip_static_cache = {}   # (path, etag) -> compressed bytes; static files are small and few
+
+
+@app.after_request
+def compress_response(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    try:
+        if (resp.status_code != 200 or "Content-Encoding" in resp.headers
+                or "gzip" not in request.headers.get("Accept-Encoding", "")
+                or not resp.mimetype.startswith(_GZIP_TYPES)):
+            return resp
+        resp.headers.add("Vary", "Accept-Encoding")
+        is_static = request.path.startswith("/static/")
+        etag = resp.headers.get("ETag")
+        cache_key = (request.path, etag) if is_static and etag else None
+        if cache_key and cache_key in _gzip_static_cache:
+            data = _gzip_static_cache[cache_key]
+            resp.direct_passthrough = False
+        else:
+            resp.direct_passthrough = False
+            raw = resp.get_data()
+            if len(raw) < _GZIP_MIN_BYTES:
+                return resp
+            data = gzip.compress(raw, compresslevel=5)
+            if cache_key:
+                if len(_gzip_static_cache) > 64:
+                    _gzip_static_cache.clear()
+                _gzip_static_cache[cache_key] = data
+        resp.set_data(data)
+        resp.headers["Content-Encoding"] = "gzip"
+        if etag:
+            resp.set_etag(etag.strip('"').removeprefix("W/").strip('"'), weak=True)
+    except Exception:
+        log.exception("gzip failed; sending uncompressed")
+    return resp
 
 
 if __name__ == "__main__":

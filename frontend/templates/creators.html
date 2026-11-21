@@ -7,12 +7,12 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Forum&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/creators.css">
-    <script src="/static/js/creators.js" async defer></script>
+    <link rel="stylesheet" href="{{ asset('css/creators.css') }}">
+    <script src="{{ asset('js/creators.js') }}" async defer></script>
 </head>
 <body>
     <div class="person" id="jack">
-        <img src="/static/imgs/jack_hagen.webp" alt="Jack Hagen" class="profile-pic">
+        <img src="{{ asset('imgs/jack_hagen.webp') }}" alt="Jack Hagen" class="profile-pic">
         <br>
         <div class="person-info">
             <h1 id="name">Jack Hagen</h1>
@@ -21,7 +21,7 @@
     </div>
 
     <div class="person" id="aaron">
-        <img src="/static/imgs/aaron_fraser.webp" alt="Aaron Fraser" class="profile-pic">
+        <img src="{{ asset('imgs/aaron_fraser.webp') }}" alt="Aaron Fraser" class="profile-pic">
         <br>
         <div class="person-info">
             <h1 id="name">Aaron Fraser</h1>
@@ -30,7 +30,7 @@
     </div>
 
     <div class="person" id="reed">
-        <img src="/static/imgs/reed_graf.jpg" alt="Reed Graf" class="profile-pic">
+        <img src="{{ asset('imgs/reed_graf.jpg') }}" alt="Reed Graf" class="profile-pic">
         <br>
         <div class="person-info">
             <h1 id="name">Reed Graf</h1>
@@ -39,7 +39,7 @@
     </div>
     
     <div class="person" id="silas">
-        <img src="/static/imgs/silas_eacret.webp" alt="Silas Eacret" class="profile-pic">
+        <img src="{{ asset('imgs/silas_eacret.webp') }}" alt="Silas Eacret" class="profile-pic">
         <br>
         <div class="person-info">
             <h1 id="name">Silas Eacret</h1>

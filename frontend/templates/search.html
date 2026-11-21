@@ -7,36 +7,52 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Forum&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/index.css">
-    <link rel="stylesheet" href="/static/css/search-results.css">
+    <link rel="stylesheet" href="{{ asset('css/index.css') }}">
+    <link rel="stylesheet" href="{{ asset('css/search-results.css') }}">
+{% include '_settings_head.html' %}
 </head>
     <body>
         <div id="search-header">
             <h1 id="main-title"><a href="/" style="color:var(--text);text-decoration:none;">Stultus</a></h1>
             <form action="/search" method="get">
-                <input id="search-input" name="q" type="search" placeholder=" Search..." value="{{ query_string }}">
+                <input id="search-input" name="q" type="search" placeholder=" Search..." value="{{ query_string }}" maxlength="200">
                 <input id="submit-btn" type="submit" value="🔍">
             </form>
         </div>
         <div id="results-container">
+            {% if error %}
+                <p style="color:var(--text)">{{ error }}</p>
+            {% elif not search_results %}
+                <p style="color:var(--text)">No results found.</p>
+            {% endif %}
             {% for url, title, score, relevance, ref_score, reference_count in search_results %}
                 <div class="result">
                     <div class="text-buffer" style="margin:15px">
                         <div>
-                            <h3>{{title}}</h3>
-                            <a href="{{ url }}">{{ url }}</a>
+                            <h3>{{ title or url }}</h3>
+                            <a href="{{ url|safe_href }}">{{ url }}</a>
                         </div>
-                        <div>
-                            <p>Search Score: {{'%0.2f'|format(score)}}</p>
-                            <p>Relevance: {{ '%0.2f'|format(relevance) }}</p>                            
+                        <div class="debug-only">
+                            <p>Search Score: {{ '%0.2f'|format(score or 0) }}</p>
+                            <p>Relevance: {{ '%0.2f'|format(relevance or 0) }}</p>
                         </div>
-                        <div>
-                            <p>Ref Score: {{ '%0.2f'|format(ref_score) }}</p>
-                            <p>Reference Ct: {{ '%0.2f'|format(reference_count) }}</p>
+                        <div class="debug-only">
+                            <p>Ref Score: {{ '%0.2f'|format(ref_score or 0) }}</p>
+                            <p>Reference Ct: {{ '%0.2f'|format(reference_count or 0) }}</p>
                         </div>
                         </div>
                 </div>
             {% endfor %}
+        </div>
+        {% if prev_url or next_url %}
+        <nav id="pagination" aria-label="Pagination">
+            {% if prev_url %}<a id="page-prev" rel="prev" href="{{ prev_url }}">&larr; Previous</a>{% endif %}
+            {% if next_url %}<a id="page-next" rel="next" href="{{ next_url }}">Next &rarr;</a>{% endif %}
+        </nav>
+        {% endif %}
+        <div id="search-stats" class="debug-only">
+            {{ search_results|length }} result{{ '' if search_results|length == 1 else 's' }} shown
+            (from #{{ offset + 1 }}) &middot; {{ elapsed_ms }} ms
         </div>
         <footer id="website-footer">
             <div>

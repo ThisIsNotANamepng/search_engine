@@ -9,15 +9,16 @@
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
         <link href="https://fonts.googleapis.com/css2?family=Forum&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="/static/css/index.css">
-        <link rel="stylesheet" href="/static/css/search.css">
+        <link rel="stylesheet" href="{{ asset('css/index.css') }}">
+        <link rel="stylesheet" href="{{ asset('css/search.css') }}">
+{% include '_settings_head.html' %}
     </head>
     <body>
 
         <div id="search-header">
             <h1 id="main-title">Stultus</h1>
             <form action="/search" method="get">
-                <input id="search-input" name="q" type="search" placeholder=" Search..." autofocus>
+                <input id="search-input" name="q" type="search" placeholder=" Search..." maxlength="200" autofocus>
                 <input id="submit-btn" type="submit" value="🔍">
             </form>
         </div>

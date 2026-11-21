@@ -202,7 +202,7 @@ _SQL_TEMPLATE = """
             reference_count
         FROM scored
         ORDER BY search_output DESC NULLS LAST, url  -- url breaks ties so results are stable
-        LIMIT 10;
+        LIMIT {limit} OFFSET {offset};
 """
 
 
@@ -253,14 +253,15 @@ _BRANCHES_FOR_CANDIDATES = {
 }
 
 
-def _fast_search(cur, groups):
+def _fast_search(cur, groups, limit=10, offset=0):
     core = [n for n in STAGE1_BRANCHES if n in dict(groups)]
     if not core:
         return []
     g = dict(groups)
     cur.execute(
         _STAGE1_SQL.format(
-            branches="\n                UNION ALL".join(_BRANCHES[n] for n in core), k=RESCORE_K,
+            branches="\n                UNION ALL".join(_BRANCHES[n] for n in core),
+            k=max(RESCORE_K, offset + limit),
             total_tokens=_TOTAL_TOKENS),
         tuple(g[n] for n in core))
     cand = [r[0] for r in cur.fetchall()]
@@ -268,7 +269,7 @@ def _fast_search(cur, groups):
         return []
     sql = _SQL_TEMPLATE.format(
         branches="\n            UNION ALL".join(_BRANCHES_FOR_CANDIDATES[n] for n, _ in groups),
-        total_tokens=_TOTAL_TOKENS)
+        total_tokens=_TOTAL_TOKENS, limit=limit, offset=offset)
     params = []
     for _, vals in groups:
         params += [vals, cand]
@@ -276,11 +277,14 @@ def _fast_search(cur, groups):
     return cur.fetchall()
 
 
-def search(query):
+def search(query, limit=10, offset=0):
     """Run search against the Postgres DB.
 
-    Returns a list of (url, title, search_output, relevance, ref_score, reference_count).
+    Returns a list of (url, title, search_output, relevance, ref_score, reference_count),
+    at most `limit` rows starting at row `offset` (for pagination).
     """
+    limit = max(1, int(limit))
+    offset = max(0, int(offset))
     tokenized = tokenizer.tokenize_all(query)
 
     words    = list(tokenized[0]) if tokenized and len(tokenized) > 0 and tokenized[0] else []
@@ -293,7 +297,7 @@ def search(query):
     if not groups:
         return []
 
-    key = (SEARCH_MODE,) + tuple((name, tuple(vals)) for name, vals in groups)
+    key = (SEARCH_MODE, limit, offset) + tuple((name, tuple(vals)) for name, vals in groups)
     cached = _cache_get(key)
     if cached is not None:
         debug_print("Cache hit for", query)
@@ -301,7 +305,7 @@ def search(query):
 
     sql_query = _SQL_TEMPLATE.format(
         branches="\n            UNION ALL".join(_BRANCHES[name] for name, _ in groups),
-        total_tokens=_TOTAL_TOKENS)
+        total_tokens=_TOTAL_TOKENS, limit=limit, offset=offset)
     params = tuple(vals for _, vals in groups)
 
     debug_print("Searching....", query)
@@ -321,7 +325,7 @@ def search(query):
                     cur.execute(sql_query, params)
                     results = cur.fetchall()
                 else:
-                    results = _fast_search(cur, groups)
+                    results = _fast_search(cur, groups, limit, offset)
             debug_print("Time taken:", time.time() - start)
             break
         except (psycopg2.OperationalError, psycopg2.InterfaceError):

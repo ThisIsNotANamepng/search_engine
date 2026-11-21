@@ -1,0 +1,154 @@
+/* Settings menu (gear button + panel) and the debug-mode switch.
+   Uses the site's variables from index.css (--text, --fg, --border, --debug-text). */
+
+/* ---- Debug mode: score blocks and stats are only shown with <html class="debug"> ---- */
+html:not(.debug) .debug-only {
+  display: none;
+}
+
+/* Without the two score columns the title/URL column takes the whole row */
+html:not(.debug) .text-buffer {
+  grid-template-columns: auto;
+}
+
+#search-stats {
+  text-align: center;
+  font-size: 16px;
+  font-style: italic;
+  color: var(--debug-text);
+}
+
+/* ---- Gear button: fixed in the corner, so it never moves the page layout ---- */
+#settings-btn {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 50;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--border);
+  border-radius: 50%;
+  background-color: var(--fg);
+  color: var(--text);
+  box-shadow: none;
+  opacity: 0.6;
+  cursor: pointer;
+  transition: opacity 0.2s ease;
+}
+
+#settings-btn:hover,
+#settings-btn:focus-visible,
+#settings-btn[aria-expanded="true"] {
+  scale: none;
+  opacity: 1;
+  box-shadow: none;
+}
+
+#settings-btn:focus-visible,
+#settings-panel select:focus-visible,
+#settings-panel input:focus-visible,
+#settings-close:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 2px;
+}
+
+#settings-btn svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
+/* ---- Panel ---- */
+#settings-panel[hidden] {
+  display: none;
+}
+
+#settings-panel {
+  position: fixed;
+  right: 12px;
+  bottom: 58px;
+  z-index: 60;
+  box-sizing: border-box;
+  width: 300px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 80px);
+  overflow: auto;
+  padding: 14px 16px;
+  text-align: left;
+  color: var(--text);
+  background-color: var(--fg);
+  border: 3px solid var(--border);
+  border-radius: 15px;
+  box-shadow: 0 4px 20px #0008;
+}
+
+#settings-panel h2 {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 0 0 8px;
+  font-size: 22px;
+}
+
+#settings-close {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--text);
+  font-size: 22px;
+  line-height: 1;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+#settings-close:hover {
+  scale: none;
+  box-shadow: none;
+  color: var(--link-hover);
+}
+
+#settings-panel .setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 40px;
+  font-size: 18px;
+}
+
+#settings-panel .setting label {
+  flex: 1;
+  cursor: pointer;
+}
+
+#settings-panel .setting small {
+  display: block;
+  font-size: 14px;
+  font-style: italic;
+  color: var(--debug-text);
+}
+
+#settings-panel input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: var(--link);
+  cursor: pointer;
+}
+
+#settings-panel select {
+  height: 34px;
+  padding: 0 8px;
+  font-size: 18px;
+  color: var(--text);
+  background-color: #2d3a2d;
+  border: 2px solid var(--border);
+  border-radius: 10px;
+}

@@ -76,6 +76,31 @@ h1 {
   margin-bottom: 10px;
 }
 
+/* Previous / Next links under the results (only rendered when there is another page) */
+#pagination {
+  display: flex;
+  justify-content: center;
+  gap: 15px;
+}
+
+#pagination a {
+  display: inline-block;
+  padding: 10px 20px;
+  font-size: 18px;
+  text-decoration: none;
+  color: var(--text);
+  background-color: #2d3a2d;
+  border: 2px solid var(--border);
+  border-radius: 25px;
+  transition: background-color 0.3s ease;
+}
+
+#pagination a:hover,
+#pagination a:focus-visible {
+  background-color: #4a5d4a;
+  border-color: #4a5d4a;
+}
+
 
 @media (max-width: 700px) {
     /* make stultus logo go to top and center itself above search bar */

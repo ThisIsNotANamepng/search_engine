@@ -1,0 +1,19 @@
+        <link rel="stylesheet" href="{{ asset('css/settings.css') }}">
+        {# Applies saved settings before first paint (no flash of the wrong state). #}
+        <script>
+        (function () {
+            try {
+                var s = JSON.parse(localStorage.getItem('stultus.settings') || '{}');
+                if (s.debug) document.documentElement.classList.add('debug');
+                // Direct visits to /search without ?limit= use the saved results-per-page.
+                if (location.pathname === '/search' && (s.limit === 20 || s.limit === 30)) {
+                    var u = new URL(location.href);
+                    if (!u.searchParams.has('limit')) {
+                        u.searchParams.set('limit', s.limit);
+                        location.replace(u.href);
+                    }
+                }
+            } catch (e) {}
+        })();
+        </script>
+        <script src="{{ asset('js/settings.js') }}" defer></script>
