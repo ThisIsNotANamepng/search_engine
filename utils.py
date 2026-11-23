@@ -63,7 +63,7 @@ WEB_STORAGE_CHUNK_SIZE = 64 * 1024
 CLAIM_TIMEOUT = "30 minutes"
 # How long a url skipped because its domain was on cooldown stays out of the queue (see finish_claims' defer)
 DEFER_DELAY = "10 minutes"
-MAX_URL_LENGTH = 2048  # urls.url, url_queue.url, urls_references.*, icon_link
+MAX_URL_LENGTH = 2048  # urls.url, url_queue.url, icon_link
 MAX_TITLE_LENGTH = 128  # urls.title
 MAX_TOKEN_LENGTH = 64  # words.word, prefixes.prefix
 
@@ -276,11 +276,6 @@ _SCHEMA_SQL = """
         -- Sum of the counts of every word, bigram, trigram and prefix stored for this page.
         -- NULL for pages stored before this column existed.
         total_tokens INT
-    );
-    CREATE TABLE IF NOT EXISTS urls_references (
-        url VARCHAR(2048) NOT NULL,
-        referenced_domain VARCHAR(2048) NOT NULL,
-        PRIMARY KEY (url, referenced_domain)
     );
                 
     -- BIGSERIAL: every url ever queued takes a new id and ids are never reused, so INT runs out. Older databases get it from widen_url_queue_id.py
@@ -959,9 +954,10 @@ def write_pages(cur, pages):
     for table, _ in POSTING_TABLES:
         cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = ANY(%s);").format(sql.Identifier(table)), (ids,))
 
-    # Not written to urls_references any more (the table is kept with what it holds, for the planned PageRank): nothing reads it, and its
-    # two-varchar primary key was the busiest index in the database, a random insert per link on db01's HDD. p["links"] stays in the
-    # pages the scrapers send, so a future link graph can be written from here again (as url ids, ~10x smaller).
+    # Links aren't stored any more. They went to urls_references (url, referenced_domain), which nothing read and whose two-varchar
+    # primary key was the busiest index in the database: a random insert per link on db01's HDD. The old data is kept on db01 as
+    # urls_references_unused for the planned PageRank. p["links"] stays in the pages the scrapers send, so a link graph can be
+    # written from here again (as url ids, ~10x smaller).
 
     def fetch_id_map(column, table, items):
         if not items:

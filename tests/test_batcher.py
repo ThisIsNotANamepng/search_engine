@@ -123,7 +123,7 @@ def db(monkeypatch):
     utils = batcher.utils
     utils.create_database()
     conn = utils.get_conn()
-    conn.cursor().execute("TRUNCATE urls, words, prefixes, urls_references, url_queue, logs, "
+    conn.cursor().execute("TRUNCATE urls, words, prefixes, url_queue, logs, "
                           "word_urls, bigram_urls, trigram_urls, prefix_urls CASCADE;")
     conn.commit()
     conn.close()
@@ -183,7 +183,6 @@ def test_writes_wait_for_the_flush_then_land(through_batcher):
     assert query(utils, "SELECT url FROM url_queue ORDER BY url") == [("https://q1.example",), ("https://q2.example",)]
     (message, age), = query(utils, "SELECT message, extract(epoch FROM now() - ts) FROM logs")
     assert message == "Scraped https://a.example" and 0 <= age < 5
-    assert query(utils, "SELECT count(*) FROM urls_references") == [(0,)]  # no longer written (see write_pages)
 
 
 @needs_db
