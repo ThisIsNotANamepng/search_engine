@@ -911,7 +911,7 @@ def write_pages(cur, pages):
     """
     Stores pages made by store() with a handful of statements for the whole batch
 
-    Every statement locks rows in sorted order (urls, then words, then prefixes), otherwise two batches storing the same url or new word deadlock
+    Two transactions: the new words and prefixes, committed first, then the urls and postings. Every statement locks rows in sorted order, otherwise two batches storing the same url or new word deadlock
     """
     load_static_token_maps()
 
@@ -925,19 +925,10 @@ def write_pages(cur, pages):
     total_tokens = [sum(p["words"].values()) + sum(b.values()) + sum(t.values()) + sum(p["prefixes"].values())
                     for p, b, t in zip(pages, bigrams, trigrams)]
 
-    # A url already stored (re-crawl, or marked seen) keeps its title and gets its postings replaced
-    cur.execute("""
-        INSERT INTO urls (url, title, icon_link, total_tokens)
-        SELECT * FROM unnest(%s::varchar[], %s::varchar[], %s::varchar[], %s::int[]) ORDER BY 1
-        ON CONFLICT (url) DO UPDATE SET total_tokens = EXCLUDED.total_tokens
-        RETURNING url, id;
-    """, ([p["url"] for p in pages], [p["title"] for p in pages], [p["icon_link"] for p in pages], total_tokens))
-    url_ids = dict(cur.fetchall())
-    ids = list(url_ids.values())
-    for table, _ in POSTING_TABLES:
-        cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = ANY(%s);").format(sql.Identifier(table)), (ids,))
-
-    # Bulk insert new words/prefixes (bigrams/trigrams are pre-populated).
+    # Bulk insert new words/prefixes (bigrams/trigrams are pre-populated), committed on their own before the rest of the batch.
+    # A batch inserting a word another open batch also inserts waits for that batch's whole transaction: in one transaction with the
+    # postings COPY that's minutes when the disk is busy, and every batcher ends up waiting behind one. Rows left behind by a batch
+    # that then fails are harmless (unused words; its retry finds them).
     # Only rows that don't exist yet: postgres burns an id for every attempted row even when ON CONFLICT skips it, which overflows the INT ids.
     words = set().union(*(p["words"] for p in pages))
     prefixes = set().union(*(p["prefixes"] for p in pages))
@@ -950,12 +941,25 @@ def write_pages(cur, pages):
                 ORDER BY t
                 ON CONFLICT ({col}) DO NOTHING;
             """).format(col=sql.Identifier(column), tbl=sql.Identifier(table)), (list(tokens),))
+    cur.connection.commit()
+
+    debug_print("Added new, unseen tokens to the database")
+
+    # A url already stored (re-crawl, or marked seen) keeps its title and gets its postings replaced
+    cur.execute("""
+        INSERT INTO urls (url, title, icon_link, total_tokens)
+        SELECT * FROM unnest(%s::varchar[], %s::varchar[], %s::varchar[], %s::int[]) ORDER BY 1
+        ON CONFLICT (url) DO UPDATE SET total_tokens = EXCLUDED.total_tokens
+        RETURNING url, id;
+    """, ([p["url"] for p in pages], [p["title"] for p in pages], [p["icon_link"] for p in pages], total_tokens))
+    url_ids = dict(cur.fetchall())
+    ids = list(url_ids.values())
+    for table, _ in POSTING_TABLES:
+        cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = ANY(%s);").format(sql.Identifier(table)), (ids,))
 
     references = [(p["url"], link) for p in pages for link in p["links"]]
     if references:
         execute_values(cur, "INSERT INTO urls_references (url, referenced_domain) VALUES %s ON CONFLICT DO NOTHING;", references)
-
-    debug_print("Added new, unseen tokens to the database")
 
     def fetch_id_map(column, table, items):
         if not items:
