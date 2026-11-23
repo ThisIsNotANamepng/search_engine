@@ -959,9 +959,9 @@ def write_pages(cur, pages):
     for table, _ in POSTING_TABLES:
         cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = ANY(%s);").format(sql.Identifier(table)), (ids,))
 
-    references = [(p["url"], link) for p in pages for link in p["links"]]
-    if references:
-        execute_values(cur, "INSERT INTO urls_references (url, referenced_domain) VALUES %s ON CONFLICT DO NOTHING;", references)
+    # Not written to urls_references any more (the table is kept with what it holds, for the planned PageRank): nothing reads it, and its
+    # two-varchar primary key was the busiest index in the database, a random insert per link on db01's HDD. p["links"] stays in the
+    # pages the scrapers send, so a future link graph can be written from here again (as url ids, ~10x smaller).
 
     def fetch_id_map(column, table, items):
         if not items:

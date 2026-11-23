@@ -183,7 +183,7 @@ def test_writes_wait_for_the_flush_then_land(through_batcher):
     assert query(utils, "SELECT url FROM url_queue ORDER BY url") == [("https://q1.example",), ("https://q2.example",)]
     (message, age), = query(utils, "SELECT message, extract(epoch FROM now() - ts) FROM logs")
     assert message == "Scraped https://a.example" and 0 <= age < 5
-    assert query(utils, "SELECT count(*) FROM urls_references") == [(0,)]  # the last scrape of a.example had no links
+    assert query(utils, "SELECT count(*) FROM urls_references") == [(0,)]  # no longer written (see write_pages)
 
 
 @needs_db
