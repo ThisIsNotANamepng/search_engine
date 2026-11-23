@@ -908,7 +908,8 @@ def write_pages(cur, pages):
     """
     Stores pages made by store() with a handful of statements for the whole batch
 
-    Two transactions: the new words and prefixes, committed first, then the urls and postings. Every statement locks rows in sorted order, otherwise two batches storing the same url or new word deadlock
+    Two transactions: the new words, prefixes and urls, committed first, then the postings, with the urls rows locked only by the
+    total_tokens update at the very end. Every statement locks rows in sorted order, otherwise two batches storing the same url or new word deadlock
     """
     load_static_token_maps()
 
@@ -938,19 +939,31 @@ def write_pages(cur, pages):
                 ORDER BY t
                 ON CONFLICT ({col}) DO NOTHING;
             """).format(col=sql.Identifier(column), tbl=sql.Identifier(table)), (list(tokens),))
-    cur.connection.commit()
 
-    debug_print("Added new, unseen tokens to the database")
-
-    # A url already stored (re-crawl, or marked seen) keeps its title and gets its postings replaced
+    # New urls get their row in this short transaction too. The old upsert at the start of the postings transaction held every page's
+    # urls row lock through the minutes of COPY below: other batches' reference_count updates (write_references) waited on it, the
+    # next page batch waited on those, and the batchers ended up writing one at a time.
+    # A url already stored (re-crawl, or marked seen) keeps its title; its total_tokens is set at the end, its postings are replaced.
+    # NOT EXISTS for the same reason as the tokens: don't burn an INT id per url that's already there.
+    page_urls = [p["url"] for p in pages]
     cur.execute("""
         INSERT INTO urls (url, title, icon_link, total_tokens)
-        SELECT * FROM unnest(%s::varchar[], %s::varchar[], %s::varchar[], %s::int[]) ORDER BY 1
-        ON CONFLICT (url) DO UPDATE SET total_tokens = EXCLUDED.total_tokens
-        RETURNING url, id;
-    """, ([p["url"] for p in pages], [p["title"] for p in pages], [p["icon_link"] for p in pages], total_tokens))
+        SELECT * FROM unnest(%s::varchar[], %s::varchar[], %s::varchar[], %s::int[]) AS v(url, title, icon_link, total_tokens)
+        WHERE NOT EXISTS (SELECT 1 FROM urls u WHERE u.url = v.url)
+        ORDER BY 1
+        ON CONFLICT (url) DO NOTHING;
+    """, (page_urls, [p["title"] for p in pages], [p["icon_link"] for p in pages], total_tokens))
+    cur.connection.commit()
+
+    debug_print("Added new, unseen tokens and urls to the database")
+
+    cur.execute("SELECT url, id FROM urls WHERE url = ANY(%s);", (page_urls,))
     url_ids = dict(cur.fetchall())
-    ids = list(url_ids.values())
+    ids = sorted(url_ids.values())
+    # Two batches storing the same url at once (a re-crawl, a claim that timed out) mustn't both delete its old postings and both COPY
+    # new ones. A per-url advisory lock keeps them apart without a urls row lock, which write_references would wait on. Taken in id
+    # order (unnest keeps the sorted array's order) so two batches can't deadlock; the two-int key space doesn't overlap create_database's.
+    cur.execute("SELECT pg_advisory_xact_lock(1, id) FROM unnest(%s::int[]) AS id;", (ids,))
     for table, _ in POSTING_TABLES:
         cur.execute(sql.SQL("DELETE FROM {} WHERE url_id = ANY(%s);").format(sql.Identifier(table)), (ids,))
 
@@ -984,6 +997,14 @@ def write_pages(cur, pages):
     for table, column, rows in copies:
         if rows:
             cur.copy_expert(f"COPY {table} ({column}, url_id, count) FROM STDIN;", io.StringIO(rows))
+
+    # Last, so the urls row locks it takes are held only until the commit right after. Rows locked in url order, like write_references
+    cur.execute("""
+        UPDATE urls SET total_tokens = r.n
+        FROM (SELECT u.id, v.n FROM urls u JOIN unnest(%s::varchar[], %s::int[]) AS v(url, n) ON u.url = v.url
+              WHERE u.total_tokens IS DISTINCT FROM v.n ORDER BY u.url FOR UPDATE OF u) AS r
+        WHERE urls.id = r.id;
+    """, (page_urls, total_tokens))
 
     debug_print("Executed insert statements, stored url.id_token.id pairs")
 
