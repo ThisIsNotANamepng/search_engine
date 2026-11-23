@@ -61,6 +61,8 @@ WEB_STORAGE_CHUNK_SIZE = 64 * 1024
 # Postgres columns have length limits, we set them in creating the database and we only send data reduced to the maximum length so we don't crash on the postgres end
 # How long a scraper may hold a claimed url before another scraper can claim it. Also the retry delay for rate-limited urls
 CLAIM_TIMEOUT = "30 minutes"
+# How long a url skipped because its domain was on cooldown stays out of the queue (see finish_claims' defer)
+DEFER_DELAY = "10 minutes"
 MAX_URL_LENGTH = 2048  # urls.url, url_queue.url, urls_references.*, icon_link
 MAX_TITLE_LENGTH = 128  # urls.title
 MAX_TOKEN_LENGTH = 64  # words.word, prefixes.prefix
@@ -1048,11 +1050,17 @@ def get_next_urls(num_urls):
 
     return urls
 
-def finish_claims(done=(), release=()):
+def finish_claims(done=(), release=(), defer=()):
     """
-    Ends this scraper's claims on urls from get_next_urls(): done urls leave the queue, released ones go back for any scraper to claim
+    Ends this scraper's claims on urls from get_next_urls(): done urls leave the queue, released ones go back for any scraper to claim,
+    deferred ones go back after DEFER_DELAY
+
+    Defer is for urls skipped because their domain is on cooldown. Released straight away they keep their low ids, so the next claim
+    gets the same urls again: with one domain filling the front of the queue every scraper spends its time claiming and handing back
+    that domain's urls (hundreds of millions of url_queue updates) instead of scraping. A deferred url stays claimed, backdated so the
+    claim expires after DEFER_DELAY, and get_next_urls' expired-claim release hands it back then.
     """
-    if not done and not release:
+    if not done and not release and not defer:
         return
 
     conn = get_conn()
@@ -1062,6 +1070,9 @@ def finish_claims(done=(), release=()):
     if release:
         # An UPDATE, not a re-insert: re-inserting burns a SERIAL id per url, and cooldown skips hand back a lot of urls
         cur.execute("UPDATE url_queue SET claimed_at = NULL WHERE url = ANY(%s);", (list(release),))
+    if defer:
+        cur.execute("UPDATE url_queue SET claimed_at = now() - %s::interval + %s::interval WHERE url = ANY(%s);",
+                    (CLAIM_TIMEOUT, DEFER_DELAY, list(defer)))
     conn.commit()
     cur.close()
     conn.close()

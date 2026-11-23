@@ -77,7 +77,7 @@ if not args.nodb:
 
 
 # It iterates through the local_queue, scraping when the url is free to be scraped
-# If a url is in the local_queue and cannot be scraped, it is added to queue_return_to_db, which is handed back to the db queue when local_queue is spent (empty)
+# If a url is in the local_queue and cannot be scraped yet (its domain is on cooldown), it is added to queue_return_to_db, which is deferred back to the db queue (utils.DEFER_DELAY) when local_queue is spent (empty)
 local_queue = []
 queue_return_to_db = []
 claimed = []  # urls this scraper claimed with get_next_urls, still marked claimed in the db queue
@@ -87,12 +87,13 @@ prev_base_domain = ""
 page_not_in_english = False
 first_run = True
 
-def finish_claims(release):
-    # End our claims: urls in release go back to the db queue, the rest of what we claimed is done and leaves it
+def finish_claims(release=(), defer=()):
+    # End our claims: urls in release go back to the db queue now, urls in defer (domain on cooldown) after utils.DEFER_DELAY,
+    # the rest of what we claimed is done and leaves it
     global claimed, retry_later
     if args.nodb or args.url or args.file:
         return  # these urls didn't come from the db queue, so there are no claims (and the rows may be another scraper's)
-    utils.finish_claims(done=set(claimed) - set(release) - set(retry_later), release=release)
+    utils.finish_claims(done=set(claimed) - set(release) - set(defer) - set(retry_later), release=release, defer=defer)
     claimed, retry_later = [], []
 
 def send_page_text(url, page_data):
@@ -105,14 +106,14 @@ def send_page_text(url, page_data):
 # On any exit, hand the urls we still hold back to the db queue (if we're killed instead, the claims time out)
 def on_exit():
     utils.close_all_connections()  # roll back anything SIGTERM cut off, otherwise its locks block handing back the same urls
-    release = local_queue + queue_return_to_db + ([url] if url else [])
+    release = local_queue + ([url] if url else [])
     try:
         if url and not (args.nodb or args.url or args.file):
             utils.enqueue_urls([url])  # the current url may be a same-host redirect target, which isn't in the db queue
     except Exception as e:
         utils.failure_print(f"Could not queue {url}: {e}")  # e.g. the batcher is down: still hand back the claims below
     try:
-        finish_claims(release)
+        finish_claims(release=release, defer=queue_return_to_db)
     except Exception as e:
         utils.failure_print(f"Could not hand back {len(release)} urls: {e}")
 
@@ -154,7 +155,7 @@ while True:
                     break
 
             else:
-                finish_claims(queue_return_to_db)
+                finish_claims(defer=queue_return_to_db)
                 queue_return_to_db = []
 
                 claiming_urls = True

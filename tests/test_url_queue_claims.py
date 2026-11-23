@@ -61,6 +61,18 @@ def test_finish_claims_releases_and_deletes(db):
 
 
 @needs_db
+def test_deferred_url_comes_back_after_the_delay(db):
+    db.enqueue_urls([A, B])
+    assert set(db.get_next_urls(10)) == {A, B}
+
+    db.finish_claims(done=[A], defer=[B])
+    assert db.get_next_urls(10) == []  # deferred: not claimable straight away
+    assert db.filter_new_urls([B]) == []  # but still queued, so links to it don't queue it again
+    execute(db, f"UPDATE url_queue SET claimed_at = claimed_at - interval '{db.DEFER_DELAY}';")
+    assert db.get_next_urls(10) == [B]  # after DEFER_DELAY its claim has expired
+
+
+@needs_db
 def test_expired_claim_is_claimable_again(db):
     db.enqueue_urls([A])
     assert db.get_next_urls(10) == [A]
